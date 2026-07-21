@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 interface DrawingCanvasProps {
   label: string;
   height?: number;
-  onChange?: (hasDrawing: boolean) => void;
+  onChange?: (hasDrawing: boolean, dataUrl?: string) => void;
 }
 
 export function DrawingCanvas({ label, height = 260, onChange }: DrawingCanvasProps) {
@@ -68,6 +68,13 @@ export function DrawingCanvas({ label, height = 260, onChange }: DrawingCanvasPr
     }
   };
 
+  const finish = () => {
+    if (!drawing.current) return;
+    drawing.current = false;
+    const canvas = canvasRef.current;
+    if (canvas && hasDrawing) onChange?.(true, canvas.toDataURL("image/png"));
+  };
+
   const clear = () => {
     const canvas = canvasRef.current;
     canvas?.getContext("2d")?.clearRect(0, 0, canvas.width, canvas.height);
@@ -86,13 +93,12 @@ export function DrawingCanvas({ label, height = 260, onChange }: DrawingCanvasPr
       <canvas
         ref={canvasRef}
         aria-label={label}
-
         className="w-full touch-none rounded-2xl border-2 border-dashed border-slate-300 bg-white shadow-inner"
         style={{ height }}
         onPointerDown={start}
         onPointerMove={move}
-        onPointerUp={() => (drawing.current = false)}
-        onPointerCancel={() => (drawing.current = false)}
+        onPointerUp={finish}
+        onPointerCancel={finish}
       />
     </div>
   );

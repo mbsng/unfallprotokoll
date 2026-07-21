@@ -14,13 +14,15 @@ import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { UserMenu } from "@/components/UserMenu";
 import { useAuth } from "@/contexts/AuthContext";
 import { localeForLanguage } from "@/i18n";
+import { createIncidentWithParty, deleteIncidentPhoto, IncidentSaveError, replaceWitness, updateIncident, updateParty, uploadCanvas, uploadPendingPhotos } from "@/lib/incidents";
+import type { IncidentDraftRef, PendingPhoto } from "@/types/incident";
 import type { Profile } from "@/types/profile";
 
 interface AccidentData {
-  date: string; time: string; location: string; injured: boolean; otherDamage: boolean; witnesses: string;
+  date: string; time: string; location: string; locationLat: number | null; locationLng: number | null; injured: boolean; otherDamage: boolean; witnesses: string;
   driverName: string; driverAddress: string; phone: string; plate: string; vehicle: string;
   insurer: string; policy: string; situations: number[]; damage: string; notes: string;
-  photos: string[]; hasSketch: boolean; hasSignature: boolean;
+  photos: PendingPhoto[]; hasSketch: boolean; sketchDataUrl: string; hasSignature: boolean; signatureDataUrl: string;
 }
 
 interface CaseItem { id: string; date: string; time: string; location: string; status: "draft" | "completed"; plate: string }
@@ -33,7 +35,7 @@ const initialCases: CaseItem[] = [
 
 const emptyData = (profile?: Profile | null): AccidentData => {
   const now = new Date();
-  return { date: now.toISOString().slice(0, 10), time: now.toTimeString().slice(0, 5), location: "", injured: false, otherDamage: false, witnesses: "", driverName: profile?.full_name ?? "", driverAddress: "", phone: profile?.phone ?? "", plate: profile?.default_vehicle_json?.plate ?? "", vehicle: profile?.default_vehicle_json?.makeModel ?? "", insurer: profile?.insurance_json?.company ?? "", policy: profile?.insurance_json?.policyNumber ?? "", situations: [], damage: "", notes: "", photos: [], hasSketch: false, hasSignature: false };
+  return { date: now.toISOString().slice(0, 10), time: now.toTimeString().slice(0, 5), location: "", locationLat: null, locationLng: null, injured: false, otherDamage: false, witnesses: "", driverName: profile?.full_name ?? "", driverAddress: "", phone: profile?.phone ?? "", plate: profile?.default_vehicle_json?.plate ?? "", vehicle: profile?.default_vehicle_json?.makeModel ?? "", insurer: profile?.insurance_json?.company ?? "", policy: profile?.insurance_json?.policyNumber ?? "", situations: [], damage: "", notes: "", photos: [], hasSketch: false, sketchDataUrl: "", hasSignature: false, signatureDataUrl: "" };
 };
 
 const fieldClass = "h-12 rounded-xl border-slate-200 bg-white text-base focus-visible:ring-[#153B66]";
@@ -50,7 +52,9 @@ export default function Index() {
   const [view, setView] = useState<"home" | "wizard">("home");
   const [step, setStep] = useState(0);
   const [data, setData] = useState<AccidentData>(() => emptyData(profile));
-
+  const [draftRef, setDraftRef] = useState<IncidentDraftRef | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [cases, setCases] = useState(initialCases);
   const [joinOpen, setJoinOpen] = useState(false);
   const [joinCode, setJoinCode] = useState("");
@@ -64,47 +68,141 @@ export default function Index() {
   };
 
   const startAccident = async () => {
+    if (creating) return;
+    setCreating(true);
     if (!user) {
       const started = await startAnonymous();
-      if (!started) toast.error(t("guest.sessionError"));
+      if (!started) {
+        setCreating(false);
+        toast.error(t("guest.sessionError"));
+        return;
+      }
     }
-    setData(emptyData(profile));
-    setStep(0);
-    setView("wizard");
-    window.scrollTo(0, 0);
+    const initial = emptyData(profile);
+    try {
+      const created = await createIncidentWithParty(
+        { fullName: initial.driverName, address: initial.driverAddress, phone: initial.phone, licenseNo: profile?.license_no ?? "" },
+        { plate: initial.plate, makeModel: initial.vehicle },
+        { company: initial.insurer, policyNumber: initial.policy },
+      );
+      setDraftRef(created);
+      setData(initial);
+      setStep(0);
+      setView("wizard");
+      window.scrollTo(0, 0);
+    } catch {
+      toast.error(t("incident.createError"));
+    } finally {
+      setCreating(false);
+    }
   };
+
   const back = () => { if (step === 0) setView("home"); else { setStep((value) => value - 1); window.scrollTo(0, 0); } };
-  const next = () => {
+
+  const saveCurrentStep = async () => {
+    if (!draftRef) throw new IncidentSaveError("save");
+    const nextRef = { ...draftRef };
+    if (step === 0) {
+      await replaceWitness(nextRef, data.witnesses);
+      nextRef.incidentVersion = await updateIncident(nextRef, {
+        occurred_at: new Date(`${data.date}T${data.time}:00`).toISOString(),
+        location_lat: data.locationLat,
+        location_lng: data.locationLng,
+        location_text: data.location,
+      });
+      setDraftRef({ ...nextRef });
+    } else if (step === 1) {
+
+      nextRef.partyVersion = await updateParty(nextRef, {
+        driver_json: { fullName: data.driverName, address: data.driverAddress, phone: data.phone, licenseNo: profile?.license_no ?? "" },
+        vehicle_json: { plate: data.plate, makeModel: data.vehicle },
+        insurance_json: { company: data.insurer, policyNumber: data.policy },
+      });
+      setDraftRef({ ...nextRef });
+    } else if (step === 2) {
+      nextRef.partyVersion = await updateParty(nextRef, { circumstances_checked: data.situations });
+      setDraftRef({ ...nextRef });
+      nextRef.incidentVersion = await updateIncident(nextRef, { circumstances_json: { injured: data.injured, otherDamage: data.otherDamage } });
+      setDraftRef({ ...nextRef });
+    } else if (step === 3) {
+      const uploaded = await uploadPendingPhotos(nextRef, data.photos);
+      setData((previous) => ({ ...previous, photos: uploaded }));
+      nextRef.partyVersion = await updateParty(nextRef, { damage_description: [data.damage, data.notes].filter(Boolean).join("\n\n") });
+      setDraftRef({ ...nextRef });
+    } else if (step === 4) {
+      const storagePath = data.sketchDataUrl ? await uploadCanvas(nextRef, data.sketchDataUrl, "sketch") : null;
+      nextRef.incidentVersion = await updateIncident(nextRef, { sketch_json: storagePath ? { storagePath } : {} });
+      setDraftRef({ ...nextRef });
+    }
+  };
+
+  const next = async () => {
     if (step === 0 && !data.date) return toast.error(t("validation.dateRequired"));
     if (step === 0 && !data.location.trim()) return toast.error(t("validation.locationRequired"));
-    setStep((value) => Math.min(value + 1, 5));
-    window.scrollTo(0, 0);
+    if (saving) return;
+    setSaving(true);
+    try {
+      await saveCurrentStep();
+      toast.success(t("incident.saved"));
+      setStep((value) => Math.min(value + 1, 5));
+      window.scrollTo(0, 0);
+    } catch (error) {
+      toast.error(t(error instanceof IncidentSaveError && error.code === "conflict" ? "incident.conflict" : "incident.saveError"));
+    } finally {
+      setSaving(false);
+    }
   };
 
   const locate = () => {
     if (!navigator.geolocation) return toast.error(t("location.unsupported"));
     setLocating(true);
     navigator.geolocation.getCurrentPosition(
-      ({ coords }) => { update("location", `${coords.latitude.toLocaleString(locale, { maximumFractionDigits: 5 })}, ${coords.longitude.toLocaleString(locale, { maximumFractionDigits: 5 })}`); setLocating(false); toast.success(t("location.success")); },
+      ({ coords }) => {
+        setData((previous) => ({ ...previous, location: `${coords.latitude.toLocaleString(locale, { maximumFractionDigits: 5 })}, ${coords.longitude.toLocaleString(locale, { maximumFractionDigits: 5 })}`, locationLat: coords.latitude, locationLng: coords.longitude }));
+        setLocating(false);
+        toast.success(t("location.success"));
+      },
       () => { setLocating(false); toast.error(t("location.error")); },
     );
   };
 
   const addPhotos = (files: FileList | null) => {
-    if (files) update("photos", [...data.photos, ...Array.from(files).map((file) => URL.createObjectURL(file))]);
+    if (!files) return;
+    const added = Array.from(files).map((file) => ({ id: crypto.randomUUID(), file, url: URL.createObjectURL(file) }));
+    update("photos", [...data.photos, ...added]);
+  };
+
+  const removePhoto = async (photo: PendingPhoto) => {
+    await deleteIncidentPhoto(photo);
+    update("photos", data.photos.filter((item) => item.id !== photo.id));
   };
 
   const join = () => {
     const code = joinCode.trim().toUpperCase();
-    if (!/^[A-Z0-9]{6}$/.test(code)) return toast.error(t("join.invalid"));
+    if (!/^[A-Z0-9]{8}$/.test(code)) return toast.error(t("join.invalid"));
     navigate(`/join/${code}`);
   };
 
-  const complete = () => {
-    if (!data.hasSignature) return toast.error(t("validation.signatureRequired"));
-    setCases((previous) => [{ id: `UK-${Math.floor(1000 + Math.random() * 9000)}`, date: data.date, time: data.time, location: data.location || t("fields.notProvided"), status: "completed", plate: data.plate || t("fields.noPlate") }, ...previous]);
-    setView("home");
-    toast.success(t("wizard.saved"));
+  const complete = async () => {
+    if (!data.hasSignature || !data.signatureDataUrl) return toast.error(t("validation.signatureRequired"));
+    if (!draftRef || saving) return;
+    setSaving(true);
+    try {
+      const nextRef = { ...draftRef };
+      const signaturePath = await uploadCanvas(nextRef, data.signatureDataUrl, "signature");
+      nextRef.partyVersion = await updateParty(nextRef, { signature_storage_path: signaturePath, signed_at: new Date().toISOString() });
+      setDraftRef({ ...nextRef });
+      nextRef.incidentVersion = await updateIncident(nextRef, { status: "signed" });
+      setDraftRef({ ...nextRef });
+      setCases((previous) => [{ id: nextRef.shareCode, date: data.date, time: data.time, location: data.location || t("fields.notProvided"), status: "completed", plate: data.plate || t("fields.noPlate") }, ...previous]);
+
+      setView("home");
+      toast.success(t("wizard.saved"));
+    } catch (error) {
+      toast.error(t(error instanceof IncidentSaveError && error.code === "conflict" ? "incident.conflict" : "incident.saveError"));
+    } finally {
+      setSaving(false);
+    }
   };
 
   const selectedSummary = useMemo(() => data.situations.map((index) => circumstances[index]), [data.situations, circumstances]);
@@ -118,10 +216,11 @@ export default function Index() {
           <div className="mt-5 flex items-center gap-2 rounded-full bg-emerald-50 px-3 py-2 text-sm font-medium text-emerald-700 md:mt-0"><ShieldCheck className="h-4 w-4" />{t("app.localData")}</div>
         </section>
         <section className="grid gap-4 md:grid-cols-2">
-          <button onClick={startAccident} className="group flex min-h-44 flex-col items-start justify-between rounded-3xl bg-[#153B66] p-6 text-left text-white shadow-lg shadow-[#153B66]/15 active:scale-[0.98]"><span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-white/15"><Plus className="h-7 w-7" /></span><span className="flex w-full items-end justify-between gap-4"><span><span className="block text-xl font-bold">{t("home.new")}</span><span className="mt-1 block text-sm text-blue-100">{t("home.newHint")}</span></span><ArrowRight className="mb-1 h-6 w-6 group-hover:translate-x-1" /></span></button>
+          <button onClick={() => void startAccident()} disabled={creating} className="group flex min-h-44 flex-col items-start justify-between rounded-3xl bg-[#153B66] p-6 text-left text-white shadow-lg shadow-[#153B66]/15 active:scale-[0.98] disabled:cursor-wait disabled:opacity-75"><span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-white/15"><Plus className="h-7 w-7" /></span><span className="flex w-full items-end justify-between gap-4"><span><span className="block text-xl font-bold">{t(creating ? "incident.creating" : "home.new")}</span><span className="mt-1 block text-sm text-blue-100">{t("home.newHint")}</span></span><ArrowRight className="mb-1 h-6 w-6 group-hover:translate-x-1" /></span></button>
           <button onClick={() => setJoinOpen((value) => !value)} className="group flex min-h-44 flex-col items-start justify-between rounded-3xl border-2 border-[#D8E3EC] bg-white p-6 text-left text-[#153B66] shadow-sm active:scale-[0.98]"><span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-[#EAF1F6]"><QrCode className="h-7 w-7" /></span><span className="flex w-full items-end justify-between gap-4"><span><span className="block text-xl font-bold">{t("home.join")}</span><span className="mt-1 block text-sm text-slate-500">{t("home.joinHint")}</span></span><ChevronRight className="mb-1 h-6 w-6 group-hover:translate-x-1" /></span></button>
         </section>
-        {joinOpen && <section className="mt-4 rounded-3xl border border-[#C9D9E5] bg-white p-5 shadow-sm"><div className="flex items-start justify-between"><div><h2 className="font-bold text-[#153B66]">{t("home.joinTitle")}</h2><p className="mt-1 text-sm text-slate-500">{t("home.joinDescription")}</p></div><Button variant="ghost" size="icon" onClick={() => setJoinOpen(false)} aria-label={t("app.close")}><X className="h-5 w-5" /></Button></div><div className="mt-4 flex gap-2"><Input value={joinCode} onChange={(event) => setJoinCode(event.target.value.toUpperCase())} onKeyDown={(event) => event.key === "Enter" && join()} maxLength={6} placeholder={t("home.joinPlaceholder")} className={`${fieldClass} font-mono tracking-[0.2em]`} /><Button className="h-12 rounded-xl bg-[#153B66] px-5" onClick={join}>{t("home.joinButton")}</Button></div></section>}
+        {joinOpen && <section className="mt-4 rounded-3xl border border-[#C9D9E5] bg-white p-5 shadow-sm"><div className="flex items-start justify-between"><div><h2 className="font-bold text-[#153B66]">{t("home.joinTitle")}</h2><p className="mt-1 text-sm text-slate-500">{t("home.joinDescription")}</p></div><Button variant="ghost" size="icon" onClick={() => setJoinOpen(false)} aria-label={t("app.close")}><X className="h-5 w-5" /></Button></div><div className="mt-4 flex gap-2"><Input value={joinCode} onChange={(event) => setJoinCode(event.target.value.toUpperCase())} onKeyDown={(event) => event.key === "Enter" && join()} maxLength={8} placeholder={t("home.joinPlaceholder")} className={`${fieldClass} font-mono tracking-[0.2em]`} /><Button className="h-12 rounded-xl bg-[#153B66] px-5" onClick={join}>{t("home.joinButton")}</Button></div></section>}
+
         <section className="mt-10"><div className="mb-4 flex items-center justify-between"><h2 className="text-xl font-bold text-[#102F52]">{t("home.recent")}</h2><Button variant="ghost" className="text-[#39719D]">{t("home.showAll")}</Button></div><div className="space-y-3">{cases.slice(0, 3).map((item) => <article key={item.id} className="flex items-center gap-4 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-[#EDF3F7] text-[#153B66]"><FileText className="h-6 w-6" /></div><div className="min-w-0 flex-1"><div className="flex items-center gap-2"><h3 className="truncate font-bold text-[#153B66]">{item.location}</h3><span className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] font-semibold ${item.status === "draft" ? "bg-amber-100 text-amber-800" : "bg-emerald-100 text-emerald-700"}`}>{t(`home.${item.status}`)}</span></div><p className="mt-1 truncate text-sm text-slate-500">{formatCaseDate(item)} · {item.plate}</p></div><ChevronRight className="h-5 w-5 shrink-0 text-slate-400" /></article>)}</div></section>
       </main>
     </div>
