@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useNavigate } from "react-router-dom";
-import { ArrowLeft, ArrowRight, Camera, Car, Check, ChevronRight, Clock3, FileText, LocateFixed, MapPin, Plus, QrCode, ShieldCheck, Trash2, UserRound, X } from "lucide-react";
+import { Link, useNavigate } from "react-router-dom";
+import { AlertTriangle, ArrowLeft, ArrowRight, Camera, Car, Check, ChevronRight, Clock3, FileText, LocateFixed, MapPin, Plus, QrCode, ShieldCheck, Trash2, UserRound, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -11,7 +11,10 @@ import { Progress } from "@/components/ui/progress";
 import { Checkbox } from "@/components/ui/checkbox";
 import { DrawingCanvas } from "@/components/DrawingCanvas";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
+import { UserMenu } from "@/components/UserMenu";
+import { useAuth } from "@/contexts/AuthContext";
 import { localeForLanguage } from "@/i18n";
+import type { Profile } from "@/types/profile";
 
 interface AccidentData {
   date: string; time: string; location: string; injured: boolean; otherDamage: boolean; witnesses: string;
@@ -28,9 +31,9 @@ const initialCases: CaseItem[] = [
   { id: "UK-2194", date: "2024-11-12", time: "19:30", location: "Bern, Wankdorf", status: "completed", plate: "BE 544 208" },
 ];
 
-const emptyData = (): AccidentData => {
+const emptyData = (profile?: Profile | null): AccidentData => {
   const now = new Date();
-  return { date: now.toISOString().slice(0, 10), time: now.toTimeString().slice(0, 5), location: "", injured: false, otherDamage: false, witnesses: "", driverName: "", driverAddress: "", phone: "", plate: "", vehicle: "", insurer: "", policy: "", situations: [], damage: "", notes: "", photos: [], hasSketch: false, hasSignature: false };
+  return { date: now.toISOString().slice(0, 10), time: now.toTimeString().slice(0, 5), location: "", injured: false, otherDamage: false, witnesses: "", driverName: profile?.full_name ?? "", driverAddress: "", phone: profile?.phone ?? "", plate: profile?.default_vehicle_json?.plate ?? "", vehicle: profile?.default_vehicle_json?.makeModel ?? "", insurer: profile?.insurance_json?.company ?? "", policy: profile?.insurance_json?.policyNumber ?? "", situations: [], damage: "", notes: "", photos: [], hasSketch: false, hasSignature: false };
 };
 
 const fieldClass = "h-12 rounded-xl border-slate-200 bg-white text-base focus-visible:ring-[#153B66]";
@@ -38,6 +41,7 @@ const fieldClass = "h-12 rounded-xl border-slate-200 bg-white text-base focus-vi
 export default function Index() {
   const { t, i18n } = useTranslation();
   const navigate = useNavigate();
+  const { user, profile, isAnonymous, startAnonymous } = useAuth();
   const locale = localeForLanguage(i18n.resolvedLanguage || i18n.language);
   const steps = t("wizard.steps", { returnObjects: true }) as string[];
   const titles = t("wizard.titles", { returnObjects: true }) as string[];
@@ -45,7 +49,8 @@ export default function Index() {
   const circumstances = t("circumstances.items", { returnObjects: true }) as string[];
   const [view, setView] = useState<"home" | "wizard">("home");
   const [step, setStep] = useState(0);
-  const [data, setData] = useState<AccidentData>(emptyData);
+  const [data, setData] = useState<AccidentData>(() => emptyData(profile));
+
   const [cases, setCases] = useState(initialCases);
   const [joinOpen, setJoinOpen] = useState(false);
   const [joinCode, setJoinCode] = useState("");
@@ -58,7 +63,16 @@ export default function Index() {
     return `${new Intl.DateTimeFormat(locale, { day: "2-digit", month: "long", year: "numeric" }).format(date)} · ${new Intl.DateTimeFormat(locale, { hour: "2-digit", minute: "2-digit" }).format(date)}`;
   };
 
-  const startAccident = () => { setData(emptyData()); setStep(0); setView("wizard"); window.scrollTo(0, 0); };
+  const startAccident = async () => {
+    if (!user) {
+      const started = await startAnonymous();
+      if (!started) toast.error(t("guest.sessionError"));
+    }
+    setData(emptyData(profile));
+    setStep(0);
+    setView("wizard");
+    window.scrollTo(0, 0);
+  };
   const back = () => { if (step === 0) setView("home"); else { setStep((value) => value - 1); window.scrollTo(0, 0); } };
   const next = () => {
     if (step === 0 && !data.date) return toast.error(t("validation.dateRequired"));
@@ -117,7 +131,9 @@ export default function Index() {
     <div className="min-h-screen bg-[#F5F7FA] pb-28 text-slate-900">
       <header className="sticky top-0 z-20 border-b border-slate-200 bg-white/95 backdrop-blur"><div className="mx-auto max-w-3xl px-4 py-3"><div className="flex items-center justify-between gap-2"><Button variant="ghost" size="icon" onClick={back} className="h-11 w-11 shrink-0 rounded-xl" aria-label={t("app.back")}><ArrowLeft className="h-6 w-6 text-[#153B66]" /></Button><div className="min-w-0 text-center"><p className="text-xs font-semibold uppercase tracking-wider text-slate-500">{t("wizard.stepOf", { current: formatNumber(step + 1), total: formatNumber(6) })}</p><p className="truncate font-bold text-[#153B66]">{steps[step]}</p></div><LanguageSwitcher /></div><Progress value={((step + 1) / 6) * 100} className="mt-3 h-1.5 bg-slate-200 [&>div]:bg-[#39719D]" /></div></header>
       <main className="mx-auto max-w-3xl px-5 py-7"><div className="mb-7"><p className="mb-2 text-sm font-semibold text-[#39719D]">{formatNumber(step + 1).padStart(2, "0")} — {steps[step]}</p><h1 className="text-2xl font-bold tracking-tight text-[#102F52]">{titles[step]}</h1><p className="mt-2 text-sm leading-relaxed text-slate-500">{descriptions[step]}</p></div>
+        {(!user || isAnonymous) && <div className="mb-5 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-amber-950"><div className="flex gap-3"><AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-700" /><div><p className="font-semibold">{t("guest.notice")}</p><p className="mt-1 text-sm leading-relaxed text-amber-800">{t("guest.detail")}</p><Button asChild variant="link" className="mt-1 h-auto p-0 font-semibold text-amber-900"><Link to="/auth">{t("guest.createAccount")}</Link></Button></div></div></div>}
         <div className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm md:p-7">
+
           {step === 0 && <div className="space-y-6"><div className="grid grid-cols-2 gap-4"><Field number="1" label={t("fields.date")}><Input type="date" value={data.date} onChange={(event) => update("date", event.target.value)} className={fieldClass} /></Field><Field number="1" label={t("fields.time")}><Input type="time" value={data.time} onChange={(event) => update("time", event.target.value)} className={fieldClass} /></Field></div><Field number="2" label={t("fields.place")}><div className="space-y-2"><Input value={data.location} onChange={(event) => update("location", event.target.value)} placeholder={t("fields.placePlaceholder")} className={fieldClass} /><Button type="button" variant="outline" onClick={locate} disabled={locating} className="h-12 w-full rounded-xl border-[#B8CDDC] text-[#153B66]"><LocateFixed className={`mr-2 h-5 w-5 ${locating ? "animate-spin" : ""}`} />{t(locating ? "location.locating" : "location.useCurrent")}</Button></div></Field><Field number="3" label={t("fields.injured")}><div className="grid grid-cols-2 gap-3"><Choice active={!data.injured} onClick={() => update("injured", false)}>{t("fields.no")}</Choice><Choice active={data.injured} warning onClick={() => update("injured", true)}>{t("fields.yesInjured")}</Choice></div>{data.injured && <p className="mt-3 rounded-xl bg-amber-50 p-3 text-sm font-medium text-amber-900">{t("fields.emergency")}</p>}</Field><Field number="4" label={t("fields.otherDamage")}><div className="grid grid-cols-2 gap-3"><Choice active={!data.otherDamage} onClick={() => update("otherDamage", false)}>{t("fields.no")}</Choice><Choice active={data.otherDamage} warning onClick={() => update("otherDamage", true)}>{t("fields.yesOtherDamage")}</Choice></div></Field><Field number="5" label={t("fields.witnesses")}><Textarea value={data.witnesses} onChange={(event) => update("witnesses", event.target.value)} placeholder={t("fields.witnessesPlaceholder")} className="min-h-24 rounded-xl text-base" /></Field></div>}
           {step === 1 && <div className="space-y-7"><SectionTitle number="6 & 9" icon={<UserRound />} title={t("fields.driver")} /><div className="space-y-5"><Field label={t("fields.fullName")}><Input value={data.driverName} onChange={(event) => update("driverName", event.target.value)} placeholder={t("fields.namePlaceholder")} className={fieldClass} /></Field><Field label={t("fields.address")}><Input value={data.driverAddress} onChange={(event) => update("driverAddress", event.target.value)} placeholder={t("fields.addressPlaceholder")} className={fieldClass} /></Field><Field label={t("fields.phone")}><Input type="tel" value={data.phone} onChange={(event) => update("phone", event.target.value)} placeholder={t("fields.phonePlaceholder")} className={fieldClass} /></Field></div><div className="border-t border-slate-100 pt-6"><SectionTitle number="7–8" icon={<Car />} title={t("fields.vehicleInsurance")} /></div><div className="grid gap-5 sm:grid-cols-2"><Field number="7" label={t("fields.plate")}><Input value={data.plate} onChange={(event) => update("plate", event.target.value.toUpperCase())} placeholder={t("fields.platePlaceholder")} className={`${fieldClass} font-semibold uppercase`} /></Field><Field number="7" label={t("fields.vehicle")}><Input value={data.vehicle} onChange={(event) => update("vehicle", event.target.value)} placeholder={t("fields.vehiclePlaceholder")} className={fieldClass} /></Field><Field number="8" label={t("fields.insurer")}><Input value={data.insurer} onChange={(event) => update("insurer", event.target.value)} placeholder={t("fields.insurerPlaceholder")} className={fieldClass} /></Field><Field number="8" label={t("fields.policy")}><Input value={data.policy} onChange={(event) => update("policy", event.target.value)} placeholder={t("fields.policyPlaceholder")} className={fieldClass} /></Field></div></div>}
           {step === 2 && <div className="space-y-3"><FieldBadge number="12" />{circumstances.map((circumstance, index) => { const selected = data.situations.includes(index); return <label key={index} className={`flex min-h-16 cursor-pointer items-center gap-4 rounded-2xl border-2 p-4 ${selected ? "border-[#39719D] bg-[#EDF4F8]" : "border-slate-200"}`}><Checkbox checked={selected} onCheckedChange={() => update("situations", selected ? data.situations.filter((value) => value !== index) : [...data.situations, index])} className="h-6 w-6 rounded-md data-[state=checked]:border-[#153B66] data-[state=checked]:bg-[#153B66]" /><span className="flex-1 text-sm font-medium leading-snug text-slate-700"><span className="mr-2 text-xs font-bold text-[#39719D]">{formatNumber(index + 1)}.</span>{circumstance}</span></label>; })}<p className="pt-3 text-center text-sm font-medium text-slate-500">{t("circumstances.selected", { count: data.situations.length, formattedCount: formatNumber(data.situations.length) })}</p></div>}
@@ -134,11 +150,12 @@ export default function Index() {
 
 export function AppHeader() {
   const { t } = useTranslation();
-  return <header className="border-b border-slate-200 bg-white"><div className="mx-auto flex max-w-5xl items-center justify-between gap-3 px-5 py-4"><div className="flex min-w-0 items-center gap-3"><img src="/assets/unfallklar-logo.png" alt={t("app.name")} className="h-11 w-11 shrink-0 rounded-xl object-cover" /><div className="min-w-0"><p className="text-xl font-bold tracking-tight text-[#153B66]">{t("app.name")}</p><p className="truncate text-xs font-medium text-slate-500">{t("app.statement")}</p></div></div><LanguageSwitcher /></div></header>;
+  return <header className="border-b border-slate-200 bg-white"><div className="mx-auto flex max-w-5xl items-center justify-between gap-2 px-4 py-4"><div className="flex min-w-0 items-center gap-3"><img src="/assets/unfallklar-logo.png" alt={t("app.name")} className="h-11 w-11 shrink-0 rounded-xl object-cover" /><div className="hidden min-w-0 md:block"><p className="text-xl font-bold tracking-tight text-[#153B66]">{t("app.name")}</p><p className="truncate text-xs font-medium text-slate-500">{t("app.statement")}</p></div></div><div className="flex items-center gap-2"><LanguageSwitcher /><UserMenu /></div></div></header>;
 }
 
 function Field({ number, label, children }: { number?: string; label: string; children: React.ReactNode }) { return <div>{number && <FieldBadge number={number} />}<Label className="mb-2 block text-sm font-semibold text-slate-700">{label}</Label>{children}</div>; }
 function FieldBadge({ number }: { number: string }) { const { t } = useTranslation(); return <span className="mb-1.5 inline-flex rounded-md bg-[#E7F0F6] px-2 py-1 text-[10px] font-bold uppercase tracking-wider text-[#285B82]">{t("fields.number", { number })}</span>; }
 function SectionTitle({ number, icon, title }: { number: string; icon: React.ReactNode; title: string }) { return <div className="mb-4 flex items-center gap-3 text-[#153B66]"><span className="flex h-10 w-10 items-center justify-center rounded-xl bg-[#EDF3F7] [&>svg]:h-5 [&>svg]:w-5">{icon}</span><div><FieldBadge number={number} /><h2 className="text-lg font-bold">{title}</h2></div></div>; }
+
 function Choice({ active, warning, onClick, children }: { active: boolean; warning?: boolean; onClick: () => void; children: React.ReactNode }) { return <button type="button" onClick={onClick} className={`h-14 rounded-xl border-2 text-base font-semibold ${active ? warning ? "border-amber-500 bg-amber-50 text-amber-900" : "border-[#153B66] bg-[#EDF3F7] text-[#153B66]" : "border-slate-200 text-slate-600"}`}>{children}</button>; }
 function Summary({ number, icon, label, value }: { number: string; icon: React.ReactNode; label: string; value: string }) { return <div className="flex gap-3 rounded-2xl bg-[#F6F8FA] p-4"><span className="mt-0.5 text-[#39719D] [&>svg]:h-5 [&>svg]:w-5">{icon}</span><div className="min-w-0"><FieldBadge number={number} /><p className="text-xs font-semibold uppercase tracking-wide text-slate-500">{label}</p><p className="mt-1 break-words text-sm font-semibold text-slate-800">{value}</p></div></div>; }
