@@ -1,8 +1,10 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useLocation, useNavigate } from "react-router-dom";
+import { QRCodeSVG } from "qrcode.react";
 import { AlertTriangle, ArrowLeft, ArrowRight, Camera, Car, Check, ChevronRight, Clock3, FileText, LocateFixed, MapPin, Plus, QrCode, ShieldCheck, Trash2, UserRound, X } from "lucide-react";
 import { toast } from "sonner";
+
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -14,8 +16,8 @@ import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { UserMenu } from "@/components/UserMenu";
 import { useAuth } from "@/contexts/AuthContext";
 import { localeForLanguage } from "@/i18n";
-import { createIncidentWithParty, deleteIncidentPhoto, IncidentSaveError, replaceWitness, updateIncident, updateParty, uploadCanvas, uploadPendingPhotos } from "@/lib/incidents";
-import type { IncidentDraftRef, PendingPhoto } from "@/types/incident";
+import { createIncidentWithParty, deleteIncidentPhoto, IncidentSaveError, loadIncidentSummary, replaceWitness, updateIncident, updateParty, uploadCanvas, uploadPendingPhotos } from "@/lib/incidents";
+import type { IncidentDraftRef, IncidentPartySummary, JoinedIncidentState, PendingPhoto } from "@/types/incident";
 import type { Profile } from "@/types/profile";
 
 interface AccidentData {
@@ -38,36 +40,81 @@ const emptyData = (profile?: Profile | null): AccidentData => {
   return { date: now.toISOString().slice(0, 10), time: now.toTimeString().slice(0, 5), location: "", locationLat: null, locationLng: null, injured: false, otherDamage: false, witnesses: "", driverName: profile?.full_name ?? "", driverAddress: "", phone: profile?.phone ?? "", plate: profile?.default_vehicle_json?.plate ?? "", vehicle: profile?.default_vehicle_json?.makeModel ?? "", insurer: profile?.insurance_json?.company ?? "", policy: profile?.insurance_json?.policyNumber ?? "", situations: [], damage: "", notes: "", photos: [], hasSketch: false, sketchDataUrl: "", hasSignature: false, signatureDataUrl: "" };
 };
 
+const joinedData = (joined: JoinedIncidentState, profile?: Profile | null): AccidentData => {
+  const data = emptyData(profile);
+  if (joined.incident.occurredAt) {
+    const occurredAt = new Date(joined.incident.occurredAt);
+    data.date = `${occurredAt.getFullYear()}-${String(occurredAt.getMonth() + 1).padStart(2, "0")}-${String(occurredAt.getDate()).padStart(2, "0")}`;
+    data.time = `${String(occurredAt.getHours()).padStart(2, "0")}:${String(occurredAt.getMinutes()).padStart(2, "0")}`;
+  }
+  data.location = joined.incident.locationText ?? "";
+  return data;
+};
+
 const fieldClass = "h-12 rounded-xl border-slate-200 bg-white text-base focus-visible:ring-[#153B66]";
 
 export default function Index() {
   const { t, i18n } = useTranslation();
   const navigate = useNavigate();
+  const location = useLocation();
+  const joinedIncident = (location.state as { joinedIncident?: JoinedIncidentState } | null)?.joinedIncident;
   const { user, profile, isAnonymous, startAnonymous } = useAuth();
+
   const locale = localeForLanguage(i18n.resolvedLanguage || i18n.language);
   const steps = t("wizard.steps", { returnObjects: true }) as string[];
   const titles = t("wizard.titles", { returnObjects: true }) as string[];
   const descriptions = t("wizard.descriptions", { returnObjects: true }) as string[];
   const circumstances = t("circumstances.items", { returnObjects: true }) as string[];
-  const [view, setView] = useState<"home" | "wizard">("home");
-  const [step, setStep] = useState(0);
-  const [data, setData] = useState<AccidentData>(() => emptyData(profile));
-  const [draftRef, setDraftRef] = useState<IncidentDraftRef | null>(null);
+  const [view, setView] = useState<"home" | "wizard">(joinedIncident ? "wizard" : "home");
+  const [step, setStep] = useState(joinedIncident ? 1 : 0);
+  const [data, setData] = useState<AccidentData>(() => joinedIncident ? joinedData(joinedIncident, profile) : emptyData(profile));
+  const [draftRef, setDraftRef] = useState<IncidentDraftRef | null>(joinedIncident?.draftRef ?? null);
+
+  const [parties, setParties] = useState<IncidentPartySummary[]>([]);
+  const [summaryLoading, setSummaryLoading] = useState(false);
+  const [completed, setCompleted] = useState(false);
   const [creating, setCreating] = useState(false);
   const [saving, setSaving] = useState(false);
+
   const [cases, setCases] = useState(initialCases);
   const [joinOpen, setJoinOpen] = useState(false);
   const [joinCode, setJoinCode] = useState("");
   const [locating, setLocating] = useState(false);
 
   const update = <K extends keyof AccidentData>(key: K, value: AccidentData[K]) => setData((previous) => ({ ...previous, [key]: value }));
+
   const formatNumber = (value: number) => new Intl.NumberFormat(locale).format(value);
   const formatCaseDate = (item: CaseItem) => {
     const date = new Date(`${item.date}T${item.time}:00`);
     return `${new Intl.DateTimeFormat(locale, { day: "2-digit", month: "long", year: "numeric" }).format(date)} · ${new Intl.DateTimeFormat(locale, { hour: "2-digit", minute: "2-digit" }).format(date)}`;
   };
 
+  useEffect(() => {
+    if (step !== 5 || !draftRef) return;
+    let active = true;
+    let initialLoad = true;
+    const refreshSummary = () => {
+      if (initialLoad) setSummaryLoading(true);
+      loadIncidentSummary(draftRef)
+        .then((summary) => {
+          if (!active) return;
+          setParties(summary.parties);
+          setDraftRef((current) => {
+            if (!current) return current;
+            const ownParty = summary.parties.find((party) => party.id === current.partyId);
+            return { ...current, incidentVersion: summary.incidentVersion, partyVersion: ownParty?.version ?? current.partyVersion };
+          });
+        })
+        .catch(() => { if (active && initialLoad) toast.error(t("incident.saveError")); })
+        .finally(() => { if (active && initialLoad) { initialLoad = false; setSummaryLoading(false); } });
+    };
+    refreshSummary();
+    const interval = window.setInterval(refreshSummary, 5000);
+    return () => { active = false; window.clearInterval(interval); };
+  }, [step, draftRef?.incidentId]);
+
   const startAccident = async () => {
+
     if (creating) return;
     setCreating(true);
     if (!user) {
@@ -87,9 +134,12 @@ export default function Index() {
       );
       setDraftRef(created);
       setData(initial);
+      setParties([]);
+      setCompleted(false);
       setStep(0);
       setView("wizard");
       window.scrollTo(0, 0);
+
     } catch {
       toast.error(t("incident.createError"));
     } finally {
@@ -97,12 +147,13 @@ export default function Index() {
     }
   };
 
-  const back = () => { if (step === 0) setView("home"); else { setStep((value) => value - 1); window.scrollTo(0, 0); } };
+  const back = () => { if (step === 0 || (step === 1 && draftRef?.partyLabel === "B")) setView("home"); else { setStep((value) => value - 1); window.scrollTo(0, 0); } };
 
   const saveCurrentStep = async () => {
+
     if (!draftRef) throw new IncidentSaveError("save");
     const nextRef = { ...draftRef };
-    if (step === 0) {
+    if (step === 0 && nextRef.partyLabel === "A") {
       await replaceWitness(nextRef, data.witnesses);
       nextRef.incidentVersion = await updateIncident(nextRef, {
         occurred_at: new Date(`${data.date}T${data.time}:00`).toISOString(),
@@ -114,6 +165,7 @@ export default function Index() {
     } else if (step === 1) {
 
       nextRef.partyVersion = await updateParty(nextRef, {
+
         driver_json: { fullName: data.driverName, address: data.driverAddress, phone: data.phone, licenseNo: profile?.license_no ?? "" },
         vehicle_json: { plate: data.plate, makeModel: data.vehicle },
         insurance_json: { company: data.insurer, policyNumber: data.policy },
@@ -122,18 +174,23 @@ export default function Index() {
     } else if (step === 2) {
       nextRef.partyVersion = await updateParty(nextRef, { circumstances_checked: data.situations });
       setDraftRef({ ...nextRef });
-      nextRef.incidentVersion = await updateIncident(nextRef, { circumstances_json: { injured: data.injured, otherDamage: data.otherDamage } });
-      setDraftRef({ ...nextRef });
+      if (nextRef.partyLabel === "A") {
+        nextRef.incidentVersion = await updateIncident(nextRef, { circumstances_json: { injured: data.injured, otherDamage: data.otherDamage } });
+        setDraftRef({ ...nextRef });
+      }
     } else if (step === 3) {
       const uploaded = await uploadPendingPhotos(nextRef, data.photos);
       setData((previous) => ({ ...previous, photos: uploaded }));
       nextRef.partyVersion = await updateParty(nextRef, { damage_description: [data.damage, data.notes].filter(Boolean).join("\n\n") });
       setDraftRef({ ...nextRef });
     } else if (step === 4) {
-      const storagePath = data.sketchDataUrl ? await uploadCanvas(nextRef, data.sketchDataUrl, "sketch") : null;
-      nextRef.incidentVersion = await updateIncident(nextRef, { sketch_json: storagePath ? { storagePath } : {} });
-      setDraftRef({ ...nextRef });
+      if (data.sketchDataUrl) await uploadCanvas(nextRef, data.sketchDataUrl, "sketch");
+      if (nextRef.partyLabel === "A") {
+        nextRef.incidentVersion = await updateIncident(nextRef, { sketch_json: data.sketchDataUrl ? { storagePath: `${nextRef.incidentId}/${nextRef.partyId}/sketch.png` } : {} });
+        setDraftRef({ ...nextRef });
+      }
     }
+
   };
 
   const next = async () => {
@@ -196,12 +253,18 @@ export default function Index() {
       const signaturePath = await uploadCanvas(nextRef, data.signatureDataUrl, "signature");
       nextRef.partyVersion = await updateParty(nextRef, { signature_storage_path: signaturePath, signed_at: new Date().toISOString() });
       setDraftRef({ ...nextRef });
-      nextRef.incidentVersion = await updateIncident(nextRef, { status: "signed" });
+      const summary = await loadIncidentSummary(nextRef);
+      nextRef.incidentVersion = summary.incidentVersion;
+      if (summary.parties.length >= 2 && summary.parties.every((party) => party.signedAt)) {
+        nextRef.incidentVersion = await updateIncident(nextRef, { status: "signed" });
+      }
       setDraftRef({ ...nextRef });
+      setParties(summary.parties);
+      setCompleted(true);
       setCases((previous) => [{ id: nextRef.shareCode, date: data.date, time: data.time, location: data.location || t("fields.notProvided"), status: "completed", plate: data.plate || t("fields.noPlate") }, ...previous]);
 
-      setView("home");
       toast.success(t("wizard.saved"));
+
     } catch (error) {
       toast.error(t(error instanceof IncidentSaveError && error.code === "conflict" ? "incident.conflict" : "incident.saveError"));
     } finally {
@@ -210,8 +273,11 @@ export default function Index() {
   };
 
   const selectedSummary = useMemo(() => data.situations.map((index) => circumstances[index]), [data.situations, circumstances]);
+  const counterpart = parties.find((party) => party.id !== draftRef?.partyId);
+  const joinUrl = draftRef ? `${window.location.origin}/join/${draftRef.shareCode}` : "";
 
   if (view === "home") return (
+
     <div className="min-h-screen bg-[#F5F7FA] text-slate-900">
       <AppHeader />
       <main className="mx-auto max-w-5xl px-5 pb-12 pt-8 md:pt-12">
@@ -244,11 +310,13 @@ export default function Index() {
           {step === 3 && <div className="space-y-6"><Field number="11" label={t("fields.visibleDamage")}><Textarea value={data.damage} onChange={(event) => update("damage", event.target.value)} placeholder={t("fields.damagePlaceholder")} className="min-h-28 rounded-xl text-base" /></Field><Field number="14" label={t("fields.remarks")}><Textarea value={data.notes} onChange={(event) => update("notes", event.target.value)} placeholder={t("fields.remarksPlaceholder")} className="min-h-24 rounded-xl text-base" /></Field><Field number="11" label={t("fields.photos")}><label className="flex min-h-32 cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed border-[#9FBACD] bg-[#F7FAFC] p-5 text-center"><Camera className="mb-2 h-8 w-8 text-[#39719D]" /><span className="font-semibold text-[#153B66]">{t("fields.photoAction")}</span><span className="mt-1 text-xs text-slate-500">{t("fields.photoHint")}</span><input type="file" accept="image/*" capture="environment" multiple className="sr-only" onChange={(event) => addPhotos(event.target.files)} /></label></Field>{data.photos.length > 0 && <div className="grid grid-cols-3 gap-3">{data.photos.map((photo, index) => <div key={photo.id} className="relative aspect-square overflow-hidden rounded-xl bg-slate-100"><img src={photo.url} alt={t("fields.photoAlt", { number: formatNumber(index + 1) })} className="h-full w-full object-cover" /><button type="button" onClick={() => void removePhoto(photo)} className="absolute right-1 top-1 flex h-8 w-8 items-center justify-center rounded-full bg-slate-900/75 text-white" aria-label={t("fields.deletePhoto")}><Trash2 className="h-4 w-4" /></button></div>)}</div>}</div>}
 
           {step === 4 && <div className="space-y-5"><div><FieldBadge number="10" /><p className="text-sm font-semibold text-slate-700">{t("fields.initialImpact")}</p></div><FieldBadge number="13" /><div className="rounded-xl bg-[#EDF4F8] p-4 text-sm leading-relaxed text-[#153B66]"><strong>{t("sketch.tipTitle")}</strong> {t("sketch.tip")}</div><DrawingCanvas label={t("fields.sketch")} height={320} onChange={(value, dataUrl) => setData((previous) => ({ ...previous, hasSketch: value, sketchDataUrl: dataUrl ?? "" }))} /><div className="flex flex-wrap gap-3 text-xs text-slate-500"><span className="rounded-full bg-slate-100 px-3 py-1.5">{t("sketch.myVehicle")}</span><span className="rounded-full bg-slate-100 px-3 py-1.5">{t("sketch.otherVehicle")}</span><span className="rounded-full bg-slate-100 px-3 py-1.5">{t("sketch.impact")}</span></div></div>}
-          {step === 5 && <div className="space-y-6"><div className="grid gap-3 sm:grid-cols-2"><Summary number="1" icon={<Clock3 />} label={t("fields.dateTime")} value={formatCaseDate({ ...initialCases[0], date: data.date, time: data.time })} /><Summary number="2" icon={<MapPin />} label={t("fields.place")} value={data.location || t("fields.notProvided")} /><Summary number="9" icon={<UserRound />} label={t("fields.driver")} value={data.driverName || t("fields.notProvided")} /><Summary number="7" icon={<Car />} label={t("fields.vehicle")} value={`${data.plate || t("fields.noPlate")}${data.vehicle ? ` · ${data.vehicle}` : ""}`} /><Summary number="8" icon={<ShieldCheck />} label={t("fields.insurer")} value={data.insurer || t("fields.notProvided")} /><Summary number="11–13" icon={<Camera />} label={t("fields.documentation")} value={`${t("fields.photosCount", { formattedCount: formatNumber(data.photos.length) })} · ${t(data.hasSketch ? "fields.sketchAvailable" : "fields.withoutSketch")}`} /></div><div className="rounded-2xl border border-slate-200 p-4"><FieldBadge number="12" /><p className="mb-2 mt-2 text-xs font-bold uppercase tracking-wider text-slate-500">{t("summary.circumstances")}</p>{selectedSummary.length ? <ul className="space-y-1.5">{selectedSummary.map((item) => <li key={item} className="flex gap-2 text-sm text-slate-700"><Check className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />{item}</li>)}</ul> : <p className="text-sm text-slate-500">{t("summary.noneSelected")}</p>}</div><FieldBadge number="15" /><DrawingCanvas label={t("fields.signature")} height={170} onChange={(value, dataUrl) => setData((previous) => ({ ...previous, hasSignature: value, signatureDataUrl: dataUrl ?? "" }))} /><p className="text-xs leading-relaxed text-slate-500">{t("summary.disclaimer")}</p></div>}
+          {step === 5 && <div className="space-y-6">{draftRef?.partyLabel === "A" && <div className="rounded-3xl bg-[#153B66] p-6 text-white"><div className="grid items-center gap-5 sm:grid-cols-[1fr_auto]"><div><p className="text-xs font-bold uppercase tracking-[0.18em] text-blue-200">{t("summary.inviteParty")}</p><p className="mt-2 font-mono text-4xl font-bold tracking-[0.18em] sm:text-5xl">{draftRef.shareCode}</p><p className="mt-3 max-w-sm text-sm leading-relaxed text-blue-100">{t("summary.scanHint")}</p></div><div className="w-fit rounded-2xl bg-white p-3"><QRCodeSVG value={joinUrl} size={152} level="M" aria-label={t("summary.qrAlt")} /></div></div></div>}<div className="grid gap-3 sm:grid-cols-2"><Summary number="1" icon={<Clock3 />} label={t("fields.dateTime")} value={formatCaseDate({ ...initialCases[0], date: data.date, time: data.time })} /><Summary number="2" icon={<MapPin />} label={t("fields.place")} value={data.location || t("fields.notProvided")} /><Summary number="9" icon={<UserRound />} label={t("fields.driver")} value={data.driverName || t("fields.notProvided")} /><Summary number="7" icon={<Car />} label={t("fields.vehicle")} value={`${data.plate || t("fields.noPlate")}${data.vehicle ? ` · ${data.vehicle}` : ""}`} /><Summary number="8" icon={<ShieldCheck />} label={t("fields.insurer")} value={data.insurer || t("fields.notProvided")} /><Summary number="11–13" icon={<Camera />} label={t("fields.documentation")} value={`${t("fields.photosCount", { formattedCount: formatNumber(data.photos.length) })} · ${t(data.hasSketch ? "fields.sketchAvailable" : "fields.withoutSketch")}`} /></div><div className="rounded-2xl border border-slate-200 p-4"><FieldBadge number="12" /><p className="mb-2 mt-2 text-xs font-bold uppercase tracking-wider text-slate-500">{t("summary.circumstances")}</p>{selectedSummary.length ? <ul className="space-y-1.5">{selectedSummary.map((item) => <li key={item} className="flex gap-2 text-sm text-slate-700"><Check className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />{item}</li>)}</ul> : <p className="text-sm text-slate-500">{t("summary.noneSelected")}</p>}</div><CounterpartSummary party={counterpart} loading={summaryLoading} /><FieldBadge number="15" /><DrawingCanvas label={t("fields.signature")} height={170} onChange={(value, dataUrl) => setData((previous) => ({ ...previous, hasSignature: value, signatureDataUrl: dataUrl ?? "" }))} /><p className="text-xs leading-relaxed text-slate-500">{t("summary.disclaimer")}</p></div>}
+
         </div>
       </main>
-      <div className="fixed inset-x-0 bottom-0 z-20 border-t border-slate-200 bg-white/95 px-5 py-4 backdrop-blur"><div className="mx-auto flex max-w-3xl gap-3"><Button variant="outline" onClick={back} disabled={saving} className="h-14 w-14 shrink-0 rounded-2xl border-slate-300" aria-label={t("app.back")}><ArrowLeft className="h-5 w-5" /></Button>{step < 5 ? <Button onClick={() => void next()} disabled={saving} className="h-14 flex-1 rounded-2xl bg-[#153B66] text-base font-semibold hover:bg-[#102F52]">{saving ? t("incident.saving") : t("wizard.next", { step: steps[step + 1] })}<ArrowRight className="ml-2 h-5 w-5" /></Button> : <Button onClick={() => void complete()} disabled={saving} className="h-14 flex-1 rounded-2xl bg-emerald-700 text-base font-semibold hover:bg-emerald-800"><Check className="mr-2 h-5 w-5" />{saving ? t("incident.saving") : t("wizard.complete")}</Button>}</div></div>
+      <div className="fixed inset-x-0 bottom-0 z-20 border-t border-slate-200 bg-white/95 px-5 py-4 backdrop-blur"><div className="mx-auto flex max-w-3xl gap-3">{completed ? <Button onClick={() => setView("home")} className="h-14 flex-1 rounded-2xl bg-[#153B66] text-base font-semibold"><Check className="mr-2 h-5 w-5" />{t("summary.toOverview")}</Button> : <><Button variant="outline" onClick={back} disabled={saving} className="h-14 w-14 shrink-0 rounded-2xl border-slate-300" aria-label={t("app.back")}><ArrowLeft className="h-5 w-5" /></Button>{step < 5 ? <Button onClick={() => void next()} disabled={saving} className="h-14 flex-1 rounded-2xl bg-[#153B66] text-base font-semibold hover:bg-[#102F52]">{saving ? t("incident.saving") : t("wizard.next", { step: steps[step + 1] })}<ArrowRight className="ml-2 h-5 w-5" /></Button> : <Button onClick={() => void complete()} disabled={saving} className="h-14 flex-1 rounded-2xl bg-emerald-700 text-base font-semibold hover:bg-emerald-800"><Check className="mr-2 h-5 w-5" />{saving ? t("incident.saving") : t("wizard.complete")}</Button>}</>}</div></div>
     </div>
+
   );
 }
 
@@ -263,3 +331,9 @@ function SectionTitle({ number, icon, title }: { number: string; icon: React.Rea
 
 function Choice({ active, warning, onClick, children }: { active: boolean; warning?: boolean; onClick: () => void; children: React.ReactNode }) { return <button type="button" onClick={onClick} className={`h-14 rounded-xl border-2 text-base font-semibold ${active ? warning ? "border-amber-500 bg-amber-50 text-amber-900" : "border-[#153B66] bg-[#EDF3F7] text-[#153B66]" : "border-slate-200 text-slate-600"}`}>{children}</button>; }
 function Summary({ number, icon, label, value }: { number: string; icon: React.ReactNode; label: string; value: string }) { return <div className="flex gap-3 rounded-2xl bg-[#F6F8FA] p-4"><span className="mt-0.5 text-[#39719D] [&>svg]:h-5 [&>svg]:w-5">{icon}</span><div className="min-w-0"><FieldBadge number={number} /><p className="text-xs font-semibold uppercase tracking-wide text-slate-500">{label}</p><p className="mt-1 break-words text-sm font-semibold text-slate-800">{value}</p></div></div>; }
+
+function CounterpartSummary({ party, loading }: { party?: IncidentPartySummary; loading: boolean }) {
+  const { t } = useTranslation();
+  const circumstances = t("circumstances.items", { returnObjects: true }) as string[];
+  return <section className="rounded-2xl border-2 border-[#C9D9E5] bg-[#F7FAFC] p-5"><div className="mb-4 flex items-center justify-between gap-3"><div><p className="text-xs font-bold uppercase tracking-wider text-[#39719D]">{t("summary.counterpartEyebrow")}</p><h2 className="mt-1 text-lg font-bold text-[#153B66]">{t("summary.counterpartTitle", { label: party?.partyLabel ?? "–" })}</h2></div><span className="rounded-full bg-white px-3 py-1 text-xs font-semibold text-slate-500">{t("summary.readOnly")}</span></div>{loading ? <p className="text-sm text-slate-500">{t("auth.loading")}</p> : !party ? <p className="rounded-xl bg-white p-4 text-sm leading-relaxed text-slate-600">{t("summary.waitingForParty")}</p> : <div className="grid gap-3 sm:grid-cols-2"><Summary number="9" icon={<UserRound />} label={t("fields.driver")} value={party.driver.fullName || t("fields.notProvided")} /><Summary number="7" icon={<Car />} label={t("fields.vehicle")} value={`${party.vehicle.plate || t("fields.noPlate")}${party.vehicle.makeModel ? ` · ${party.vehicle.makeModel}` : ""}`} /><Summary number="8" icon={<ShieldCheck />} label={t("fields.insurer")} value={`${party.insurance.company || t("fields.notProvided")}${party.insurance.policyNumber ? ` · ${party.insurance.policyNumber}` : ""}`} /><Summary number="11" icon={<FileText />} label={t("fields.visibleDamage")} value={party.damageDescription || t("fields.notProvided")} /><div className="rounded-2xl bg-white p-4 sm:col-span-2"><p className="text-xs font-semibold uppercase tracking-wide text-slate-500">{t("summary.circumstances")}</p><p className="mt-2 text-sm leading-relaxed text-slate-700">{party.circumstancesChecked.length ? party.circumstancesChecked.map((index) => circumstances[index]).filter(Boolean).join(" · ") : t("summary.noneSelected")}</p></div></div>}</section>;
+}

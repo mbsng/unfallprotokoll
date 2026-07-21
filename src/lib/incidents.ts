@@ -1,5 +1,5 @@
 import { supabase } from "@/integrations/supabase/client";
-import type { IncidentDraftRef, PendingPhoto } from "@/types/incident";
+import type { IncidentDraftRef, IncidentPreview, IncidentSummaryData, JoinedIncidentState, PendingPhoto } from "@/types/incident";
 
 export class IncidentSaveError extends Error {
   constructor(public code: "save" | "conflict" | "create") {
@@ -7,7 +7,25 @@ export class IncidentSaveError extends Error {
   }
 }
 
+export class IncidentJoinError extends Error {
+  constructor(public code: string) {
+    super(code);
+  }
+}
+
+async function functionErrorCode(error: unknown, fallback: string) {
+  const context = (error as { context?: Response } | null)?.context;
+  if (!context) return fallback;
+  try {
+    const body = await context.clone().json() as { error?: string };
+    return body.error ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 export async function createIncidentWithParty(driver: object, vehicle: object, insurance: object): Promise<IncidentDraftRef> {
+
   const { data, error } = await supabase.rpc("create_incident_with_party", {
     initial_driver: driver,
     initial_vehicle: vehicle,
@@ -18,13 +36,53 @@ export async function createIncidentWithParty(driver: object, vehicle: object, i
   return {
     incidentId: row.incident_id,
     partyId: row.party_id,
+    partyLabel: "A",
     shareCode: row.share_code,
     incidentVersion: row.incident_version,
     partyVersion: row.party_version,
   };
 }
 
+export async function previewIncident(code: string): Promise<IncidentPreview> {
+  const { data, error } = await supabase.functions.invoke("join-incident", { body: { action: "preview", code } });
+  if (error) throw new IncidentJoinError(await functionErrorCode(error, "not_found"));
+  if (!data?.incident) throw new IncidentJoinError(data?.error ?? "not_found");
+  return data.incident as IncidentPreview;
+}
+
+export async function joinIncident(code: string): Promise<JoinedIncidentState> {
+  const { data, error } = await supabase.functions.invoke("join-incident", { body: { action: "join", code } });
+  if (error) throw new IncidentJoinError(await functionErrorCode(error, "join_failed"));
+  if (!data?.draftRef || !data?.incident) throw new IncidentJoinError(data?.error ?? "join_failed");
+  return data as JoinedIncidentState;
+}
+
+export async function loadIncidentSummary(ref: IncidentDraftRef): Promise<IncidentSummaryData> {
+  const [incidentResult, partiesResult] = await Promise.all([
+    supabase.from("incidents").select("version, status").eq("id", ref.incidentId).single(),
+    supabase.from("incident_parties").select("id, party_label, version, driver_json, vehicle_json, insurance_json, damage_description, circumstances_checked, signed_at").eq("incident_id", ref.incidentId).order("party_label"),
+  ]);
+  if (incidentResult.error || partiesResult.error) throw new IncidentSaveError("save");
+  return {
+    incidentVersion: incidentResult.data.version,
+    status: incidentResult.data.status,
+    parties: partiesResult.data.map((party) => ({
+      id: party.id,
+      partyLabel: party.party_label as "A" | "B",
+      version: party.version,
+      driver: party.driver_json,
+
+      vehicle: party.vehicle_json,
+      insurance: party.insurance_json,
+      damageDescription: party.damage_description,
+      circumstancesChecked: party.circumstances_checked,
+      signedAt: party.signed_at,
+    })),
+  };
+}
+
 export async function updateIncident(ref: IncidentDraftRef, updates: Record<string, unknown>) {
+
   const nextVersion = ref.incidentVersion + 1;
   const { data, error } = await supabase
     .from("incidents")
