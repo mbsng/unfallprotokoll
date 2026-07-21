@@ -71,13 +71,25 @@ export async function loadIncidentSummary(ref: IncidentDraftRef): Promise<Incide
       partyLabel: party.party_label as "A" | "B",
       version: party.version,
       driver: party.driver_json,
-
       vehicle: party.vehicle_json,
       insurance: party.insurance_json,
       damageDescription: party.damage_description,
       circumstancesChecked: party.circumstances_checked,
       signedAt: party.signed_at,
     })),
+  };
+}
+
+export function subscribeToIncident(incidentId: string, onChange: () => void, onStatus: (connected: boolean) => void) {
+  const channel = supabase
+    .channel(`incident:${incidentId}`)
+    .on("postgres_changes", { event: "*", schema: "public", table: "incidents", filter: `id=eq.${incidentId}` }, onChange)
+    .on("postgres_changes", { event: "*", schema: "public", table: "incident_parties", filter: `incident_id=eq.${incidentId}` }, onChange)
+    .subscribe((status) => onStatus(status === "SUBSCRIBED"));
+
+  return () => {
+    onStatus(false);
+    void supabase.removeChannel(channel);
   };
 }
 
