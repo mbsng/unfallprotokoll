@@ -64,6 +64,8 @@ export async function replaceWitness(ref: IncidentDraftRef, witness: string) {
 const extensionForFile = (file: File) => {
   if (file.type === "image/png") return "png";
   if (file.type === "image/webp") return "webp";
+  if (file.type === "image/heic") return "heic";
+  if (file.type === "image/heif") return "heif";
   if (file.type === "application/pdf") return "pdf";
   return "jpg";
 };
@@ -86,12 +88,12 @@ export async function uploadPendingPhotos(ref: IncidentDraftRef, photos: Pending
     if (error) throw new IncidentSaveError("save");
     const mediaId = await registerMedia(ref, path, "photo", new Date(photo.file.lastModified).toISOString());
     result.push({ ...photo, storagePath: path, mediaId, file: undefined });
-
   }
   return result;
 }
 
 const dataUrlToBlob = async (dataUrl: string) => {
+
   const response = await fetch(dataUrl);
   return response.blob();
 };
@@ -106,7 +108,13 @@ export async function uploadCanvas(ref: IncidentDraftRef, dataUrl: string, name:
 }
 
 export async function deleteIncidentPhoto(photo: PendingPhoto) {
-  if (photo.storagePath) await supabase.storage.from("incident-media").remove([photo.storagePath]);
-  if (photo.mediaId) await supabase.from("incident_media").delete().eq("id", photo.mediaId);
+  if (photo.storagePath) {
+    const { error } = await supabase.storage.from("incident-media").remove([photo.storagePath]);
+    if (error) throw new IncidentSaveError("save");
+  }
+  if (photo.mediaId) {
+    const { error } = await supabase.from("incident_media").delete().eq("id", photo.mediaId);
+    if (error) throw new IncidentSaveError("save");
+  }
   URL.revokeObjectURL(photo.url);
 }
