@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { RotateCcw } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 
 interface DrawingCanvasProps {
@@ -9,6 +10,7 @@ interface DrawingCanvasProps {
 }
 
 export function DrawingCanvas({ label, height = 260, onChange }: DrawingCanvasProps) {
+  const { t } = useTranslation();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const drawing = useRef(false);
   const [hasDrawing, setHasDrawing] = useState(false);
@@ -78,12 +80,13 @@ export function DrawingCanvas({ label, height = 260, onChange }: DrawingCanvasPr
       <div className="mb-2 flex items-center justify-between">
         <span className="text-sm font-semibold text-slate-700">{label}</span>
         <Button type="button" variant="ghost" size="sm" onClick={clear} className="h-10 gap-2 text-slate-600">
-          <RotateCcw className="h-4 w-4" /> Löschen
+          <RotateCcw className="h-4 w-4" /> {t("sketch.clear")}
         </Button>
       </div>
       <canvas
         ref={canvasRef}
         aria-label={label}
+
         className="w-full touch-none rounded-2xl border-2 border-dashed border-slate-300 bg-white shadow-inner"
         style={{ height }}
         onPointerDown={start}
