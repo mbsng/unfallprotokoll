@@ -16,17 +16,11 @@ import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { UserMenu } from "@/components/UserMenu";
 import { useAuth } from "@/contexts/AuthContext";
 import { localeForLanguage } from "@/i18n";
-import { createIncidentWithParty, deleteIncidentPhoto, IncidentSaveError, loadIncidentSummary, replaceWitness, subscribeToIncident, updateIncident, updateParty, uploadCanvas, uploadPendingPhotos } from "@/lib/incidents";
-import type { IncidentDraftRef, IncidentPartySummary, JoinedIncidentState, PendingPhoto } from "@/types/incident";
+import { loadIncidentSummary, subscribeToIncident } from "@/lib/incidents";
+import { createLocalDraft, deleteLocalPhoto, getLatestDraft, markDraftComplete, saveDraftField, saveLocalPhoto, type LocalDraft } from "@/lib/local-db";
+import type { AccidentData, IncidentDraftRef, IncidentPartySummary, JoinedIncidentState, PendingPhoto } from "@/types/incident";
 
 import type { Profile } from "@/types/profile";
-
-interface AccidentData {
-  date: string; time: string; location: string; locationLat: number | null; locationLng: number | null; injured: boolean; otherDamage: boolean; witnesses: string;
-  driverName: string; driverAddress: string; phone: string; plate: string; vehicle: string;
-  insurer: string; policy: string; situations: number[]; damage: string; notes: string;
-  photos: PendingPhoto[]; hasSketch: boolean; sketchDataUrl: string; hasSignature: boolean; signatureDataUrl: string;
-}
 
 interface CaseItem { id: string; date: string; time: string; location: string; status: "draft" | "completed"; plate: string }
 
@@ -77,6 +71,7 @@ export default function Index() {
   const [step, setStep] = useState(joinedIncident ? 1 : 0);
   const [data, setData] = useState<AccidentData>(() => joinedIncident ? joinedData(joinedIncident, profile) : emptyData(profile));
   const [draftRef, setDraftRef] = useState<IncidentDraftRef | null>(joinedIncident?.draftRef ?? null);
+  const [localDraftId, setLocalDraftId] = useState<string | null>(null);
 
   const [parties, setParties] = useState<IncidentPartySummary[]>([]);
   const [summaryLoading, setSummaryLoading] = useState(false);
@@ -93,9 +88,16 @@ export default function Index() {
   const [joinCode, setJoinCode] = useState("");
   const [locating, setLocating] = useState(false);
 
+  const applyLocalDraft = (draft: LocalDraft) => {
+    setLocalDraftId(draft.id);
+    setDraftRef(draft.ref);
+    setData(draft.data);
+  };
+
   const update = <K extends keyof AccidentData>(key: K, value: AccidentData[K]) => {
     setDirty(true);
     setData((previous) => ({ ...previous, [key]: value }));
+    if (localDraftId) void saveDraftField(localDraftId, key, value);
   };
 
   const formatNumber = (value: number) => new Intl.NumberFormat(locale).format(value);
@@ -106,7 +108,30 @@ export default function Index() {
   };
 
   useEffect(() => {
-    if (view !== "wizard" || !draftRef) return;
+    let active = true;
+    void getLatestDraft().then(async (latest) => {
+      if (!active) return;
+      if (joinedIncident && latest?.ref.partyId !== joinedIncident.draftRef.partyId) {
+        const created = await createLocalDraft(joinedData(joinedIncident, profile), joinedIncident.draftRef);
+        if (active) applyLocalDraft(created);
+      } else if (latest) {
+        applyLocalDraft(latest);
+        if (!localDraftId) setView("wizard");
+      }
+    });
+    const onDraftChange = (event: Event) => {
+      const draft = (event as CustomEvent<LocalDraft>).detail;
+      if (draft.id === localDraftId) applyLocalDraft(draft);
+    };
+    window.addEventListener("local-draft-change", onDraftChange);
+    return () => {
+      active = false;
+      window.removeEventListener("local-draft-change", onDraftChange);
+    };
+  }, [joinedIncident?.draftRef.partyId, localDraftId]);
+
+  useEffect(() => {
+    if (view !== "wizard" || !draftRef || draftRef.incidentId.startsWith("local:")) return;
     let active = true;
     let refreshing = false;
     let refreshQueued = false;
@@ -152,36 +177,21 @@ export default function Index() {
   }, [view, draftRef?.incidentId]);
 
   const startAccident = async () => {
-
     if (creating) return;
     setCreating(true);
-    if (!user) {
-      const started = await startAnonymous();
-      if (!started) {
-        setCreating(false);
-        toast.error(t("guest.sessionError"));
-        return;
-      }
-    }
     const initial = emptyData(profile);
     try {
-      const created = await createIncidentWithParty(
-        { fullName: initial.driverName, address: initial.driverAddress, phone: initial.phone, licenseNo: profile?.license_no ?? "" },
-        { plate: initial.plate, makeModel: initial.vehicle },
-        { company: initial.insurer, policyNumber: initial.policy },
-      );
-      setDraftRef(created);
-      setData(initial);
+      const created = await createLocalDraft(initial);
+      applyLocalDraft(created);
       setParties([]);
       setServerLoaded(false);
       setRealtimeConnected(false);
       setDirty(false);
       setCompleted(false);
       setStep(0);
-
       setView("wizard");
       window.scrollTo(0, 0);
-
+      if (!user && navigator.onLine) void startAnonymous();
     } catch {
       toast.error(t("incident.createError"));
     } finally {
@@ -191,77 +201,15 @@ export default function Index() {
 
   const back = () => { if (step === 0 || (step === 1 && draftRef?.partyLabel === "B")) setView("home"); else { setStep((value) => value - 1); window.scrollTo(0, 0); } };
 
-  const saveCurrentStep = async () => {
-
-    if (!draftRef) throw new IncidentSaveError("save");
-    const nextRef = { ...draftRef };
-    if (step === 0 && nextRef.partyLabel === "A") {
-      await replaceWitness(nextRef, data.witnesses);
-      nextRef.incidentVersion = await updateIncident(nextRef, {
-        occurred_at: new Date(`${data.date}T${data.time}:00`).toISOString(),
-        location_lat: data.locationLat,
-        location_lng: data.locationLng,
-        location_text: data.location,
-      });
-      setDraftRef({ ...nextRef });
-    } else if (step === 1) {
-
-      nextRef.partyVersion = await updateParty(nextRef, {
-
-        driver_json: { fullName: data.driverName, address: data.driverAddress, phone: data.phone, licenseNo: profile?.license_no ?? "" },
-        vehicle_json: { plate: data.plate, makeModel: data.vehicle },
-        insurance_json: { company: data.insurer, policyNumber: data.policy },
-      });
-      setDraftRef({ ...nextRef });
-    } else if (step === 2) {
-      nextRef.partyVersion = await updateParty(nextRef, { circumstances_checked: data.situations });
-      setDraftRef({ ...nextRef });
-      if (nextRef.partyLabel === "A") {
-        nextRef.incidentVersion = await updateIncident(nextRef, { circumstances_json: { injured: data.injured, otherDamage: data.otherDamage } });
-        setDraftRef({ ...nextRef });
-      }
-    } else if (step === 3) {
-      const uploaded = await uploadPendingPhotos(nextRef, data.photos);
-      setData((previous) => ({ ...previous, photos: uploaded }));
-      nextRef.partyVersion = await updateParty(nextRef, { damage_description: [data.damage, data.notes].filter(Boolean).join("\n\n") });
-      setDraftRef({ ...nextRef });
-    } else if (step === 4) {
-      if (data.sketchDataUrl) await uploadCanvas(nextRef, data.sketchDataUrl, "sketch");
-      if (nextRef.partyLabel === "A") {
-        nextRef.incidentVersion = await updateIncident(nextRef, { sketch_json: data.sketchDataUrl ? { storagePath: `${nextRef.incidentId}/${nextRef.partyId}/sketch.png` } : {} });
-        setDraftRef({ ...nextRef });
-      }
-    }
-
-    return nextRef;
-  };
-
   const next = async () => {
-
     if (step === 0 && !data.date) return toast.error(t("validation.dateRequired"));
     if (step === 0 && !data.location.trim()) return toast.error(t("validation.locationRequired"));
     if (step === 1 && ![data.driverName, data.driverAddress, data.phone, data.plate, data.vehicle, data.insurer, data.policy].every(hasText)) return toast.error(t("validation.requiredFields"));
     if (step === 3 && !hasText(data.damage)) return toast.error(t("validation.damageRequired"));
-    if (saving) return;
-    setSaving(true);
-    try {
-      const syncedRef = await saveCurrentStep();
-      setDirty(false);
-      if (step === 4) {
-        const summary = await loadIncidentSummary(syncedRef);
-        const ownParty = summary.parties.find((party) => party.id === syncedRef.partyId);
-        setParties(summary.parties);
-        setServerLoaded(true);
-        setDraftRef({ ...syncedRef, incidentVersion: summary.incidentVersion, partyVersion: ownParty?.version ?? syncedRef.partyVersion });
-      }
-      toast.success(t("incident.saved"));
-      setStep((value) => Math.min(value + 1, 5));
-      window.scrollTo(0, 0);
-    } catch (error) {
-      toast.error(t(error instanceof IncidentSaveError && error.code === "conflict" ? "incident.conflict" : "incident.saveError"));
-    } finally {
-      setSaving(false);
-    }
+    setDirty(false);
+    toast.success(t("incident.saved"));
+    setStep((value) => Math.min(value + 1, 5));
+    window.scrollTo(0, 0);
   };
 
   const locate = () => {
@@ -269,7 +217,10 @@ export default function Index() {
     setLocating(true);
     navigator.geolocation.getCurrentPosition(
       ({ coords }) => {
-        setData((previous) => ({ ...previous, location: `${coords.latitude.toLocaleString(locale, { maximumFractionDigits: 5 })}, ${coords.longitude.toLocaleString(locale, { maximumFractionDigits: 5 })}`, locationLat: coords.latitude, locationLng: coords.longitude }));
+        const location = `${coords.latitude.toLocaleString(locale, { maximumFractionDigits: 5 })}, ${coords.longitude.toLocaleString(locale, { maximumFractionDigits: 5 })}`;
+        update("location", location);
+        update("locationLat", coords.latitude);
+        update("locationLng", coords.longitude);
         setLocating(false);
         toast.success(t("location.success"));
       },
@@ -278,15 +229,14 @@ export default function Index() {
   };
 
   const addPhotos = (files: FileList | null) => {
-    if (!files) return;
-    const added = Array.from(files).map((file) => ({ id: crypto.randomUUID(), file, url: URL.createObjectURL(file) }));
-    update("photos", [...data.photos, ...added]);
+    if (!files || !localDraftId) return;
+    for (const file of Array.from(files)) void saveLocalPhoto(localDraftId, file);
   };
 
   const removePhoto = async (photo: PendingPhoto) => {
+    if (!localDraftId) return;
     try {
-      await deleteIncidentPhoto(photo);
-      update("photos", data.photos.filter((item) => item.id !== photo.id));
+      await deleteLocalPhoto(localDraftId, photo.id);
     } catch {
       toast.error(t("incident.saveError"));
     }
@@ -301,28 +251,15 @@ export default function Index() {
   const complete = async () => {
     if (!signatureUnlocked) return toast.error(t("signatureGate.syncing"));
     if (!data.hasSignature || !data.signatureDataUrl) return toast.error(t("validation.signatureRequired"));
-    if (!draftRef || saving) return;
+    if (!draftRef || !localDraftId || saving) return;
     setSaving(true);
-
     try {
-      const nextRef = { ...draftRef };
-      const signaturePath = await uploadCanvas(nextRef, data.signatureDataUrl, "signature");
-      nextRef.partyVersion = await updateParty(nextRef, { signature_storage_path: signaturePath, signed_at: new Date().toISOString() });
-      setDraftRef({ ...nextRef });
-      const summary = await loadIncidentSummary(nextRef);
-      nextRef.incidentVersion = summary.incidentVersion;
-      if (summary.parties.length >= 2 && summary.parties.every((party) => party.signedAt)) {
-        nextRef.incidentVersion = await updateIncident(nextRef, { status: "signed" });
-      }
-      setDraftRef({ ...nextRef });
-      setParties(summary.parties);
+      await markDraftComplete(localDraftId);
       setCompleted(true);
-      setCases((previous) => [{ id: nextRef.shareCode, date: data.date, time: data.time, location: data.location || t("fields.notProvided"), status: "completed", plate: data.plate || t("fields.noPlate") }, ...previous]);
-
+      setCases((previous) => [{ id: draftRef.shareCode, date: data.date, time: data.time, location: data.location || t("fields.notProvided"), status: "completed", plate: data.plate || t("fields.noPlate") }, ...previous]);
       toast.success(t("wizard.saved"));
-
-    } catch (error) {
-      toast.error(t(error instanceof IncidentSaveError && error.code === "conflict" ? "incident.conflict" : "incident.saveError"));
+    } catch {
+      toast.error(t("incident.saveError"));
     } finally {
       setSaving(false);
     }
@@ -334,8 +271,10 @@ export default function Index() {
   const partyB = parties.find((party) => party.partyLabel === "B");
   const partyBStatus = !partyB ? "waiting" : partyB.signedAt ? "signed" : partyB.version === 1 ? "joined" : "filling";
   const allRequiredFieldsComplete = parties.length >= 2 && parties.every(partyRequiredFieldsComplete);
+  const ownRequiredFieldsComplete = [data.driverName, data.driverAddress, data.phone, data.plate, data.vehicle, data.insurer, data.policy, data.damage].every(hasText);
   const localStateSynced = Boolean(serverLoaded && realtimeConnected && !dirty && !saving && ownParty && draftRef && ownParty.version === draftRef.partyVersion);
-  const signatureUnlocked = allRequiredFieldsComplete && localStateSynced;
+  const offlineDraft = Boolean(draftRef?.incidentId.startsWith("local:") || !navigator.onLine);
+  const signatureUnlocked = ownRequiredFieldsComplete && (offlineDraft || (allRequiredFieldsComplete && localStateSynced));
   const signatureGateReason = !partyB ? "waiting" : !allRequiredFieldsComplete ? "required" : "syncing";
   const joinUrl = draftRef ? `${window.location.origin}/join/${draftRef.shareCode}` : "";
 
@@ -367,14 +306,14 @@ export default function Index() {
         {(!user || isAnonymous) && <div className="mb-5 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-amber-950"><div className="flex gap-3"><AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-700" /><div><p className="font-semibold">{t("guest.notice")}</p><p className="mt-1 text-sm leading-relaxed text-amber-800">{t("guest.detail")}</p><Button asChild variant="link" className="mt-1 h-auto p-0 font-semibold text-amber-900"><Link to="/auth">{t("guest.createAccount")}</Link></Button></div></div></div>}
         <div className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm md:p-7">
 
-          {step === 0 && <div className="space-y-6"><div className="grid grid-cols-2 gap-4"><Field number="1" label={t("fields.date")}><Input type="date" value={data.date} onChange={(event) => update("date", event.target.value)} className={fieldClass} /></Field><Field number="1" label={t("fields.time")}><Input type="time" value={data.time} onChange={(event) => update("time", event.target.value)} className={fieldClass} /></Field></div><Field number="2" label={t("fields.place")}><div className="space-y-2"><Input value={data.location} onChange={(event) => setData((previous) => ({ ...previous, location: event.target.value, locationLat: null, locationLng: null }))} placeholder={t("fields.placePlaceholder")} className={fieldClass} /><Button type="button" variant="outline" onClick={locate} disabled={locating} className="h-12 w-full rounded-xl border-[#B8CDDC] text-[#153B66]"><LocateFixed className={`mr-2 h-5 w-5 ${locating ? "animate-spin" : ""}`} />{t(locating ? "location.locating" : "location.useCurrent")}</Button></div></Field><Field number="3" label={t("fields.injured")}><div className="grid grid-cols-2 gap-3"><Choice active={!data.injured} onClick={() => update("injured", false)}>{t("fields.no")}</Choice><Choice active={data.injured} warning onClick={() => update("injured", true)}>{t("fields.yesInjured")}</Choice></div>{data.injured && <p className="mt-3 rounded-xl bg-amber-50 p-3 text-sm font-medium text-amber-900">{t("fields.emergency")}</p>}</Field><Field number="4" label={t("fields.otherDamage")}><div className="grid grid-cols-2 gap-3"><Choice active={!data.otherDamage} onClick={() => update("otherDamage", false)}>{t("fields.no")}</Choice><Choice active={data.otherDamage} warning onClick={() => update("otherDamage", true)}>{t("fields.yesOtherDamage")}</Choice></div></Field><Field number="5" label={t("fields.witnesses")}><Textarea value={data.witnesses} onChange={(event) => update("witnesses", event.target.value)} placeholder={t("fields.witnessesPlaceholder")} className="min-h-24 rounded-xl text-base" /></Field></div>}
+          {step === 0 && <div className="space-y-6"><div className="grid grid-cols-2 gap-4"><Field number="1" label={t("fields.date")}><Input type="date" value={data.date} onChange={(event) => update("date", event.target.value)} className={fieldClass} /></Field><Field number="1" label={t("fields.time")}><Input type="time" value={data.time} onChange={(event) => update("time", event.target.value)} className={fieldClass} /></Field></div><Field number="2" label={t("fields.place")}><div className="space-y-2"><Input value={data.location} onChange={(event) => { update("location", event.target.value); update("locationLat", null); update("locationLng", null); }} placeholder={t("fields.placePlaceholder")} className={fieldClass} /><Button type="button" variant="outline" onClick={locate} disabled={locating} className="h-12 w-full rounded-xl border-[#B8CDDC] text-[#153B66]"><LocateFixed className={`mr-2 h-5 w-5 ${locating ? "animate-spin" : ""}`} />{t(locating ? "location.locating" : "location.useCurrent")}</Button></div></Field><Field number="3" label={t("fields.injured")}><div className="grid grid-cols-2 gap-3"><Choice active={!data.injured} onClick={() => update("injured", false)}>{t("fields.no")}</Choice><Choice active={data.injured} warning onClick={() => update("injured", true)}>{t("fields.yesInjured")}</Choice></div>{data.injured && <p className="mt-3 rounded-xl bg-amber-50 p-3 text-sm font-medium text-amber-900">{t("fields.emergency")}</p>}</Field><Field number="4" label={t("fields.otherDamage")}><div className="grid grid-cols-2 gap-3"><Choice active={!data.otherDamage} onClick={() => update("otherDamage", false)}>{t("fields.no")}</Choice><Choice active={data.otherDamage} warning onClick={() => update("otherDamage", true)}>{t("fields.yesOtherDamage")}</Choice></div></Field><Field number="5" label={t("fields.witnesses")}><Textarea value={data.witnesses} onChange={(event) => update("witnesses", event.target.value)} placeholder={t("fields.witnessesPlaceholder")} className="min-h-24 rounded-xl text-base" /></Field></div>}
 
           {step === 1 && <div className="space-y-7"><SectionTitle number="6 & 9" icon={<UserRound />} title={t("fields.driver")} /><div className="space-y-5"><Field label={t("fields.fullName")}><Input value={data.driverName} onChange={(event) => update("driverName", event.target.value)} placeholder={t("fields.namePlaceholder")} className={fieldClass} /></Field><Field label={t("fields.address")}><Input value={data.driverAddress} onChange={(event) => update("driverAddress", event.target.value)} placeholder={t("fields.addressPlaceholder")} className={fieldClass} /></Field><Field label={t("fields.phone")}><Input type="tel" value={data.phone} onChange={(event) => update("phone", event.target.value)} placeholder={t("fields.phonePlaceholder")} className={fieldClass} /></Field></div><div className="border-t border-slate-100 pt-6"><SectionTitle number="7–8" icon={<Car />} title={t("fields.vehicleInsurance")} /></div><div className="grid gap-5 sm:grid-cols-2"><Field number="7" label={t("fields.plate")}><Input value={data.plate} onChange={(event) => update("plate", event.target.value.toUpperCase())} placeholder={t("fields.platePlaceholder")} className={`${fieldClass} font-semibold uppercase`} /></Field><Field number="7" label={t("fields.vehicle")}><Input value={data.vehicle} onChange={(event) => update("vehicle", event.target.value)} placeholder={t("fields.vehiclePlaceholder")} className={fieldClass} /></Field><Field number="8" label={t("fields.insurer")}><Input value={data.insurer} onChange={(event) => update("insurer", event.target.value)} placeholder={t("fields.insurerPlaceholder")} className={fieldClass} /></Field><Field number="8" label={t("fields.policy")}><Input value={data.policy} onChange={(event) => update("policy", event.target.value)} placeholder={t("fields.policyPlaceholder")} className={fieldClass} /></Field></div></div>}
           {step === 2 && <div className="space-y-3"><FieldBadge number="12" />{circumstances.map((circumstance, index) => { const selected = data.situations.includes(index); return <label key={index} className={`flex min-h-16 cursor-pointer items-center gap-4 rounded-2xl border-2 p-4 ${selected ? "border-[#39719D] bg-[#EDF4F8]" : "border-slate-200"}`}><Checkbox checked={selected} onCheckedChange={() => update("situations", selected ? data.situations.filter((value) => value !== index) : [...data.situations, index])} className="h-6 w-6 rounded-md data-[state=checked]:border-[#153B66] data-[state=checked]:bg-[#153B66]" /><span className="flex-1 text-sm font-medium leading-snug text-slate-700"><span className="mr-2 text-xs font-bold text-[#39719D]">{formatNumber(index + 1)}.</span>{circumstance}</span></label>; })}<p className="pt-3 text-center text-sm font-medium text-slate-500">{t("circumstances.selected", { count: data.situations.length, formattedCount: formatNumber(data.situations.length) })}</p></div>}
           {step === 3 && <div className="space-y-6"><Field number="11" label={t("fields.visibleDamage")}><Textarea value={data.damage} onChange={(event) => update("damage", event.target.value)} placeholder={t("fields.damagePlaceholder")} className="min-h-28 rounded-xl text-base" /></Field><Field number="14" label={t("fields.remarks")}><Textarea value={data.notes} onChange={(event) => update("notes", event.target.value)} placeholder={t("fields.remarksPlaceholder")} className="min-h-24 rounded-xl text-base" /></Field><Field number="11" label={t("fields.photos")}><label className="flex min-h-32 cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed border-[#9FBACD] bg-[#F7FAFC] p-5 text-center"><Camera className="mb-2 h-8 w-8 text-[#39719D]" /><span className="font-semibold text-[#153B66]">{t("fields.photoAction")}</span><span className="mt-1 text-xs text-slate-500">{t("fields.photoHint")}</span><input type="file" accept="image/*" capture="environment" multiple className="sr-only" onChange={(event) => addPhotos(event.target.files)} /></label></Field>{data.photos.length > 0 && <div className="grid grid-cols-3 gap-3">{data.photos.map((photo, index) => <div key={photo.id} className="relative aspect-square overflow-hidden rounded-xl bg-slate-100"><img src={photo.url} alt={t("fields.photoAlt", { number: formatNumber(index + 1) })} className="h-full w-full object-cover" /><button type="button" onClick={() => void removePhoto(photo)} className="absolute right-1 top-1 flex h-8 w-8 items-center justify-center rounded-full bg-slate-900/75 text-white" aria-label={t("fields.deletePhoto")}><Trash2 className="h-4 w-4" /></button></div>)}</div>}</div>}
 
-          {step === 4 && <div className="space-y-5"><div><FieldBadge number="10" /><p className="text-sm font-semibold text-slate-700">{t("fields.initialImpact")}</p></div><FieldBadge number="13" /><div className="rounded-xl bg-[#EDF4F8] p-4 text-sm leading-relaxed text-[#153B66]"><strong>{t("sketch.tipTitle")}</strong> {t("sketch.tip")}</div><DrawingCanvas label={t("fields.sketch")} height={320} onChange={(value, dataUrl) => setData((previous) => ({ ...previous, hasSketch: value, sketchDataUrl: dataUrl ?? "" }))} /><div className="flex flex-wrap gap-3 text-xs text-slate-500"><span className="rounded-full bg-slate-100 px-3 py-1.5">{t("sketch.myVehicle")}</span><span className="rounded-full bg-slate-100 px-3 py-1.5">{t("sketch.otherVehicle")}</span><span className="rounded-full bg-slate-100 px-3 py-1.5">{t("sketch.impact")}</span></div></div>}
-          {step === 5 && <div className="space-y-6">{draftRef?.partyLabel === "A" && <div className="rounded-3xl bg-[#153B66] p-6 text-white"><div className="grid items-center gap-5 sm:grid-cols-[1fr_auto]"><div><p className="text-xs font-bold uppercase tracking-[0.18em] text-blue-200">{t("summary.inviteParty")}</p><p className="mt-2 font-mono text-4xl font-bold tracking-[0.18em] sm:text-5xl">{draftRef.shareCode}</p><p className="mt-3 max-w-sm text-blue-100">{t("summary.scanHint")}</p></div><div className="w-fit rounded-2xl bg-white p-3"><QRCodeSVG value={joinUrl} size={152} level="M" aria-label={t("summary.qrAlt")} /></div></div></div>}<div className="grid gap-3 sm:grid-cols-2"><Summary number="1" icon={<Clock3 />} label={t("fields.dateTime")} value={formatCaseDate({ ...initialCases[0], date: data.date, time: data.time })} /><Summary number="2" icon={<MapPin />} label={t("fields.place")} value={data.location || t("fields.notProvided")} /><Summary number="9" icon={<UserRound />} label={t("fields.driver")} value={data.driverName || t("fields.notProvided")} /><Summary number="7" icon={<Car />} label={t("fields.vehicle")} value={`${data.plate || t("fields.noPlate")}${data.vehicle ? ` · ${data.vehicle}` : ""}`} /><Summary number="8" icon={<ShieldCheck />} label={t("fields.insurer")} value={data.insurer || t("fields.notProvided")} /><Summary number="11–13" icon={<Camera />} label={t("fields.documentation")} value={`${t("fields.photosCount", { formattedCount: formatNumber(data.photos.length) })} · ${t(data.hasSketch ? "fields.sketchAvailable" : "fields.withoutSketch")}`} /></div><div className="rounded-2xl border border-slate-200 p-4"><FieldBadge number="12" /><p className="mb-2 mt-2 text-xs font-bold uppercase tracking-wider text-slate-500">{t("summary.circumstances")}</p>{selectedSummary.length ? <ul className="space-y-1.5">{selectedSummary.map((item) => <li key={item} className="flex gap-2 text-sm text-slate-700"><Check className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />{item}</li>)}</ul> : <p className="text-sm text-slate-500">{t("summary.noneSelected")}</p>}</div><CounterpartSummary party={counterpart} loading={summaryLoading} /><FieldBadge number="15" />{signatureUnlocked || completed ? <DrawingCanvas label={t("fields.signature")} height={170} onChange={(value, dataUrl) => setData((previous) => ({ ...previous, hasSignature: value, signatureDataUrl: dataUrl ?? "" }))} /> : <SignatureGate reason={signatureGateReason} connected={realtimeConnected} />}<p className="text-xs leading-relaxed text-slate-500">{t("summary.disclaimer")}</p></div>}
+          {step === 4 && <div className="space-y-5"><div><FieldBadge number="10" /><p className="text-sm font-semibold text-slate-700">{t("fields.initialImpact")}</p></div><FieldBadge number="13" /><div className="rounded-xl bg-[#EDF4F8] p-4 text-sm leading-relaxed text-[#153B66]"><strong>{t("sketch.tipTitle")}</strong> {t("sketch.tip")}</div><DrawingCanvas label={t("fields.sketch")} height={320} onChange={(value, dataUrl) => { update("hasSketch", value); update("sketchDataUrl", dataUrl ?? ""); }} /><div className="flex flex-wrap gap-3 text-xs text-slate-500"><span className="rounded-full bg-slate-100 px-3 py-1.5">{t("sketch.myVehicle")}</span><span className="rounded-full bg-slate-100 px-3 py-1.5">{t("sketch.otherVehicle")}</span><span className="rounded-full bg-slate-100 px-3 py-1.5">{t("sketch.impact")}</span></div></div>}
+          {step === 5 && <div className="space-y-6">{draftRef?.partyLabel === "A" && <div className="rounded-3xl bg-[#153B66] p-6 text-white"><div className="grid items-center gap-5 sm:grid-cols-[1fr_auto]"><div><p className="text-xs font-bold uppercase tracking-[0.18em] text-blue-200">{t("summary.inviteParty")}</p><p className="mt-2 font-mono text-4xl font-bold tracking-[0.18em] sm:text-5xl">{draftRef.shareCode}</p><p className="mt-3 max-w-sm text-blue-100">{t("summary.scanHint")}</p></div><div className="w-fit rounded-2xl bg-white p-3"><QRCodeSVG value={joinUrl} size={152} level="M" aria-label={t("summary.qrAlt")} /></div></div></div>}<div className="grid gap-3 sm:grid-cols-2"><Summary number="1" icon={<Clock3 />} label={t("fields.dateTime")} value={formatCaseDate({ ...initialCases[0], date: data.date, time: data.time })} /><Summary number="2" icon={<MapPin />} label={t("fields.place")} value={data.location || t("fields.notProvided")} /><Summary number="9" icon={<UserRound />} label={t("fields.driver")} value={data.driverName || t("fields.notProvided")} /><Summary number="7" icon={<Car />} label={t("fields.vehicle")} value={`${data.plate || t("fields.noPlate")}${data.vehicle ? ` · ${data.vehicle}` : ""}`} /><Summary number="8" icon={<ShieldCheck />} label={t("fields.insurer")} value={data.insurer || t("fields.notProvided")} /><Summary number="11–13" icon={<Camera />} label={t("fields.documentation")} value={`${t("fields.photosCount", { formattedCount: formatNumber(data.photos.length) })} · ${t(data.hasSketch ? "fields.sketchAvailable" : "fields.withoutSketch")}`} /></div><div className="rounded-2xl border border-slate-200 p-4"><FieldBadge number="12" /><p className="mb-2 mt-2 text-xs font-bold uppercase tracking-wider text-slate-500">{t("summary.circumstances")}</p>{selectedSummary.length ? <ul className="space-y-1.5">{selectedSummary.map((item) => <li key={item} className="flex gap-2 text-sm text-slate-700"><Check className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />{item}</li>)}</ul> : <p className="text-sm text-slate-500">{t("summary.noneSelected")}</p>}</div><CounterpartSummary party={counterpart} loading={summaryLoading} /><FieldBadge number="15" />{signatureUnlocked || completed ? <DrawingCanvas label={t("fields.signature")} height={170} onChange={(value, dataUrl) => { update("hasSignature", value); update("signatureDataUrl", dataUrl ?? ""); }} /> : <SignatureGate reason={signatureGateReason} connected={realtimeConnected} />}<p className="text-xs leading-relaxed text-slate-500">{t("summary.disclaimer")}</p></div>}
 
         </div>
       </main>

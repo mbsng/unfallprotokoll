@@ -6,6 +6,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { BrowserRouter, Routes, Route, useLocation, useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { AuthProvider, useAuth } from "@/contexts/AuthContext";
+import { SyncStatus } from "@/components/SyncStatus";
+import { startSyncWorker } from "@/lib/sync-worker";
 import Index from "./pages/Index";
 import Join from "./pages/Join";
 import AuthPage from "./pages/Auth";
@@ -35,13 +37,18 @@ function SessionGate() {
   return <Routes><Route path="/" element={<Index />} /><Route path="/join/:code" element={<Join />} /><Route path="/auth" element={<AuthPage />} /><Route path="/onboarding" element={<Onboarding />} /><Route path="*" element={<NotFound />} /></Routes>;
 }
 
+function AppRuntime() {
+  useEffect(() => startSyncWorker(), []);
+  return <><SyncStatus /><SessionGate /></>;
+}
+
 const App = () => (
   <QueryClientProvider client={queryClient}>
     <TooltipProvider>
       <Toaster />
       <Sonner />
       <BrowserRouter>
-        <AuthProvider><SessionGate /></AuthProvider>
+        <AuthProvider><AppRuntime /></AuthProvider>
       </BrowserRouter>
     </TooltipProvider>
   </QueryClientProvider>

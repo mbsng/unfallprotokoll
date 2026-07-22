@@ -44,6 +44,32 @@ export interface PendingPhoto {
   mediaId?: string;
 }
 
+export interface AccidentData {
+  date: string;
+  time: string;
+  location: string;
+  locationLat: number | null;
+  locationLng: number | null;
+  injured: boolean;
+  otherDamage: boolean;
+  witnesses: string;
+  driverName: string;
+  driverAddress: string;
+  phone: string;
+  plate: string;
+  vehicle: string;
+  insurer: string;
+  policy: string;
+  situations: number[];
+  damage: string;
+  notes: string;
+  photos: PendingPhoto[];
+  hasSketch: boolean;
+  sketchDataUrl: string;
+  hasSignature: boolean;
+  signatureDataUrl: string;
+}
+
 export interface DriverIncidentData {
   fullName: string;
   address: string;
