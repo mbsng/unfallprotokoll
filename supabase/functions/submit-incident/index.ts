@@ -88,6 +88,16 @@ serve(async (req) => {
     }
     const { data: signed, error: signError } = await service.storage.from("incident-pdfs").createSignedUrl(submission.pdf_storage_path, 3600, { download: `Unfallprotokoll-${incident.share_code}.pdf` });
     if (signError) throw signError;
+    try {
+      const webhookResponse = await fetch("https://itdkfzzajyxfofnrgkqx.supabase.co/functions/v1/push-webhook", {
+        method: "POST",
+        headers: { Authorization: authHeader, apikey: Deno.env.get("SUPABASE_ANON_KEY")!, "Content-Type": "application/json" },
+        body: JSON.stringify({ submissionId: submission.id, incidentId }),
+      });
+      if (!webhookResponse.ok) console.warn("[submit-incident] webhook event was not accepted", { incidentId, responseCode: webhookResponse.status });
+    } catch (webhookError) {
+      console.warn("[submit-incident] webhook event failed", { incidentId, error: webhookError instanceof Error ? webhookError.message : String(webhookError) });
+    }
     console.log("[submit-incident] incident submitted", { incidentId, submissionId: submission.id, emailId: email.id });
     return json({ submissionId: submission.id, status: "submitted", submittedAt, downloadUrl: signed.signedUrl });
   } catch (error) {

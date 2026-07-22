@@ -1,0 +1,206 @@
+openapi: 3.0.3
+info:
+  title: Unfallprotokoll Insurance API
+  version: 1.0.0
+  description: |
+    Pull API for signed or submitted European accident statements.
+    All JSON responses use the canonical `incident.v1` schema. Media URLs are
+    signed and expire at the timestamp stated in `url_expires_at`.
+servers:
+  - url: https://itdkfzzajyxfofnrgkqx.supabase.co/functions/v1/api
+security:
+  - BearerApiKey: []
+paths:
+  /v1/incidents:
+    get:
+      operationId: listIncidents
+      summary: List incidents belonging to the API key's organization
+      description: Returns at most 50 signed or submitted incidents updated since the supplied timestamp.
+      parameters:
+        - name: since
+          in: query
+          required: false
+          description: Inclusive ISO 8601 timestamp. Defaults to the Unix epoch.
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: Canonical incident exports
+          headers:
+            X-RateLimit-Limit:
+              schema: { type: integer }
+              description: Requests allowed per API key and minute.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [schema_version, items, next_since]
+                properties:
+                  schema_version: { type: string, enum: [incident.v1] }
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/IncidentV1' }
+                  next_since: { type: string, format: date-time }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /v1/incidents/{id}:
+    get:
+      operationId: getIncident
+      summary: Get one canonical incident export
+      parameters:
+        - $ref: '#/components/parameters/IncidentId'
+      responses:
+        '200':
+          description: Canonical incident export
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IncidentV1' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /v1/incidents/{id}/pdf:
+    get:
+      operationId: downloadIncidentPdf
+      summary: Download the generated European accident statement PDF
+      parameters:
+        - $ref: '#/components/parameters/IncidentId'
+      responses:
+        '200':
+          description: PDF document
+          content:
+            application/pdf:
+              schema: { type: string, format: binary }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+components:
+  securitySchemes:
+    BearerApiKey:
+      type: http
+      scheme: bearer
+      bearerFormat: uk_live_...
+      description: API key shown once when it is created. Keys are stored only as SHA-256 hashes.
+  parameters:
+    IncidentId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+  responses:
+    BadRequest:
+      description: Invalid request
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Unauthorized:
+      description: Missing, invalid, or revoked API key
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Forbidden:
+      description: API key lacks the required scope
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    NotFound:
+      description: Incident or PDF not found in the key's organization
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    RateLimited:
+      description: Rate limit of 60 requests per API key and minute exceeded
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+        required_scope: { type: string }
+    SignedMedia:
+      type: object
+      required: [id, party_id, type, url, url_expires_at]
+      properties:
+        id: { type: string, format: uuid }
+        party_id: { type: string, format: uuid }
+        type: { type: string, enum: [PHOTO, SKETCH, DOCUMENT, SIGNATURE] }
+        taken_at: { type: string, format: date-time, nullable: true }
+        uploaded_at: { type: string, format: date-time }
+        url: { type: string, format: uri }
+        url_expires_at: { type: string, format: date-time }
+    NumberedField:
+      type: object
+      required: [code, value]
+      properties:
+        code:
+          type: string
+          description: Language-neutral field code.
+        value:
+          nullable: true
+          description: Field value; shape depends on the numbered European statement field.
+    Party:
+      type: object
+      required: [id, role, fields, version, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        role: { type: string, enum: [PARTY_A, PARTY_B, PARTY_C] }
+        profile_id: { type: string, format: uuid, nullable: true }
+        fields:
+          type: object
+          description: European accident statement fields 01 through 15 with language-neutral codes.
+          required: ['01','02','03','04','05','06','07','08','09','10','11','12','13','14','15']
+          properties:
+            '01': { $ref: '#/components/schemas/NumberedField' }
+            '02': { $ref: '#/components/schemas/NumberedField' }
+            '03': { $ref: '#/components/schemas/NumberedField' }
+            '04': { $ref: '#/components/schemas/NumberedField' }
+            '05': { $ref: '#/components/schemas/NumberedField' }
+            '06': { $ref: '#/components/schemas/NumberedField' }
+            '07': { $ref: '#/components/schemas/NumberedField' }
+            '08': { $ref: '#/components/schemas/NumberedField' }
+            '09': { $ref: '#/components/schemas/NumberedField' }
+            '10': { $ref: '#/components/schemas/NumberedField' }
+            '11': { $ref: '#/components/schemas/NumberedField' }
+            '12': { $ref: '#/components/schemas/NumberedField' }
+            '13': { $ref: '#/components/schemas/NumberedField' }
+            '14': { $ref: '#/components/schemas/NumberedField' }
+            '15': { $ref: '#/components/schemas/NumberedField' }
+        version: { type: integer, minimum: 1 }
+        updated_at: { type: string, format: date-time }
+    IncidentV1:
+      type: object
+      required: [schema_version, event_type, exported_at, incident, parties, media, sha256]
+      properties:
+        schema_version: { type: string, enum: [incident.v1] }
+        event_type: { type: string, enum: [incident.signed, incident.submitted] }
+        exported_at: { type: string, format: date-time }
+        incident:
+          type: object
+          required: [id, share_code, status, location, version]
+          properties:
+            id: { type: string, format: uuid }
+            share_code: { type: string, minLength: 8, maxLength: 8 }
+            status: { type: string, enum: [SIGNED, SUBMITTED] }
+            occurred_at: { type: string, format: date-time, nullable: true }
+            occurred_date: { type: string, format: date, nullable: true }
+            location:
+              type: object
+              properties:
+                text: { type: string, nullable: true }
+                latitude: { type: number, format: double, nullable: true }
+                longitude: { type: number, format: double, nullable: true }
+            version: { type: integer, minimum: 1 }
+            created_at: { type: string, format: date-time }
+            updated_at: { type: string, format: date-time }
+        parties:
+          type: array
+          minItems: 2
+          items: { $ref: '#/components/schemas/Party' }
+        media:
+          type: array
+          items: { $ref: '#/components/schemas/SignedMedia' }
+        submission:
+          type: object
+          nullable: true
+          additionalProperties: true
+        sha256:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+          description: SHA-256 over the canonical JSON document before the sha256 property is added.
