@@ -1,5 +1,6 @@
 import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
+import { validateWebhookEndpoint } from "../_shared/safe-webhook.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -23,16 +24,6 @@ async function hmacHex(secret: string, payload: string) {
   const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload));
   return Array.from(new Uint8Array(signature)).map((byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
-function validEndpoint(endpoint: string) {
-  try {
-    const url = new URL(endpoint);
-    if (url.protocol !== "https:") return false;
-    const host = url.hostname.toLowerCase();
-    if (host === "localhost" || host === "127.0.0.1" || host === "::1" || host.endsWith(".local")) return false;
-    return !/^(10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.)/.test(host);
-  } catch { return false; }
 }
 
 serve(async (req) => {
@@ -64,7 +55,12 @@ serve(async (req) => {
     if (action === "create_webhook") {
       const name = typeof body.name === "string" ? body.name.trim() : "";
       const endpointUrl = typeof body.endpointUrl === "string" ? body.endpointUrl.trim() : "";
-      if (!name || name.length > 100 || !validEndpoint(endpointUrl)) return json({ error: "invalid_webhook" }, 400);
+      if (!name || name.length > 100) return json({ error: "invalid_webhook" }, 400);
+      try {
+        await validateWebhookEndpoint(endpointUrl);
+      } catch {
+        return json({ error: "invalid_webhook" }, 400);
+      }
       const master = Deno.env.get("WEBHOOK_MASTER_SECRET");
       if (!master) return json({ error: "webhook_secret_not_configured" }, 503);
       const id = crypto.randomUUID();

@@ -6,6 +6,7 @@ export type SyncOperation = "create" | "update" | "upload" | "delete" | "complet
 
 export interface LocalDraft {
   id: string;
+  ownerId: string;
   ref: IncidentDraftRef;
   data: AccidentData;
   fieldModifiedAt: Record<string, string>;
@@ -15,6 +16,7 @@ export interface LocalDraft {
 
 export interface LocalPhoto {
   id: string;
+  ownerId: string;
   draftId: string;
   blob: Blob;
   fileName: string;
@@ -26,6 +28,7 @@ export interface LocalPhoto {
 
 export interface OutboxEntry {
   id: string;
+  ownerId: string;
   draftId: string;
   table: SyncTable;
   operation: SyncOperation;
@@ -39,6 +42,7 @@ export interface OutboxEntry {
 
 export interface SyncConflict {
   id: string;
+  ownerId: string;
   draftId: string;
   table: "incidents" | "incident_parties";
   field: keyof AccidentData;
@@ -62,6 +66,20 @@ class AccidentDatabase extends Dexie {
       outbox: "id, draftId, nextAttemptAt, createdAt",
       conflicts: "id, draftId, createdAt",
     });
+    this.version(2).stores({
+      drafts: "id, ownerId, [ownerId+updatedAt], ref.incidentId, updatedAt",
+      photos: "id, ownerId, draftId, [ownerId+draftId], storagePath",
+      outbox: "id, ownerId, draftId, [ownerId+nextAttemptAt], nextAttemptAt, createdAt",
+      conflicts: "id, ownerId, draftId, [ownerId+createdAt], createdAt",
+    }).upgrade(async (transaction) => {
+      // Version 1 records had no owner and cannot be assigned safely.
+      await Promise.all([
+        transaction.table("drafts").clear(),
+        transaction.table("photos").clear(),
+        transaction.table("outbox").clear(),
+        transaction.table("conflicts").clear(),
+      ]);
+    });
   }
 }
 
@@ -84,8 +102,9 @@ const tableForField = (field: keyof AccidentData): SyncTable => {
 
 const notifyDraft = (draft: LocalDraft) => window.dispatchEvent(new CustomEvent("local-draft-change", { detail: draft }));
 export const requestSync = () => window.dispatchEvent(new Event("outbox-change"));
+const owns = (ownerId: string, record?: { ownerId: string }) => record?.ownerId === ownerId;
 
-export async function createLocalDraft(data: AccidentData, joinedRef?: IncidentDraftRef) {
+export async function createLocalDraft(ownerId: string, data: AccidentData, joinedRef?: IncidentDraftRef) {
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
   const ref = joinedRef ?? {
@@ -96,12 +115,12 @@ export async function createLocalDraft(data: AccidentData, joinedRef?: IncidentD
     incidentVersion: 0,
     partyVersion: 0,
   };
-  const draft: LocalDraft = { id, ref, data, fieldModifiedAt: {}, createdAt: now, updatedAt: now };
+  const draft: LocalDraft = { id, ownerId, ref, data, fieldModifiedAt: {}, createdAt: now, updatedAt: now };
   await db.transaction("rw", db.drafts, db.outbox, async () => {
     await db.drafts.add(draft);
     if (!joinedRef) {
       await db.outbox.add({
-        id: crypto.randomUUID(), draftId: id, table: "incidents", operation: "create",
+        id: crypto.randomUUID(), ownerId, draftId: id, table: "incidents", operation: "create",
         payload: {}, version: 0, device_id: deviceId, attempts: 0, nextAttemptAt: Date.now(), createdAt: now,
       });
     }
@@ -111,12 +130,12 @@ export async function createLocalDraft(data: AccidentData, joinedRef?: IncidentD
   return draft;
 }
 
-export async function saveDraftField<K extends keyof AccidentData>(draftId: string, field: K, value: AccidentData[K]) {
+export async function saveDraftField<K extends keyof AccidentData>(ownerId: string, draftId: string, field: K, value: AccidentData[K]) {
   const modifiedAt = new Date().toISOString();
   let updatedDraft: LocalDraft | undefined;
   await db.transaction("rw", db.drafts, db.outbox, async () => {
     const draft = await db.drafts.get(draftId);
-    if (!draft) return;
+    if (!owns(ownerId, draft)) return;
     draft.data = { ...draft.data, [field]: value };
     draft.fieldModifiedAt = { ...draft.fieldModifiedAt, [field]: modifiedAt };
     draft.updatedAt = modifiedAt;
@@ -124,7 +143,7 @@ export async function saveDraftField<K extends keyof AccidentData>(draftId: stri
     const version = table === "incidents" ? draft.ref.incidentVersion : draft.ref.partyVersion;
     await db.drafts.put(draft);
     await db.outbox.add({
-      id: crypto.randomUUID(), draftId, table, operation: "update",
+      id: crypto.randomUUID(), ownerId, draftId, table, operation: "update",
       payload: { field, value, modifiedAt }, version, device_id: deviceId,
       attempts: 0, nextAttemptAt: Date.now(), createdAt: modifiedAt,
     });
@@ -134,19 +153,19 @@ export async function saveDraftField<K extends keyof AccidentData>(draftId: stri
   requestSync();
 }
 
-export async function saveLocalPhoto(draftId: string, file: File) {
+export async function saveLocalPhoto(ownerId: string, draftId: string, file: File) {
   const draft = await db.drafts.get(draftId);
-  if (!draft) return;
+  if (!owns(ownerId, draft)) return;
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
-  const photo: LocalPhoto = { id, draftId, blob: file, fileName: file.name, mimeType: file.type || "image/jpeg", lastModified: file.lastModified };
+  const photo: LocalPhoto = { id, ownerId, draftId, blob: file, fileName: file.name, mimeType: file.type || "image/jpeg", lastModified: file.lastModified };
   draft.data = { ...draft.data, photos: [...draft.data.photos, { id, url: "" }] };
   draft.updatedAt = now;
   await db.transaction("rw", db.drafts, db.photos, db.outbox, async () => {
     await db.photos.add(photo);
     await db.drafts.put(draft);
     await db.outbox.add({
-      id: crypto.randomUUID(), draftId, table: "incident_media", operation: "upload",
+      id: crypto.randomUUID(), ownerId, draftId, table: "incident_media", operation: "upload",
       payload: { photoId: id }, version: draft.ref.partyVersion, device_id: deviceId,
       attempts: 0, nextAttemptAt: Date.now(), createdAt: now,
     });
@@ -155,20 +174,20 @@ export async function saveLocalPhoto(draftId: string, file: File) {
   requestSync();
 }
 
-export async function deleteLocalPhoto(draftId: string, photoId: string) {
+export async function deleteLocalPhoto(ownerId: string, draftId: string, photoId: string) {
   const draft = await db.drafts.get(draftId);
   const photo = await db.photos.get(photoId);
-  if (!draft) return;
+  if (!owns(ownerId, draft) || (photo && !owns(ownerId, photo))) return;
   const now = new Date().toISOString();
   draft.data = { ...draft.data, photos: draft.data.photos.filter((item) => item.id !== photoId) };
   draft.updatedAt = now;
   await db.transaction("rw", db.drafts, db.photos, db.outbox, async () => {
     await db.drafts.put(draft);
     await db.photos.delete(photoId);
-    await db.outbox.where("draftId").equals(draftId).filter((entry) => entry.operation === "upload" && entry.payload.photoId === photoId).delete();
+    await db.outbox.where("draftId").equals(draftId).filter((entry) => entry.ownerId === ownerId && entry.operation === "upload" && entry.payload.photoId === photoId).delete();
     if (photo?.storagePath || photo?.mediaId) {
       await db.outbox.add({
-        id: crypto.randomUUID(), draftId, table: "incident_media", operation: "delete",
+        id: crypto.randomUUID(), ownerId, draftId, table: "incident_media", operation: "delete",
         payload: { storagePath: photo.storagePath, mediaId: photo.mediaId }, version: draft.ref.partyVersion,
         device_id: deviceId, attempts: 0, nextAttemptAt: Date.now(), createdAt: now,
       });
@@ -179,7 +198,7 @@ export async function deleteLocalPhoto(draftId: string, photoId: string) {
 }
 
 export async function hydrateDraft(draft: LocalDraft) {
-  const photos = await db.photos.where("draftId").equals(draft.id).toArray();
+  const photos = await db.photos.where("[ownerId+draftId]").equals([draft.ownerId, draft.id]).toArray();
   const byId = new Map(photos.map((photo) => [photo.id, photo]));
   const hydrated: PendingPhoto[] = draft.data.photos.map((item) => {
     const local = byId.get(item.id);
@@ -188,17 +207,18 @@ export async function hydrateDraft(draft: LocalDraft) {
   return { ...draft, data: { ...draft.data, photos: hydrated } };
 }
 
-export async function getLatestDraft() {
-  const draft = await db.drafts.orderBy("updatedAt").last();
+export async function getLatestDraft(ownerId: string) {
+  const drafts = await db.drafts.where("ownerId").equals(ownerId).sortBy("updatedAt");
+  const draft = drafts.at(-1);
   return draft ? hydrateDraft(draft) : undefined;
 }
 
-export async function markDraftComplete(draftId: string) {
+export async function markDraftComplete(ownerId: string, draftId: string) {
   const draft = await db.drafts.get(draftId);
-  if (!draft) return;
+  if (!owns(ownerId, draft)) return;
   const now = new Date().toISOString();
   await db.outbox.add({
-    id: crypto.randomUUID(), draftId, table: "incident_parties", operation: "complete",
+    id: crypto.randomUUID(), ownerId, draftId, table: "incident_parties", operation: "complete",
     payload: {}, version: draft.ref.partyVersion, device_id: deviceId,
     attempts: 0, nextAttemptAt: Date.now(), createdAt: now,
   });
@@ -208,4 +228,15 @@ export async function markDraftComplete(draftId: string) {
 export async function applyDraftFromSync(draft: LocalDraft) {
   await db.drafts.put(draft);
   notifyDraft(await hydrateDraft(draft));
+}
+
+export async function clearLocalAccidentData(ownerId: string) {
+  await db.transaction("rw", db.drafts, db.photos, db.outbox, db.conflicts, async () => {
+    await Promise.all([
+      db.drafts.where("ownerId").equals(ownerId).delete(),
+      db.photos.where("ownerId").equals(ownerId).delete(),
+      db.outbox.where("ownerId").equals(ownerId).delete(),
+      db.conflicts.where("ownerId").equals(ownerId).delete(),
+    ]);
+  });
 }

@@ -1,6 +1,7 @@
 import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
 import { buildIncidentExport, incidentBelongsToOrg } from "../_shared/incident-export.ts";
+import { validateWebhookEndpoint } from "../_shared/safe-webhook.ts";
 
 declare const EdgeRuntime: { waitUntil(promise: Promise<unknown>): void };
 const corsHeaders = {
@@ -22,19 +23,7 @@ async function derivedSecret(integrationId: string) {
   return hmacHex(master, `integration:${integrationId}`);
 }
 
-function validEndpoint(endpoint: string) {
-  try {
-    const url = new URL(endpoint);
-    if (url.protocol !== "https:") return false;
-    const host = url.hostname.toLowerCase();
-    if (host === "localhost" || host === "127.0.0.1" || host === "::1" || host.endsWith(".local")) return false;
-    if (/^(10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.)/.test(host)) return false;
-    return true;
-  } catch { return false; }
-}
-
 async function deliver(service: any, integration: any, submissionId: string, document: unknown, test = false) {
-  if (!validEndpoint(integration.endpoint_url)) throw new Error("invalid_endpoint");
   const payload = JSON.stringify(document);
   const secret = await derivedSecret(integration.id);
   const signature = await hmacHex(secret, payload);
@@ -48,7 +37,8 @@ async function deliver(service: any, integration: any, submissionId: string, doc
     let responseCode: number | null = null;
     let errorMessage: string | null = null;
     try {
-      const response = await fetch(integration.endpoint_url, {
+      const endpoint = await validateWebhookEndpoint(integration.endpoint_url);
+      const response = await fetch(endpoint, {
         method: "POST",
         redirect: "error",
         headers: {

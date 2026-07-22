@@ -12,7 +12,9 @@ export default function AuthPage() {
   const { t, i18n } = useTranslation();
   const [method, setMethod] = useState<"password" | "magic">("password");
   const locale = localeForLanguage(i18n.resolvedLanguage || i18n.language);
-  const redirectTo = `${window.location.origin}/auth`;
+  const requestedRedirect = new URLSearchParams(window.location.search).get("redirect");
+  const safeRedirect = requestedRedirect?.startsWith("/") && !requestedRedirect.startsWith("//") ? requestedRedirect : "/";
+  const redirectTo = `${window.location.origin}/auth?redirect=${encodeURIComponent(safeRedirect)}`;
   const localization = {
     sign_up: { email_label: t("auth.email"), password_label: t("auth.password"), email_input_placeholder: t("auth.emailPlaceholder"), password_input_placeholder: t("auth.passwordPlaceholder"), button_label: t("auth.signUp"), loading_button_label: t("auth.signingUp"), link_text: t("auth.noAccount"), confirmation_text: t("auth.confirmation") },
     sign_in: { email_label: t("auth.email"), password_label: t("auth.password"), email_input_placeholder: t("auth.emailPlaceholder"), password_input_placeholder: t("auth.passwordPlaceholder"), button_label: t("auth.signIn"), loading_button_label: t("auth.signingIn"), link_text: t("auth.hasAccount") },

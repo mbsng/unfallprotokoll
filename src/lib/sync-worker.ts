@@ -1,9 +1,11 @@
+import Dexie from "dexie";
 import { supabase } from "@/integrations/supabase/client";
 import { db, deviceId, applyDraftFromSync, requestSync, type LocalDraft, type OutboxEntry, type SyncConflict } from "@/lib/local-db";
 import type { AccidentData } from "@/types/incident";
 
 let running = false;
 let started = false;
+let activeOwnerId: string | null = null;
 
 const sameValue = (left: unknown, right: unknown) => JSON.stringify(left) === JSON.stringify(right);
 
@@ -65,15 +67,13 @@ function serverFields(table: "incidents" | "incident_parties", row: Record<strin
   return undefined;
 }
 
-async function ensureSession() {
+async function assertOwner(ownerId: string) {
   const { data } = await supabase.auth.getSession();
-  if (data.session) return;
-  const { error } = await supabase.auth.signInAnonymously({ options: { data: { device_id: deviceId } } });
-  if (error) throw error;
+  if (activeOwnerId !== ownerId || data.session?.user.id !== ownerId) throw new Error("sync_owner_changed");
 }
 
 async function createRemoteDraft(draft: LocalDraft, entry: OutboxEntry) {
-  await ensureSession();
+  await assertOwner(draft.ownerId);
   const { data, error } = await supabase.rpc("create_incident_with_party", {
     initial_driver: { fullName: draft.data.driverName, address: draft.data.driverAddress, phone: draft.data.phone },
     initial_vehicle: { plate: draft.data.plate, makeModel: draft.data.vehicle },
@@ -97,7 +97,7 @@ async function createRemoteDraft(draft: LocalDraft, entry: OutboxEntry) {
   const snapshotEntries: OutboxEntry[] = snapshotFields.map((field, index) => {
     const table = field === "witnesses" ? "incident_witnesses" : ["date", "time", "location", "locationLat", "locationLng", "injured", "otherDamage"].includes(field) ? "incidents" : "incident_parties";
     return {
-      id: crypto.randomUUID(), draftId: draft.id, table, operation: "update",
+      id: crypto.randomUUID(), ownerId: draft.ownerId, draftId: draft.id, table, operation: "update",
       payload: { field, value: draft.data[field], modifiedAt: draft.fieldModifiedAt[field] ?? now },
       version: table === "incidents" ? draft.ref.incidentVersion : draft.ref.partyVersion,
       device_id: deviceId, attempts: 0, nextAttemptAt: Date.now(), createdAt: new Date(Date.now() + index).toISOString(),
@@ -159,7 +159,7 @@ async function writeVersioned(draft: LocalDraft, entry: OutboxEntry) {
       const serverTime = new Date(server.updated_at).getTime();
       if (Math.abs(localTime - serverTime) < 1000) {
         const conflict: SyncConflict = {
-          id: crypto.randomUUID(), draftId: draft.id, table, field, localValue,
+          id: crypto.randomUUID(), ownerId: draft.ownerId, draftId: draft.id, table, field, localValue,
           serverValue, serverVersion: server.version, createdAt: new Date().toISOString(),
         };
         await db.transaction("rw", db.conflicts, db.outbox, async () => {
@@ -219,7 +219,7 @@ async function syncMedia(draft: LocalDraft, entry: OutboxEntry) {
   }
   const photoId = entry.payload.photoId as string;
   const photo = await db.photos.get(photoId);
-  if (!photo) {
+  if (!photo || photo.ownerId !== draft.ownerId) {
     await db.outbox.delete(entry.id);
     return;
   }
@@ -271,8 +271,10 @@ async function completeDraft(draft: LocalDraft, entry: OutboxEntry) {
 }
 
 async function processEntry(entry: OutboxEntry) {
+  if (entry.ownerId !== activeOwnerId) return;
+  await assertOwner(entry.ownerId);
   const draft = await db.drafts.get(entry.draftId);
-  if (!draft) {
+  if (!draft || draft.ownerId !== entry.ownerId) {
     await db.outbox.delete(entry.id);
     return;
   }
@@ -291,15 +293,17 @@ async function defer(entry: OutboxEntry) {
 }
 
 export async function processOutbox() {
-  if (running || !navigator.onLine) return;
+  const ownerId = activeOwnerId;
+  if (running || !navigator.onLine || !ownerId) return;
   running = true;
   try {
-    const entries = await db.outbox.where("nextAttemptAt").belowOrEqual(Date.now()).sortBy("createdAt");
+    const entries = await db.outbox.where("[ownerId+nextAttemptAt]").between([ownerId, Dexie.minKey], [ownerId, Date.now()]).sortBy("createdAt");
     for (const entry of entries) {
+      if (activeOwnerId !== ownerId) break;
       try {
         await processEntry(entry);
       } catch {
-        await defer(entry);
+        if (activeOwnerId === ownerId) await defer(entry);
         break;
       }
     }
@@ -308,8 +312,9 @@ export async function processOutbox() {
   }
 }
 
-export function startSyncWorker() {
-  if (started) return () => undefined;
+export function startSyncWorker(ownerId: string) {
+  activeOwnerId = ownerId;
+  if (started) return () => { if (activeOwnerId === ownerId) activeOwnerId = null; };
   started = true;
   const sync = () => void processOutbox();
   window.addEventListener("online", sync);
@@ -317,6 +322,7 @@ export function startSyncWorker() {
   const interval = window.setInterval(sync, 30_000);
   sync();
   return () => {
+    activeOwnerId = null;
     started = false;
     window.removeEventListener("online", sync);
     window.removeEventListener("outbox-change", sync);
@@ -324,9 +330,14 @@ export function startSyncWorker() {
   };
 }
 
+export function pauseSyncWorker() {
+  activeOwnerId = null;
+}
+
 export async function resolveConflict(conflict: SyncConflict, choice: "local" | "server") {
+  if (conflict.ownerId !== activeOwnerId) return;
   const draft = await db.drafts.get(conflict.draftId);
-  if (!draft) return;
+  if (!draft || draft.ownerId !== conflict.ownerId) return;
   if (choice === "server") {
     draft.data = { ...draft.data, [conflict.field]: conflict.serverValue };
     draft.fieldModifiedAt = { ...draft.fieldModifiedAt, [conflict.field]: new Date().toISOString() };
@@ -342,7 +353,7 @@ export async function resolveConflict(conflict: SyncConflict, choice: "local" | 
     const version = conflict.serverVersion;
     await db.transaction("rw", db.outbox, db.conflicts, async () => {
       await db.outbox.add({
-        id: crypto.randomUUID(), draftId: draft.id, table: conflict.table, operation: "update",
+        id: crypto.randomUUID(), ownerId: draft.ownerId, draftId: draft.id, table: conflict.table, operation: "update",
         payload: { field: conflict.field, value: conflict.localValue, modifiedAt: now }, version,
         device_id: deviceId, attempts: 0, nextAttemptAt: Date.now(), createdAt: now,
       });

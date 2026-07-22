@@ -3,6 +3,8 @@ import type { Session, User } from "@supabase/supabase-js";
 import { supabase } from "@/integrations/supabase/client";
 import { localeForLanguage } from "@/i18n";
 import i18n from "@/i18n";
+import { clearLocalAccidentData } from "@/lib/local-db";
+import { pauseSyncWorker } from "@/lib/sync-worker";
 import type { Profile } from "@/types/profile";
 
 interface AuthContextValue {
@@ -89,6 +91,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const signOut = async () => {
     setError(null);
+    const ownerId = session?.user.id;
+    pauseSyncWorker();
+    if (ownerId) await clearLocalAccidentData(ownerId);
     await supabase.auth.signOut();
     setProfile(null);
   };

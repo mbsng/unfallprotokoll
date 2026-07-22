@@ -7,10 +7,10 @@ import { resolveConflict } from "@/lib/sync-worker";
 import { Button } from "@/components/ui/button";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
 
-export function SyncStatus() {
+export function SyncStatus({ ownerId }: { ownerId: string | null }) {
   const { t } = useTranslation();
-  const pending = useLiveQuery(() => db.outbox.count(), [], 0);
-  const conflicts = useLiveQuery(() => db.conflicts.orderBy("createdAt").toArray(), [], []);
+  const pending = useLiveQuery(() => ownerId ? db.outbox.where("ownerId").equals(ownerId).count() : 0, [ownerId], 0);
+  const conflicts = useLiveQuery(() => ownerId ? db.conflicts.where("ownerId").equals(ownerId).sortBy("createdAt") : [], [ownerId], []);
   const [online, setOnline] = useState(navigator.onLine);
   const conflict = conflicts[0];
 

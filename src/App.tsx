@@ -25,22 +25,27 @@ function SessionGate() {
 
   useEffect(() => {
     if (loading || profileLoading) return;
+    const requestedRedirect = new URLSearchParams(location.search).get("redirect");
+    const safeRedirect = requestedRedirect?.startsWith("/") && !requestedRedirect.startsWith("//") ? requestedRedirect : "/";
     if (user && !isAnonymous && profile && !profile.onboarding_completed && location.pathname !== "/onboarding") {
       navigate("/onboarding", { replace: true });
-    } else if (user && !isAnonymous && profile?.onboarding_completed && (location.pathname === "/onboarding" || location.pathname === "/auth")) {
+    } else if (user && !isAnonymous && profile?.onboarding_completed && location.pathname === "/auth") {
+      navigate(safeRedirect, { replace: true });
+    } else if (user && !isAnonymous && profile?.onboarding_completed && location.pathname === "/onboarding") {
       navigate("/", { replace: true });
     } else if ((!user || isAnonymous) && location.pathname === "/onboarding") {
       navigate("/", { replace: true });
     }
-  }, [user, profile, loading, profileLoading, isAnonymous, location.pathname, navigate]);
+  }, [user, profile, loading, profileLoading, isAnonymous, location.pathname, location.search, navigate]);
 
   if (loading || profileLoading) return <div className="flex min-h-screen items-center justify-center bg-[#F5F7FA] px-5 text-center font-medium text-[#153B66]">{t("auth.loading")}</div>;
   return <Routes><Route path="/" element={<Index />} /><Route path="/join/:code" element={<Join />} /><Route path="/auth" element={<AuthPage />} /><Route path="/onboarding" element={<Onboarding />} /><Route path="/integrations" element={<Integrations />} /><Route path="*" element={<NotFound />} /></Routes>;
 }
 
 function AppRuntime() {
-  useEffect(() => startSyncWorker(), []);
-  return <><SyncStatus /><SessionGate /></>;
+  const { user } = useAuth();
+  useEffect(() => user ? startSyncWorker(user.id) : undefined, [user?.id]);
+  return <><SyncStatus ownerId={user?.id ?? null} /><SessionGate /></>;
 }
 
 const App = () => (

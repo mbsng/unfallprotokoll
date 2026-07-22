@@ -16,6 +16,7 @@ import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { UserMenu } from "@/components/UserMenu";
 import { useAuth } from "@/contexts/AuthContext";
 import { localeForLanguage } from "@/i18n";
+import { supabase } from "@/integrations/supabase/client";
 import { loadIncidentSummary, subscribeToIncident } from "@/lib/incidents";
 import { createLocalDraft, deleteLocalPhoto, getLatestDraft, markDraftComplete, saveDraftField, saveLocalPhoto, type LocalDraft } from "@/lib/local-db";
 import { generateIncidentPdf, SubmissionError, submitIncident } from "@/lib/submissions";
@@ -98,7 +99,7 @@ export default function Index() {
   const update = <K extends keyof AccidentData>(key: K, value: AccidentData[K]) => {
     setDirty(true);
     setData((previous) => ({ ...previous, [key]: value }));
-    if (localDraftId) void saveDraftField(localDraftId, key, value);
+    if (user && localDraftId) void saveDraftField(user.id, localDraftId, key, value);
   };
 
   const formatNumber = (value: number) => new Intl.NumberFormat(locale).format(value);
@@ -110,10 +111,16 @@ export default function Index() {
 
   useEffect(() => {
     let active = true;
-    void getLatestDraft().then(async (latest) => {
+    if (!user) {
+      setLocalDraftId(null);
+      setDraftRef(null);
+      setView("home");
+      return;
+    }
+    void getLatestDraft(user.id).then(async (latest) => {
       if (!active) return;
       if (joinedIncident && latest?.ref.partyId !== joinedIncident.draftRef.partyId) {
-        const created = await createLocalDraft(joinedData(joinedIncident, profile), joinedIncident.draftRef);
+        const created = await createLocalDraft(user.id, joinedData(joinedIncident, profile), joinedIncident.draftRef);
         if (active) applyLocalDraft(created);
       } else if (latest) {
         applyLocalDraft(latest);
@@ -122,14 +129,14 @@ export default function Index() {
     });
     const onDraftChange = (event: Event) => {
       const draft = (event as CustomEvent<LocalDraft>).detail;
-      if (draft.id === localDraftId) applyLocalDraft(draft);
+      if (draft.ownerId === user.id && draft.id === localDraftId) applyLocalDraft(draft);
     };
     window.addEventListener("local-draft-change", onDraftChange);
     return () => {
       active = false;
       window.removeEventListener("local-draft-change", onDraftChange);
     };
-  }, [joinedIncident?.draftRef.partyId, localDraftId]);
+  }, [user?.id, joinedIncident?.draftRef.partyId, localDraftId]);
 
   useEffect(() => {
     if (view !== "wizard" || !draftRef || draftRef.incidentId.startsWith("local:")) return;
@@ -182,7 +189,13 @@ export default function Index() {
     setCreating(true);
     const initial = emptyData(profile);
     try {
-      const created = await createLocalDraft(initial);
+      let ownerId = user?.id;
+      if (!ownerId) {
+        if (!navigator.onLine || !(await startAnonymous())) throw new Error("authentication_required");
+        ownerId = (await supabase.auth.getUser()).data.user?.id;
+      }
+      if (!ownerId) throw new Error("authentication_required");
+      const created = await createLocalDraft(ownerId, initial);
       applyLocalDraft(created);
       setParties([]);
       setServerLoaded(false);
@@ -192,7 +205,6 @@ export default function Index() {
       setStep(0);
       setView("wizard");
       window.scrollTo(0, 0);
-      if (!user && navigator.onLine) void startAnonymous();
     } catch {
       toast.error(t("incident.createError"));
     } finally {
@@ -230,14 +242,14 @@ export default function Index() {
   };
 
   const addPhotos = (files: FileList | null) => {
-    if (!files || !localDraftId) return;
-    for (const file of Array.from(files)) void saveLocalPhoto(localDraftId, file);
+    if (!files || !user || !localDraftId) return;
+    for (const file of Array.from(files)) void saveLocalPhoto(user.id, localDraftId, file);
   };
 
   const removePhoto = async (photo: PendingPhoto) => {
-    if (!localDraftId) return;
+    if (!user || !localDraftId) return;
     try {
-      await deleteLocalPhoto(localDraftId, photo.id);
+      await deleteLocalPhoto(user.id, localDraftId, photo.id);
     } catch {
       toast.error(t("incident.saveError"));
     }
@@ -252,10 +264,10 @@ export default function Index() {
   const complete = async () => {
     if (!signatureUnlocked) return toast.error(t("signatureGate.syncing"));
     if (!data.hasSignature || !data.signatureDataUrl) return toast.error(t("validation.signatureRequired"));
-    if (!draftRef || !localDraftId || saving) return;
+    if (!user || !draftRef || !localDraftId || saving) return;
     setSaving(true);
     try {
-      await markDraftComplete(localDraftId);
+      await markDraftComplete(user.id, localDraftId);
       setCompleted(true);
       setCases((previous) => [{ id: draftRef.shareCode, date: data.date, time: data.time, location: data.location || t("fields.notProvided"), status: "completed", plate: data.plate || t("fields.noPlate") }, ...previous]);
       toast.success(t("wizard.saved"));
