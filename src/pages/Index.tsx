@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { QRCodeSVG } from "qrcode.react";
-import { AlertTriangle, ArrowLeft, ArrowRight, Camera, Car, Check, ChevronRight, Clock3, FileText, LocateFixed, LockKeyhole, MapPin, Plus, QrCode, Radio, ShieldCheck, Trash2, UserRound, X } from "lucide-react";
+import { AlertTriangle, ArrowLeft, ArrowRight, Camera, Car, Check, ChevronRight, Clock3, Download, FileText, LocateFixed, LockKeyhole, Mail, MapPin, Plus, QrCode, Radio, Send, ShieldCheck, Trash2, UserRound, X } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -18,6 +18,7 @@ import { useAuth } from "@/contexts/AuthContext";
 import { localeForLanguage } from "@/i18n";
 import { loadIncidentSummary, subscribeToIncident } from "@/lib/incidents";
 import { createLocalDraft, deleteLocalPhoto, getLatestDraft, markDraftComplete, saveDraftField, saveLocalPhoto, type LocalDraft } from "@/lib/local-db";
+import { generateIncidentPdf, SubmissionError, submitIncident } from "@/lib/submissions";
 import type { AccidentData, IncidentDraftRef, IncidentPartySummary, JoinedIncidentState, PendingPhoto } from "@/types/incident";
 
 import type { Profile } from "@/types/profile";
@@ -313,7 +314,7 @@ export default function Index() {
           {step === 3 && <div className="space-y-6"><Field number="11" label={t("fields.visibleDamage")}><Textarea value={data.damage} onChange={(event) => update("damage", event.target.value)} placeholder={t("fields.damagePlaceholder")} className="min-h-28 rounded-xl text-base" /></Field><Field number="14" label={t("fields.remarks")}><Textarea value={data.notes} onChange={(event) => update("notes", event.target.value)} placeholder={t("fields.remarksPlaceholder")} className="min-h-24 rounded-xl text-base" /></Field><Field number="11" label={t("fields.photos")}><label className="flex min-h-32 cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed border-[#9FBACD] bg-[#F7FAFC] p-5 text-center"><Camera className="mb-2 h-8 w-8 text-[#39719D]" /><span className="font-semibold text-[#153B66]">{t("fields.photoAction")}</span><span className="mt-1 text-xs text-slate-500">{t("fields.photoHint")}</span><input type="file" accept="image/*" capture="environment" multiple className="sr-only" onChange={(event) => addPhotos(event.target.files)} /></label></Field>{data.photos.length > 0 && <div className="grid grid-cols-3 gap-3">{data.photos.map((photo, index) => <div key={photo.id} className="relative aspect-square overflow-hidden rounded-xl bg-slate-100"><img src={photo.url} alt={t("fields.photoAlt", { number: formatNumber(index + 1) })} className="h-full w-full object-cover" /><button type="button" onClick={() => void removePhoto(photo)} className="absolute right-1 top-1 flex h-8 w-8 items-center justify-center rounded-full bg-slate-900/75 text-white" aria-label={t("fields.deletePhoto")}><Trash2 className="h-4 w-4" /></button></div>)}</div>}</div>}
 
           {step === 4 && <div className="space-y-5"><div><FieldBadge number="10" /><p className="text-sm font-semibold text-slate-700">{t("fields.initialImpact")}</p></div><FieldBadge number="13" /><div className="rounded-xl bg-[#EDF4F8] p-4 text-sm leading-relaxed text-[#153B66]"><strong>{t("sketch.tipTitle")}</strong> {t("sketch.tip")}</div><DrawingCanvas label={t("fields.sketch")} height={320} onChange={(value, dataUrl) => { update("hasSketch", value); update("sketchDataUrl", dataUrl ?? ""); }} /><div className="flex flex-wrap gap-3 text-xs text-slate-500"><span className="rounded-full bg-slate-100 px-3 py-1.5">{t("sketch.myVehicle")}</span><span className="rounded-full bg-slate-100 px-3 py-1.5">{t("sketch.otherVehicle")}</span><span className="rounded-full bg-slate-100 px-3 py-1.5">{t("sketch.impact")}</span></div></div>}
-          {step === 5 && <div className="space-y-6">{draftRef?.partyLabel === "A" && <div className="rounded-3xl bg-[#153B66] p-6 text-white"><div className="grid items-center gap-5 sm:grid-cols-[1fr_auto]"><div><p className="text-xs font-bold uppercase tracking-[0.18em] text-blue-200">{t("summary.inviteParty")}</p><p className="mt-2 font-mono text-4xl font-bold tracking-[0.18em] sm:text-5xl">{draftRef.shareCode}</p><p className="mt-3 max-w-sm text-blue-100">{t("summary.scanHint")}</p></div><div className="w-fit rounded-2xl bg-white p-3"><QRCodeSVG value={joinUrl} size={152} level="M" aria-label={t("summary.qrAlt")} /></div></div></div>}<div className="grid gap-3 sm:grid-cols-2"><Summary number="1" icon={<Clock3 />} label={t("fields.dateTime")} value={formatCaseDate({ ...initialCases[0], date: data.date, time: data.time })} /><Summary number="2" icon={<MapPin />} label={t("fields.place")} value={data.location || t("fields.notProvided")} /><Summary number="9" icon={<UserRound />} label={t("fields.driver")} value={data.driverName || t("fields.notProvided")} /><Summary number="7" icon={<Car />} label={t("fields.vehicle")} value={`${data.plate || t("fields.noPlate")}${data.vehicle ? ` · ${data.vehicle}` : ""}`} /><Summary number="8" icon={<ShieldCheck />} label={t("fields.insurer")} value={data.insurer || t("fields.notProvided")} /><Summary number="11–13" icon={<Camera />} label={t("fields.documentation")} value={`${t("fields.photosCount", { formattedCount: formatNumber(data.photos.length) })} · ${t(data.hasSketch ? "fields.sketchAvailable" : "fields.withoutSketch")}`} /></div><div className="rounded-2xl border border-slate-200 p-4"><FieldBadge number="12" /><p className="mb-2 mt-2 text-xs font-bold uppercase tracking-wider text-slate-500">{t("summary.circumstances")}</p>{selectedSummary.length ? <ul className="space-y-1.5">{selectedSummary.map((item) => <li key={item} className="flex gap-2 text-sm text-slate-700"><Check className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />{item}</li>)}</ul> : <p className="text-sm text-slate-500">{t("summary.noneSelected")}</p>}</div><CounterpartSummary party={counterpart} loading={summaryLoading} /><FieldBadge number="15" />{signatureUnlocked || completed ? <DrawingCanvas label={t("fields.signature")} height={170} onChange={(value, dataUrl) => { update("hasSignature", value); update("signatureDataUrl", dataUrl ?? ""); }} /> : <SignatureGate reason={signatureGateReason} connected={realtimeConnected} />}<p className="text-xs leading-relaxed text-slate-500">{t("summary.disclaimer")}</p></div>}
+          {step === 5 && <div className="space-y-6">{draftRef?.partyLabel === "A" && <div className="rounded-3xl bg-[#153B66] p-6 text-white"><div className="grid items-center gap-5 sm:grid-cols-[1fr_auto]"><div><p className="text-xs font-bold uppercase tracking-[0.18em] text-blue-200">{t("summary.inviteParty")}</p><p className="mt-2 font-mono text-4xl font-bold tracking-[0.18em] sm:text-5xl">{draftRef.shareCode}</p><p className="mt-3 max-w-sm text-blue-100">{t("summary.scanHint")}</p></div><div className="w-fit rounded-2xl bg-white p-3"><QRCodeSVG value={joinUrl} size={152} level="M" aria-label={t("summary.qrAlt")} /></div></div></div>}<div className="grid gap-3 sm:grid-cols-2"><Summary number="1" icon={<Clock3 />} label={t("fields.dateTime")} value={formatCaseDate({ ...initialCases[0], date: data.date, time: data.time })} /><Summary number="2" icon={<MapPin />} label={t("fields.place")} value={data.location || t("fields.notProvided")} /><Summary number="9" icon={<UserRound />} label={t("fields.driver")} value={data.driverName || t("fields.notProvided")} /><Summary number="7" icon={<Car />} label={t("fields.vehicle")} value={`${data.plate || t("fields.noPlate")}${data.vehicle ? ` · ${data.vehicle}` : ""}`} /><Summary number="8" icon={<ShieldCheck />} label={t("fields.insurer")} value={data.insurer || t("fields.notProvided")} /><Summary number="11–13" icon={<Camera />} label={t("fields.documentation")} value={`${t("fields.photosCount", { formattedCount: formatNumber(data.photos.length) })} · ${t(data.hasSketch ? "fields.sketchAvailable" : "fields.withoutSketch")}`} /></div><div className="rounded-2xl border border-slate-200 p-4"><FieldBadge number="12" /><p className="mb-2 mt-2 text-xs font-bold uppercase tracking-wider text-slate-500">{t("summary.circumstances")}</p>{selectedSummary.length ? <ul className="space-y-1.5">{selectedSummary.map((item) => <li key={item} className="flex gap-2 text-sm text-slate-700"><Check className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />{item}</li>)}</ul> : <p className="text-sm text-slate-500">{t("summary.noneSelected")}</p>}</div><CounterpartSummary party={counterpart} loading={summaryLoading} /><FieldBadge number="15" />{signatureUnlocked || completed ? <DrawingCanvas label={t("fields.signature")} height={170} onChange={(value, dataUrl) => { update("hasSignature", value); update("signatureDataUrl", dataUrl ?? ""); }} /> : <SignatureGate reason={signatureGateReason} connected={realtimeConnected} />}{(completed || ownParty?.signedAt) && draftRef && !draftRef.incidentId.startsWith("local:") && <SubmissionPanel incidentId={draftRef.incidentId} />}<p className="text-xs leading-relaxed text-slate-500">{t("summary.disclaimer")}</p></div>}
 
         </div>
       </main>
@@ -321,6 +322,47 @@ export default function Index() {
     </div>
 
   );
+}
+
+function SubmissionPanel({ incidentId }: { incidentId: string }) {
+  const { t } = useTranslation();
+  const [targetEmail, setTargetEmail] = useState("");
+  const [generating, setGenerating] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [submitted, setSubmitted] = useState(false);
+
+  const download = async () => {
+    setGenerating(true);
+    try {
+      const result = await generateIncidentPdf(incidentId);
+      const anchor = document.createElement("a");
+      anchor.href = result.downloadUrl;
+      anchor.rel = "noopener";
+      anchor.click();
+    } catch (error) {
+      const code = error instanceof SubmissionError ? error.code : "pdf_generation_failed";
+      toast.error(t(`submission.errors.${code}`, { defaultValue: t("submission.errors.pdf_generation_failed") }));
+    } finally {
+      setGenerating(false);
+    }
+  };
+
+  const submit = async () => {
+    if (!/^\S+@\S+\.\S+$/.test(targetEmail)) return toast.error(t("submission.invalidEmail"));
+    setSubmitting(true);
+    try {
+      await submitIncident(incidentId, targetEmail);
+      setSubmitted(true);
+      toast.success(t("submission.success"));
+    } catch (error) {
+      const code = error instanceof SubmissionError ? error.code : "submission_failed";
+      toast.error(t(`submission.errors.${code}`, { defaultValue: t("submission.errors.submission_failed") }));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return <section className="rounded-2xl border border-[#B8CDDC] bg-[#F4F8FB] p-5"><div className="flex items-start gap-3"><span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-white text-[#153B66]"><Mail className="h-5 w-5" /></span><div><h3 className="font-bold text-[#153B66]">{t("submission.title")}</h3><p className="mt-1 text-sm leading-relaxed text-slate-600">{t("submission.description")}</p></div></div><div className="mt-4 space-y-3"><Input type="email" value={targetEmail} onChange={(event) => setTargetEmail(event.target.value)} placeholder={t("submission.emailPlaceholder")} className={fieldClass} disabled={submitted} /><div className="grid gap-2 sm:grid-cols-2"><Button type="button" variant="outline" onClick={() => void download()} disabled={generating || submitting} className="h-12 rounded-xl border-[#9FBACD] text-[#153B66]"><Download className="mr-2 h-4 w-4" />{t(generating ? "submission.generating" : "submission.download")}</Button><Button type="button" onClick={() => void submit()} disabled={generating || submitting || submitted} className="h-12 rounded-xl bg-[#153B66]"><Send className="mr-2 h-4 w-4" />{t(submitted ? "submission.submitted" : submitting ? "submission.submitting" : "submission.submit")}</Button></div></div></section>;
 }
 
 export function AppHeader() {

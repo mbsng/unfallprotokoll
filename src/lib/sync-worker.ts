@@ -248,6 +248,21 @@ async function completeDraft(draft: LocalDraft, entry: OutboxEntry) {
     .eq("id", draft.ref.partyId).eq("version", draft.ref.partyVersion).select("version").maybeSingle();
   if (error || !data) throw error ?? new Error("complete_conflict");
   draft.ref = { ...draft.ref, partyVersion: data.version };
+
+  const { data: signedParties, error: partiesError } = await supabase.from("incident_parties").select("signed_at").eq("incident_id", draft.ref.incidentId);
+  if (partiesError) throw partiesError;
+  if (signedParties.length >= 2 && signedParties.every((party) => party.signed_at)) {
+    const { data: incident, error: incidentError } = await supabase.from("incidents").select("status, version").eq("id", draft.ref.incidentId).single();
+    if (incidentError) throw incidentError;
+    if (incident.status !== "signed") {
+      const { data: signedIncident, error: signError } = await supabase.from("incidents")
+        .update({ status: "signed", version: incident.version + 1, updated_at: new Date().toISOString() })
+        .eq("id", draft.ref.incidentId).eq("version", incident.version).select("version").single();
+      if (signError) throw signError;
+      draft.ref = { ...draft.ref, incidentVersion: signedIncident.version };
+    }
+  }
+
   await db.transaction("rw", db.drafts, db.outbox, async () => {
     await db.drafts.put(draft);
     await db.outbox.delete(entry.id);
