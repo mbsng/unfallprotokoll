@@ -32,7 +32,7 @@ export function SyncStatus({ ownerId }: { ownerId: string | null }) {
 
   return (
     <>
-      <div className={`fixed right-3 top-3 z-50 flex items-center gap-2 rounded-full border px-3 py-2 text-xs font-semibold shadow-sm ${statusClass}`} role="status" aria-live="polite">
+      <div className={`pointer-events-none fixed right-3 top-3 z-50 flex items-center gap-2 rounded-full border px-3 py-2 text-xs font-semibold shadow-sm ${statusClass}`} role="status" aria-live="polite">
         {!online ? <CloudOff className="h-4 w-4" /> : pending > 0 ? <RefreshCw className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
         <span>{!online ? t("sync.offline", { count: pending }) : pending > 0 ? t("sync.pending", { count: pending }) : t("sync.synced")}</span>
       </div>
