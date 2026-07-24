@@ -26,7 +26,7 @@ export default function AuthPage() {
 
   return (
     <div className="min-h-screen bg-[#F5F7FA] px-5 py-6 text-slate-900">
-      <div className="mx-auto flex max-w-5xl items-center justify-between"><Link to="/" className="flex items-center gap-3"><img src="/assets/unfallklar-logo.png" alt={t("app.name")} className="h-11 w-11 rounded-xl object-cover" /><span className="font-bold text-[#153B66]">{t("app.name")}</span></Link><LanguageSwitcher /></div>
+      <div className="mx-auto flex max-w-5xl items-center justify-between"><Link to="/" className="flex items-center gap-3"><img src="/assets/upsala-logo.png" alt={t("app.name")} className="h-11 w-11 rounded-xl object-cover" /><span className="font-bold text-[#153B66]">{t("app.name")}</span></Link><LanguageSwitcher /></div>
       <main className="mx-auto mt-10 max-w-md md:mt-16">
         <div className="mb-7 text-center"><span className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-[#E7F0F6] text-[#153B66]"><KeyRound className="h-7 w-7" /></span><h1 className="text-3xl font-bold tracking-tight text-[#102F52]">{t("auth.title")}</h1><p className="mt-3 leading-relaxed text-slate-600">{t("auth.subtitle")}</p></div>
         <section className="rounded-3xl border border-slate-200 bg-white p-5 shadow-xl shadow-slate-200/50 md:p-7">

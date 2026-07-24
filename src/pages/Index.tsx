@@ -379,7 +379,7 @@ function SubmissionPanel({ incidentId }: { incidentId: string }) {
 
 export function AppHeader() {
   const { t } = useTranslation();
-  return <header className="border-b border-slate-200 bg-white"><div className="mx-auto flex max-w-5xl items-center justify-between gap-2 px-4 py-4"><div className="flex min-w-0 items-center gap-3"><img src="/assets/unfallklar-logo.png" alt={t("app.name")} className="h-11 w-11 shrink-0 rounded-xl object-cover" /><div className="hidden min-w-0 md:block"><p className="text-xl font-bold tracking-tight text-[#153B66]">{t("app.name")}</p><p className="truncate text-xs font-medium text-slate-500">{t("app.statement")}</p></div></div><div className="flex items-center gap-2"><LanguageSwitcher /><UserMenu /></div></div></header>;
+  return <header className="border-b border-slate-200 bg-white"><div className="mx-auto flex max-w-5xl items-center justify-between gap-2 px-4 py-4"><div className="flex min-w-0 items-center gap-3"><img src="/assets/upsala-logo.png" alt={t("app.name")} className="h-11 w-11 shrink-0 rounded-xl object-cover" /><div className="hidden min-w-0 md:block"><p className="text-xl font-bold tracking-tight text-[#153B66]">{t("app.name")}</p><p className="truncate text-xs font-medium text-slate-500">{t("app.statement")}</p></div></div><div className="flex items-center gap-2"><LanguageSwitcher /><UserMenu /></div></div></header>;
 }
 
 function Field({ number, label, children }: { number?: string; label: string; children: React.ReactNode }) { return <div>{number && <FieldBadge number={number} />}<Label className="mb-2 block text-sm font-semibold text-slate-700">{label}</Label>{children}</div>; }

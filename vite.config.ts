@@ -14,10 +14,10 @@ export default defineConfig(() => ({
     react(),
     VitePWA({
       registerType: "autoUpdate",
-      includeAssets: ["favicon.ico", "assets/unfallklar-logo.png"],
+      includeAssets: ["favicon.ico", "assets/upsala-logo.png"],
       manifest: {
-        name: "Unfallprotokoll",
-        short_name: "Unfallprotokoll",
+        name: "Upsala.ch",
+        short_name: "Upsala.ch",
         description: "Unfälle vollständig und sicher dokumentieren – auch offline.",
         theme_color: "#153B66",
         background_color: "#F5F7FA",

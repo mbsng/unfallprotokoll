@@ -42,7 +42,7 @@ i18n
     interpolation: { escapeValue: false },
     detection: {
       order: ["localStorage", "navigator"],
-      lookupLocalStorage: "unfallklar-language",
+      lookupLocalStorage: "upsala-language",
       caches: ["localStorage"],
     },
   });

@@ -64,7 +64,7 @@ export default function Join() {
         </div>
       </header>
       <main className="mx-auto max-w-xl px-5 py-10 md:py-16">
-        <div className="mb-8 flex items-center gap-3"><img src="/assets/unfallklar-logo.png" alt={t("app.name")} className="h-12 w-12 rounded-xl object-cover" /><div><p className="font-bold text-[#153B66]">{t("app.name")}</p><p className="text-xs text-slate-500">{t("app.statement")}</p></div></div>
+        <div className="mb-8 flex items-center gap-3"><img src="/assets/upsala-logo.png" alt={t("app.name")} className="h-12 w-12 rounded-xl object-cover" /><div><p className="font-bold text-[#153B66]">{t("app.name")}</p><p className="text-xs text-slate-500">{t("app.statement")}</p></div></div>
         <section className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm md:p-8">
           <span className="mb-5 flex h-12 w-12 items-center justify-center rounded-2xl bg-[#E7F0F6] text-[#153B66]"><Link2 className="h-6 w-6" /></span>
           <p className="text-sm font-bold uppercase tracking-wider text-[#39719D]">{t("join.eyebrow")}</p>

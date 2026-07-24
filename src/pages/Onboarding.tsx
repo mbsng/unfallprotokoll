@@ -60,7 +60,7 @@ export default function Onboarding() {
 
   return (
     <div className="min-h-screen bg-[#F5F7FA] px-5 py-6 text-slate-900">
-      <header className="mx-auto flex max-w-3xl items-center justify-between"><div className="flex items-center gap-3"><img src="/assets/unfallklar-logo.png" alt={t("app.name")} className="h-11 w-11 rounded-xl object-cover" /><span className="font-bold text-[#153B66]">{t("app.name")}</span></div><LanguageSwitcher /></header>
+      <header className="mx-auto flex max-w-3xl items-center justify-between"><div className="flex items-center gap-3"><img src="/assets/upsala-logo.png" alt={t("app.name")} className="h-11 w-11 rounded-xl object-cover" /><span className="font-bold text-[#153B66]">{t("app.name")}</span></div><LanguageSwitcher /></header>
       <main className="mx-auto max-w-2xl py-10 md:py-14">
         <div className="mb-8"><p className="text-sm font-bold uppercase tracking-wider text-[#39719D]">{t("onboarding.eyebrow")}</p><h1 className="mt-2 text-3xl font-bold tracking-tight text-[#102F52]">{t("onboarding.title")}</h1><p className="mt-3 max-w-xl leading-relaxed text-slate-600">{t("onboarding.subtitle")}</p></div>
         <form onSubmit={save} className="space-y-5">
