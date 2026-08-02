@@ -121,11 +121,13 @@ serve(async (req) => {
     if (action === "invite_driver") {
       const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
       if (!emailPattern.test(email) || email.length > 254) return json({ error: "invalid_email" }, 400);
-      const siteUrl = Deno.env.get("SITE_URL") ?? new URL(req.url).origin;
+      const requestOrigin = req.headers.get("Origin");
+      const siteUrl = requestOrigin && /^https?:\/\//i.test(requestOrigin) ? requestOrigin : Deno.env.get("SITE_URL");
       const { data: invited, error: inviteError } = await service.auth.admin.inviteUserByEmail(email, {
-        redirectTo: `${siteUrl.replace(/\/$/, "")}/auth`,
+        ...(siteUrl ? { redirectTo: `${siteUrl.replace(/\/$/, "")}/auth` } : {}),
         data: { org_id: manager.org_id, role: "driver" },
       });
+
       if (inviteError || !invited.user) {
         if (inviteError?.message.toLowerCase().includes("already")) return json({ error: "already_registered" }, 409);
         throw inviteError ?? new Error("invite_failed");
