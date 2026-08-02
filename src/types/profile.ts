@@ -10,10 +10,22 @@ export interface InsuranceProfile {
   policyNumber?: string;
 }
 
+export interface OrganizationBranding {
+  logo_url?: string;
+  primary_color?: string;
+}
+
+export interface Organization {
+  id: string;
+  name: string;
+  branding_json: OrganizationBranding | null;
+}
+
 export interface Profile {
   id: string;
   full_name: string | null;
   phone: string | null;
+
   license_no: string | null;
   default_vehicle_json: VehicleProfile;
   insurance_json: InsuranceProfile;

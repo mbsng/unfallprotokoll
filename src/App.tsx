@@ -13,6 +13,7 @@ import Join from "./pages/Join";
 import AuthPage from "./pages/Auth";
 import Onboarding from "./pages/Onboarding";
 import Integrations from "./pages/Integrations";
+import Fleet from "./pages/Fleet";
 import NotFound from "./pages/NotFound";
 
 const queryClient = new QueryClient();
@@ -38,8 +39,8 @@ function SessionGate() {
     }
   }, [user, profile, loading, profileLoading, isAnonymous, location.pathname, location.search, navigate]);
 
-  if (loading || profileLoading) return <div className="flex min-h-screen items-center justify-center bg-[#F5F7FA] px-5 text-center font-medium text-[#153B66]">{t("auth.loading")}</div>;
-  return <Routes><Route path="/" element={<Index />} /><Route path="/join/:code" element={<Join />} /><Route path="/auth" element={<AuthPage />} /><Route path="/onboarding" element={<Onboarding />} /><Route path="/integrations" element={<Integrations />} /><Route path="*" element={<NotFound />} /></Routes>;
+  if (loading || profileLoading) return <div className="flex min-h-screen items-center justify-center bg-[#F5F7FA] px-5 text-center font-medium text-primary">{t("auth.loading")}</div>;
+  return <Routes><Route path="/" element={<Index />} /><Route path="/join/:code" element={<Join />} /><Route path="/auth" element={<AuthPage />} /><Route path="/onboarding" element={<Onboarding />} /><Route path="/fleet" element={<Fleet />} /><Route path="/integrations" element={<Integrations />} /><Route path="*" element={<NotFound />} /></Routes>;
 }
 
 function AppRuntime() {

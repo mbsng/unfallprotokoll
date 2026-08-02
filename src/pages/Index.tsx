@@ -379,10 +379,13 @@ function SubmissionPanel({ incidentId }: { incidentId: string }) {
 
 export function AppHeader() {
   const { t } = useTranslation();
-  return <header className="border-b border-slate-200 bg-white"><div className="mx-auto flex max-w-5xl items-center justify-between gap-2 px-4 py-4"><div className="flex min-w-0 items-center gap-3"><img src="/assets/upsala-logo.png" alt={t("app.name")} className="h-[48px] w-[48px] shrink-0 rounded-xl object-cover" /><div className="hidden min-w-0 md:block"><p className="text-xl font-bold tracking-tight text-[#153B66]">{t("app.name")}</p><p className="truncate text-xs font-medium text-slate-500">{t("app.statement")}</p></div></div><div className="flex items-center gap-2"><LanguageSwitcher /><UserMenu /></div></div></header>;
+  const { organization } = useAuth();
+  const name = organization?.name ?? t("app.name");
+  return <header className="border-b border-slate-200 bg-white"><div className="mx-auto flex max-w-5xl items-center justify-between gap-2 px-4 py-4"><div className="flex min-w-0 items-center gap-3"><img src={organization?.branding_json?.logo_url || "/assets/upsala-logo.png"} alt={name} className="h-[48px] w-[48px] shrink-0 rounded-xl object-contain" /><div className="hidden min-w-0 md:block"><p className="text-xl font-bold tracking-tight text-primary">{name}</p><p className="truncate text-xs font-medium text-slate-500">{t("app.statement")}</p></div></div><div className="flex items-center gap-2"><LanguageSwitcher /><UserMenu /></div></div></header>;
 }
 
 function Field({ number, label, children }: { number?: string; label: string; children: React.ReactNode }) { return <div>{number && <FieldBadge number={number} />}<Label className="mb-2 block text-sm font-semibold text-slate-700">{label}</Label>{children}</div>; }
+
 function FieldBadge({ number }: { number: string }) { const { t } = useTranslation(); return <span className="mb-1.5 inline-flex rounded-md bg-[#E7F0F6] px-2 py-1 text-[10px] font-bold uppercase tracking-wider text-[#285B82]">{t("fields.number", { number })}</span>; }
 function SectionTitle({ number, icon, title }: { number: string; icon: React.ReactNode; title: string }) { return <div className="mb-4 flex items-center gap-3 text-[#153B66]"><span className="flex h-10 w-10 items-center justify-center rounded-xl bg-[#EDF3F7] [&>svg]:h-5 [&>svg]:w-5">{icon}</span><div><FieldBadge number={number} /><h2 className="text-lg font-bold">{title}</h2></div></div>; }
 

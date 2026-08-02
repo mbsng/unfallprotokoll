@@ -1,6 +1,7 @@
-import { Cable, LogIn, LogOut, UserRound } from "lucide-react";
+import { Cable, LayoutDashboard, LogIn, LogOut, UserRound } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router-dom";
+
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { useAuth } from "@/contexts/AuthContext";
@@ -21,8 +22,10 @@ export function UserMenu() {
       <DropdownMenuContent align="end" className="w-64 rounded-xl p-2">
         <DropdownMenuLabel><p className="truncate text-sm font-semibold">{profile?.full_name || user.email}</p><p className="truncate text-xs font-normal text-slate-500">{user.email}</p></DropdownMenuLabel>
         <DropdownMenuSeparator />
+        {profile?.org_id && ["fleet_manager", "admin"].includes(profile.role) && <DropdownMenuItem asChild className="min-h-11 cursor-pointer rounded-lg"><Link to="/fleet"><LayoutDashboard className="mr-2 h-4 w-4" />Flotten-Portal</Link></DropdownMenuItem>}
         {profile?.org_id && ["insurer_agent", "admin"].includes(profile.role) && <DropdownMenuItem asChild className="min-h-11 cursor-pointer rounded-lg"><Link to="/integrations"><Cable className="mr-2 h-4 w-4" />{t("integrations.menu")}</Link></DropdownMenuItem>}
         <DropdownMenuItem onClick={() => void signOut()} className="min-h-11 cursor-pointer rounded-lg text-red-700"><LogOut className="mr-2 h-4 w-4" />{t("auth.signOut")}</DropdownMenuItem>
+
       </DropdownMenuContent>
     </DropdownMenu>
   );

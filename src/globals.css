@@ -107,4 +107,20 @@
   button, input, textarea {
     touch-action: manipulation;
   }
+
+  html[data-org-branding] [class*="bg-[#153B66]"],
+  html[data-org-branding] [class*="bg-[#102F52]"] {
+    background-color: var(--org-primary) !important;
+  }
+
+  html[data-org-branding] [class*="text-[#153B66]"],
+  html[data-org-branding] [class*="text-[#102F52]"],
+  html[data-org-branding] [class*="text-[#39719D]"] {
+    color: var(--org-primary) !important;
+  }
+
+  html[data-org-branding] [class*="border-[#153B66]"],
+  html[data-org-branding] [class*="border-[#39719D]"] {
+    border-color: var(--org-primary) !important;
+  }
 }

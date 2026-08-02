@@ -1,8 +1,10 @@
 import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
 import { PDFDocument, StandardFonts, rgb, type PDFImage, type PDFPage, type PDFFont } from "https://esm.sh/pdf-lib@1.17.1";
+import { incidentBelongsToOrg } from "../_shared/incident-export.ts";
 
 const corsHeaders = {
+
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
@@ -81,11 +83,22 @@ serve(async (req) => {
       service.from("incident_media").select("storage_path, kind, taken_at").eq("incident_id", incidentId).order("uploaded_at"),
     ]);
     if (incidentError || partiesError || !incident || !parties) return json({ error: "not_found" }, 404);
-    const ownParty = parties.find((party) => party.profile_id === authData.user.id);
-    if (!ownParty) return json({ error: "forbidden" }, 403);
+    let submissionParty = parties.find((party) => party.profile_id === authData.user.id);
+    if (!submissionParty) {
+      const { data: requester } = await service.from("profiles").select("org_id, role").eq("id", authData.user.id).maybeSingle();
+      const managerAllowed = requester?.org_id
+        && ["fleet_manager", "admin"].includes(requester.role)
+        && await incidentBelongsToOrg(service, incidentId, requester.org_id);
+      if (!managerAllowed) return json({ error: "forbidden" }, 403);
+      const partyProfileIds = parties.map((party) => party.profile_id).filter(Boolean);
+      const { data: orgProfile } = await service.from("profiles").select("id").eq("org_id", requester.org_id).in("id", partyProfileIds).limit(1).maybeSingle();
+      submissionParty = parties.find((party) => party.profile_id === orgProfile?.id);
+    }
+    if (!submissionParty) return json({ error: "forbidden" }, 403);
     if (!["signed", "submitted"].includes(incident.status) || parties.length < 2 || parties.some((party) => !party.signed_at)) return json({ error: "incident_not_completed" }, 409);
 
     const downloaded = new Map<string, { bytes: Uint8Array; contentType?: string }>();
+
     for (const item of media ?? []) {
       const { data, error } = await service.storage.from("incident-media").download(item.storage_path);
       if (!error && data) downloaded.set(item.storage_path, { bytes: new Uint8Array(await data.arrayBuffer()), contentType: data.type });
@@ -185,17 +198,19 @@ serve(async (req) => {
     const { error: uploadError } = await service.storage.from("incident-pdfs").upload(storagePath, pdfBytes, { upsert: true, contentType: "application/pdf" });
     if (uploadError) throw uploadError;
 
-    const { data: existing } = await service.from("submissions").select("id, status").eq("incident_id", incidentId).eq("party_id", ownParty.id).maybeSingle();
+    const { data: existing } = await service.from("submissions").select("id, status").eq("incident_id", incidentId).eq("party_id", submissionParty.id).maybeSingle();
     let submissionId: string;
     if (existing) {
       const { error } = await service.from("submissions").update({ pdf_storage_path: storagePath }).eq("id", existing.id);
+
       if (error) throw error;
       submissionId = existing.id;
     } else {
-      const { data: submission, error } = await service.from("submissions").insert({ incident_id: incidentId, party_id: ownParty.id, target: "pending", status: "generated", pdf_storage_path: storagePath }).select("id").single();
+      const { data: submission, error } = await service.from("submissions").insert({ incident_id: incidentId, party_id: submissionParty.id, target: "pending", status: "generated", pdf_storage_path: storagePath }).select("id").single();
       if (error) throw error;
       submissionId = submission.id;
     }
+
     const { data: signed, error: signError } = await service.storage.from("incident-pdfs").createSignedUrl(storagePath, 3600, { download: `Unfallprotokoll-${incident.share_code}.pdf` });
     if (signError) throw signError;
     console.log("[generate-pdf] PDF generated", { incidentId, submissionId, photoCount: photos.length });
