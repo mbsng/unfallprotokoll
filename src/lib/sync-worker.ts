@@ -302,11 +302,16 @@ export async function processOutbox() {
       if (activeOwnerId !== ownerId) break;
       try {
         await processEntry(entry);
-      } catch {
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (entry.operation === "create" && message.includes("plan_limit_reached")) {
+          window.dispatchEvent(new CustomEvent("plan-limit-reached", { detail: { draftId: entry.draftId } }));
+        }
         if (activeOwnerId === ownerId) await defer(entry);
         break;
       }
     }
+
   } finally {
     running = false;
   }

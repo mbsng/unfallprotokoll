@@ -17,8 +17,10 @@ import { UserMenu } from "@/components/UserMenu";
 import { useAuth } from "@/contexts/AuthContext";
 import { localeForLanguage } from "@/i18n";
 import { supabase } from "@/integrations/supabase/client";
+import { getPlanEntitlement } from "@/lib/billing";
 import { loadIncidentSummary, subscribeToIncident } from "@/lib/incidents";
 import { createLocalDraft, deleteLocalPhoto, getLatestDraft, markDraftComplete, saveDraftField, saveLocalPhoto, type LocalDraft } from "@/lib/local-db";
+
 import { generateIncidentPdf, SubmissionError, submitIncident } from "@/lib/submissions";
 import type { AccidentData, IncidentDraftRef, IncidentPartySummary, JoinedIncidentState, PendingPhoto } from "@/types/incident";
 
@@ -139,7 +141,14 @@ export default function Index() {
   }, [user?.id, joinedIncident?.draftRef.partyId, localDraftId]);
 
   useEffect(() => {
+    const showUpgrade = () => navigate("/upgrade?reason=limit");
+    window.addEventListener("plan-limit-reached", showUpgrade);
+    return () => window.removeEventListener("plan-limit-reached", showUpgrade);
+  }, [navigate]);
+
+  useEffect(() => {
     if (view !== "wizard" || !draftRef || draftRef.incidentId.startsWith("local:")) return;
+
     let active = true;
     let refreshing = false;
     let refreshQueued = false;
@@ -195,8 +204,16 @@ export default function Index() {
         ownerId = (await supabase.auth.getUser()).data.user?.id;
       }
       if (!ownerId) throw new Error("authentication_required");
+      if (navigator.onLine) {
+        const entitlement = await getPlanEntitlement();
+        if (!entitlement.canCreate) {
+          navigate("/upgrade?reason=limit");
+          return;
+        }
+      }
       const created = await createLocalDraft(ownerId, initial);
       applyLocalDraft(created);
+
       setParties([]);
       setServerLoaded(false);
       setRealtimeConnected(false);
