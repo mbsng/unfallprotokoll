@@ -6,8 +6,10 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { BrowserRouter, Routes, Route, useLocation, useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { AuthProvider, useAuth } from "@/contexts/AuthContext";
+import { DeepLinkHandler } from "@/components/DeepLinkHandler";
 import { SyncStatus } from "@/components/SyncStatus";
 import { startSyncWorker } from "@/lib/sync-worker";
+
 import Index from "./pages/Index";
 import Join from "./pages/Join";
 import AuthPage from "./pages/Auth";
@@ -47,7 +49,7 @@ function SessionGate() {
 function AppRuntime() {
   const { user } = useAuth();
   useEffect(() => user ? startSyncWorker(user.id) : undefined, [user?.id]);
-  return <><SyncStatus ownerId={user?.id ?? null} /><SessionGate /></>;
+  return <><DeepLinkHandler /><SyncStatus ownerId={user?.id ?? null} /><SessionGate /></>;
 }
 
 const App = () => (

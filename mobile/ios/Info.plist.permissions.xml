@@ -1,0 +1,4 @@
+<key>NSCameraUsageDescription</key>
+<string>Upsala benötigt die Kamera, um Schäden und die Unfallstelle zu dokumentieren.</string>
+<key>NSLocationWhenInUseUsageDescription</key>
+<string>Upsala verwendet Ihren Standort, um den Unfallort in das Protokoll zu übernehmen.</string>

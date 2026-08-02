@@ -1,0 +1,15 @@
+{
+  "applinks": {
+    "details": [
+      {
+        "appID": "APPLE_TEAM_ID.ch.upsala.app",
+        "components": [
+          {
+            "/": "/join/*",
+            "comment": "Upsala Unfallbeitritt"
+          }
+        ]
+      }
+    ]
+  }
+}
