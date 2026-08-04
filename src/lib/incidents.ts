@@ -98,39 +98,44 @@ export async function loadIncidentSummary(ref: IncidentDraftRef): Promise<Incide
 }
 
 export async function loadUserIncidents(userId: string): Promise<UserIncidentItem[]> {
-  const { data: ownParties, error } = await supabase
+  const { data: incidents, error: incidentsError } = await supabase
+    .from("incidents")
+    .select("id, share_code, status, occurred_at, location_text, created_at, updated_at")
+    .order("updated_at", { ascending: false })
+    .limit(20);
+
+  if (incidentsError) throw incidentsError;
+  if (!incidents?.length) return [];
+
+  const { data: allParties, error: partiesError } = await supabase
     .from("incident_parties")
-    .select("id, incident_id, party_label, signed_at, driver_json, vehicle_json, insurance_json, damage_description, incident:incidents(id, share_code, status, occurred_at, location_text, updated_at)")
-    .eq("profile_id", userId)
-    .order("incident.updated_at", { ascending: false });
+    .select("id, incident_id, party_label, profile_id, signed_at, driver_json, vehicle_json, insurance_json, damage_description")
+    .in("incident_id", incidents.map((i) => i.id));
 
-  if (error) throw error;
-  if (!ownParties?.length) return [];
+  if (partiesError) throw partiesError;
 
-  const incidentIds = ownParties.map((p) => p.incident_id);
-  const { data: allParties } = await supabase
-    .from("incident_parties")
-    .select("id, incident_id, signed_at")
-    .in("incident_id", incidentIds);
-
-  return ownParties.map((own) => {
-    const incidentRow = (Array.isArray(own.incident) ? own.incident[0] : own.incident) as Record<string, unknown> | null;
-    const others = (allParties ?? []).filter((p) => p.incident_id === own.incident_id && p.id !== own.id);
-    return {
-      incidentId: own.incident_id,
-      partyId: own.id,
-      partyLabel: own.party_label as "A" | "B",
-      shareCode: (incidentRow?.share_code as string) ?? "",
-      status: (incidentRow?.status as string) ?? "draft",
-      ownSignedAt: own.signed_at,
-      counterpartSignedAt: others[0]?.signed_at ?? null,
-      counterpartExists: others.length > 0,
-      ownFieldsComplete: isPartyComplete(own.driver_json, own.vehicle_json, own.insurance_json, own.damage_description),
-      occurredAt: (incidentRow?.occurred_at as string) ?? null,
-      locationText: (incidentRow?.location_text as string) ?? null,
-      plate: (own.vehicle_json as Record<string, string> | null)?.plate ?? "",
-    };
-  });
+  return incidents
+    .map((incident) => {
+      const partiesForIncident = (allParties ?? []).filter((p) => p.incident_id === incident.id);
+      const own = partiesForIncident.find((p) => p.profile_id === userId);
+      if (!own) return null;
+      const others = partiesForIncident.filter((p) => p.id !== own.id);
+      return {
+        incidentId: incident.id,
+        partyId: own.id,
+        partyLabel: own.party_label as "A" | "B",
+        shareCode: incident.share_code,
+        status: incident.status,
+        ownSignedAt: own.signed_at,
+        counterpartSignedAt: others[0]?.signed_at ?? null,
+        counterpartExists: others.length > 0,
+        ownFieldsComplete: isPartyComplete(own.driver_json, own.vehicle_json, own.insurance_json, own.damage_description),
+        occurredAt: incident.occurred_at,
+        locationText: incident.location_text,
+        plate: (own.vehicle_json as Record<string, string> | null)?.plate ?? "",
+      };
+    })
+    .filter((item): item is UserIncidentItem => item !== null);
 }
 
 export function computeCaseStatus(item: UserIncidentItem): CaseStatus {

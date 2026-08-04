@@ -3,7 +3,7 @@ import { useLiveQuery } from "dexie-react-hooks";
 import { useTranslation } from "react-i18next";
 
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import { AlertTriangle, ArrowLeft, ArrowRight, Camera, Car, Check, CheckCircle2, ChevronRight, Clock3, Download, FileText, LocateFixed, Mail, MapPin, PenLine, Plus, QrCode, Radio, Send, ShieldCheck, Trash2, UserRound } from "lucide-react";
+import { AlertTriangle, ArrowLeft, ArrowRight, Camera, Car, Check, CheckCircle2, ChevronRight, Clock3, Download, FileText, LocateFixed, Mail, MapPin, PenLine, Plus, QrCode, Radio, RefreshCw, Send, ShieldCheck, Trash2, UserRound } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -131,6 +131,8 @@ export default function Index() {
 
   const [serverCases, setServerCases] = useState<UserIncidentItem[]>([]);
   const [casesLoading, setCasesLoading] = useState(false);
+  const [casesError, setCasesError] = useState(false);
+  const [ensuringServerCase, setEnsuringServerCase] = useState(false);
   const [locating, setLocating] = useState(false);
   const photoInputRef = useRef<HTMLInputElement>(null);
 
@@ -231,21 +233,24 @@ export default function Index() {
   }, [view, draftRef?.incidentId]);
 
   useEffect(() => {
-    if (view !== "home" || !user || isAnonymous) return;
+    if (view !== "home" || !user) return;
     let active = true;
     const loadCases = async () => {
       setCasesLoading(true);
+      setCasesError(false);
       try {
         const cases = await loadUserIncidents(user.id);
         if (active) setServerCases(cases);
-      } catch { /* offline */ } finally {
+      } catch {
+        if (active) setCasesError(true);
+      } finally {
         if (active) setCasesLoading(false);
       }
     };
     void loadCases();
     const unsubscribe = subscribeToUserIncidents(() => { if (active) void loadCases(); });
     return () => { active = false; unsubscribe(); };
-  }, [view, user?.id, isAnonymous, signedJustNow]);
+  }, [view, user?.id, signedJustNow]);
 
   const allCases = useMemo<CaseItem[]>(() => {
     const items = serverCases.map(toCaseItem);
@@ -264,6 +269,31 @@ export default function Index() {
       return new Date(`${b.date}T${b.time}`).getTime() - new Date(`${a.date}T${a.time}`).getTime();
     });
   }, [serverCases, localDrafts]);
+
+  useEffect(() => {
+    if (step !== 5 || !draftRef || !draftRef.incidentId.startsWith("local:") || !user || !localDraftId || ensuringServerCase) return;
+    if (!navigator.onLine) return;
+    let active = true;
+    setEnsuringServerCase(true);
+    void processOutbox().then(() => {
+      if (active) setEnsuringServerCase(false);
+    }).catch(() => {
+      if (active) setEnsuringServerCase(false);
+    });
+    return () => { active = false; };
+  }, [step, draftRef?.incidentId, user?.id, localDraftId, ensuringServerCase]);
+
+  const retrySync = async () => {
+    if (!navigator.onLine || !user) return;
+    setEnsuringServerCase(true);
+    try {
+      await processOutbox();
+    } catch {
+      toast.error(t("incident.saveError"));
+    } finally {
+      setEnsuringServerCase(false);
+    }
+  };
 
   const startAccident = async () => {
     if (creating) return;
@@ -447,32 +477,52 @@ export default function Index() {
           <button onClick={() => navigate("/join")} className="group flex min-h-44 flex-col items-start justify-between rounded-3xl border-2 border-[#D8E3EC] bg-white p-6 text-left text-[#153B66] shadow-sm active:scale-[0.98]"><span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-[#EAF1F6]"><QrCode className="h-7 w-7" /></span><span className="flex w-full items-end justify-between gap-4"><span><span className="block text-xl font-bold">{t("home.join")}</span><span className="mt-1 block text-sm text-slate-500">{t("home.joinHint")}</span></span><ChevronRight className="mb-1 h-6 w-6 group-hover:translate-x-1" /></span></button>
         </section>
 
-        {allCases.length > 0 && <section className="mt-10">
-          <div className="mb-4 flex items-center justify-between"><h2 className="text-xl font-bold text-[#102F52]">{t("home.recent")}</h2></div>
-          <div className="space-y-3">
-            {allCases.map((item) => {
-              const targetStep = item.caseStatus === "draft" ? 0 : item.caseStatus === "action_needed" ? 5 : 5;
-              return (
-                <button key={item.id} onClick={() => void openCase(item, targetStep)} className="flex w-full items-center gap-4 rounded-2xl border border-slate-200 bg-white p-4 text-left shadow-sm transition hover:shadow-md active:scale-[0.99]">
-                  <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-[#EDF3F7] text-[#153B66]"><FileText className="h-6 w-6" /></div>
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2"><h3 className="truncate font-bold text-[#153B66]">{item.location || t("fields.notProvided")}</h3>
-                      <span className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] font-semibold ${statusColors[item.caseStatus]}`}>{t(`caseStatus.${item.caseStatus}`)}</span>
+        {casesLoading && (
+          <section className="mt-10">
+            <div className="mb-4"><h2 className="text-xl font-bold text-[#102F52]">{t("home.recent")}</h2></div>
+            <div className="space-y-3">
+              {[1, 2, 3].map((i) => <div key={i} className="flex animate-pulse items-center gap-4 rounded-2xl border border-slate-200 bg-white p-4"><div className="h-12 w-12 shrink-0 rounded-2xl bg-slate-200" /><div className="flex-1 space-y-2"><div className="h-4 w-1/3 rounded bg-slate-200" /><div className="h-3 w-1/2 rounded bg-slate-200" /></div></div>)}
+            </div>
+          </section>
+        )}
+
+        {!casesLoading && casesError && (
+          <section className="mt-10 rounded-2xl border border-rose-200 bg-rose-50 p-6 text-center">
+            <p className="text-sm font-semibold text-rose-900">{t("home.loadError")}</p>
+            <Button variant="outline" onClick={() => { setCasesError(false); setSignedJustNow((v) => !v); }} className="mt-3 rounded-xl border-rose-300 bg-white text-rose-900">{t("home.retry")}</Button>
+          </section>
+        )}
+
+        {!casesLoading && !casesError && allCases.length > 0 && (
+          <section className="mt-10">
+            <div className="mb-4 flex items-center justify-between"><h2 className="text-xl font-bold text-[#102F52]">{t("home.recent")}</h2></div>
+            <div className="space-y-3">
+              {allCases.map((item) => {
+                const targetStep = item.caseStatus === "draft" ? 0 : item.caseStatus === "action_needed" ? 5 : 5;
+                return (
+                  <button key={item.id} onClick={() => void openCase(item, targetStep)} className="flex w-full items-center gap-4 rounded-2xl border border-slate-200 bg-white p-4 text-left shadow-sm transition hover:shadow-md active:scale-[0.99]">
+                    <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-[#EDF3F7] text-[#153B66]"><FileText className="h-6 w-6" /></div>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2"><h3 className="truncate font-bold text-[#153B66]">{item.location || t("fields.notProvided")}</h3>
+                        <span className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] font-semibold ${statusColors[item.caseStatus]}`}>{t(`caseStatus.${item.caseStatus}`)}</span>
+                      </div>
+                      <p className="mt-1 truncate text-sm text-slate-500">{formatCaseDate(item) || t("fields.notProvided")} · {item.plate || t("fields.noPlate")}</p>
                     </div>
-                    <p className="mt-1 truncate text-sm text-slate-500">{formatCaseDate(item) || t("fields.notProvided")} · {item.plate || t("fields.noPlate")}</p>
-                  </div>
-                  {item.caseStatus === "action_needed" && <PenLine className="h-5 w-5 shrink-0 text-orange-500" />}
-                  <ChevronRight className="h-5 w-5 shrink-0 text-slate-400" />
-                </button>
-              );
-            })}
-          </div>
-        </section>}
-        {allCases.length === 0 && !casesLoading && (user && !isAnonymous) && (
+                    {item.caseStatus === "action_needed" && <PenLine className="h-5 w-5 shrink-0 text-orange-500" />}
+                    <ChevronRight className="h-5 w-5 shrink-0 text-slate-400" />
+                  </button>
+                );
+              })}
+            </div>
+          </section>
+        )}
+
+        {!casesLoading && !casesError && allCases.length === 0 && (
           <section className="mt-10 flex flex-col items-center justify-center rounded-3xl border border-dashed border-slate-300 bg-white py-16 text-center">
             <FileText className="mb-3 h-10 w-10 text-slate-300" />
             <p className="font-semibold text-slate-600">{t("home.noCases")}</p>
             <p className="mt-1 text-sm text-slate-400">{t("home.noCasesHint")}</p>
+            <Button onClick={() => void startAccident()} className="mt-4 rounded-xl bg-[#153B66]"><Plus className="mr-2 h-4 w-4" />{t("home.new")}</Button>
           </section>
         )}
       </main>
@@ -495,7 +545,13 @@ export default function Index() {
 
           {step === 4 && <div className="space-y-5"><div><FieldBadge number="10" /><p className="text-sm font-semibold text-slate-700">{t("fields.initialImpact")}</p></div><FieldBadge number="13" /><div className="rounded-xl bg-[#EDF4F8] p-4 text-sm leading-relaxed text-[#153B66]"><strong>{t("sketch.tipTitle")}</strong> {t("sketch.tip")}</div><DrawingCanvas label={t("fields.sketch")} height={320} initialDataUrl={data.sketchDataUrl} onChange={(value, dataUrl) => { update("hasSketch", value); update("sketchDataUrl", dataUrl ?? ""); }} /><div className="flex flex-wrap gap-3 text-xs text-slate-500"><span className="rounded-full bg-slate-100 px-3 py-1.5">{t("sketch.myVehicle")}</span><span className="rounded-full bg-slate-100 px-3 py-1.5">{t("sketch.otherVehicle")}</span><span className="rounded-full bg-slate-100 px-3 py-1.5">{t("sketch.impact")}</span></div></div>}
           {step === 5 && <div className="space-y-6">
-            {draftRef?.partyLabel === "A" && !alreadySigned && <InviteParty shareCode={draftRef.shareCode} loading={draftRef.incidentId.startsWith("local:")} />}
+            {draftRef?.partyLabel === "A" && !alreadySigned && (draftRef.incidentId.startsWith("local:")
+              ? (ensuringServerCase
+                  ? <div className="flex items-center justify-center rounded-2xl border border-slate-200 bg-slate-50 p-8"><RefreshCw className="mr-2 h-5 w-5 animate-spin text-[#39719D]" /><span className="text-sm font-semibold text-slate-600">{t("invite.savingCase")}</span></div>
+                  : !navigator.onLine
+                    ? <div className="rounded-2xl border border-amber-200 bg-amber-50 p-5 text-center"><p className="text-sm font-semibold text-amber-900">{t("invite.offlineHint")}</p><p className="mt-1 text-xs text-amber-700">{t("invite.offlineDetail")}</p></div>
+                    : <div className="rounded-2xl border border-rose-200 bg-rose-50 p-5 text-center"><p className="text-sm font-semibold text-rose-900">{t("invite.saveFailed")}</p><Button variant="outline" onClick={() => void retrySync()} className="mt-3 rounded-xl border-rose-300 bg-white text-rose-900">{t("home.retry")}</Button></div>)
+              : <InviteParty shareCode={draftRef.shareCode} loading={false} />)}
             <div className="grid gap-3 sm:grid-cols-2"><Summary number="1" icon={<Clock3 />} label={t("fields.dateTime")} value={formatCaseDate(data)} /><Summary number="2" icon={<MapPin />} label={t("fields.place")} value={data.location || t("fields.notProvided")} /><Summary number="9" icon={<UserRound />} label={t("fields.driver")} value={data.driverName || t("fields.notProvided")} /><Summary number="7" icon={<Car />} label={t("fields.vehicle")} value={`${data.plate || t("fields.noPlate")}${data.vehicle ? ` · ${data.vehicle}` : ""}`} /><Summary number="8" icon={<ShieldCheck />} label={t("fields.insurer")} value={data.insurer || t("fields.notProvided")} /><Summary number="11–13" icon={<Camera />} label={t("fields.documentation")} value={`${t("fields.photosCount", { formattedCount: formatNumber(data.photos.length) })} · ${t(data.hasSketch ? "fields.sketchAvailable" : "fields.withoutSketch")}`} /></div>
             <div className="rounded-2xl border border-slate-200 p-4"><FieldBadge number="12" /><p className="mb-2 mt-2 text-xs font-bold uppercase tracking-wider text-slate-500">{t("summary.circumstances")}</p>{selectedSummary.length ? <ul className="space-y-1.5">{selectedSummary.map((item) => <li key={item} className="flex gap-2 text-sm text-slate-700"><Check className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />{item}</li>)}</ul> : <p className="text-sm text-slate-500">{t("summary.noneSelected")}</p>}</div>
             {counterpart && <CounterpartSummary party={counterpart} loading={summaryLoading} />}
