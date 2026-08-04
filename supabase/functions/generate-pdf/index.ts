@@ -4,13 +4,13 @@ import { PDFDocument, StandardFonts, rgb, type PDFImage, type PDFPage, type PDFF
 import { incidentBelongsToOrg } from "../_shared/incident-export.ts";
 
 const corsHeaders = {
-
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
 const json = (body: Record<string, unknown>, status = 200) => new Response(JSON.stringify(body), { status, headers: { ...corsHeaders, "Content-Type": "application/json" } });
 const A4 = { width: 595.28, height: 841.89 };
 const LANDSCAPE = { width: A4.height, height: A4.width };
+
 const circumstances = [
   "parkte / hielt an", "verliess einen Parkplatz / öffnete eine Tür", "parkte ein", "fuhr aus Parkplatz / Grundstück aus",
   "fuhr auf Parkplatz / Grundstück ein", "fuhr in einen Kreisverkehr ein", "fuhr im Kreisverkehr", "fuhr auf das Heck auf",
@@ -18,7 +18,19 @@ const circumstances = [
   "fuhr rückwärts", "geriet auf die Gegenfahrbahn", "kam von rechts", "missachtete Vorfahrt / Rotlicht",
 ];
 
-const clean = (value: unknown) => String(value ?? "—").replace(/[–—]/g, "-").replace(/[“”]/g, '"').replace(/[‘’]/g, "'").replace(/[^\x20-\xFF\n]/g, "?");
+// pdf-lib StandardFonts use WinAnsiEncoding which supports Latin-1 including German umlauts.
+// Replace characters outside WinAnsi range to avoid encoding crashes.
+const clean = (value: unknown) => {
+  if (value === null || value === undefined) return "—";
+  return String(value)
+    .replace(/[–—]/g, "-")
+    .replace(/[""]/g, '"')
+    .replace(/['']/g, "'")
+    .replace(/…/g, "...")
+    .replace(/€/g, "EUR")
+    .replace(/[^\x20-\xFF\n]/g, "?");
+};
+
 const lines = (font: PDFFont, text: string, size: number, maxWidth: number) => {
   const result: string[] = [];
   for (const paragraph of clean(text).split("\n")) {
@@ -50,7 +62,10 @@ async function embedImage(pdf: PDFDocument, bytes: Uint8Array, contentType?: str
     if (contentType?.includes("png")) return await pdf.embedPng(bytes);
     if (contentType?.includes("jpeg") || contentType?.includes("jpg")) return await pdf.embedJpg(bytes);
     try { return await pdf.embedPng(bytes); } catch { return await pdf.embedJpg(bytes); }
-  } catch { return null; }
+  } catch {
+    console.warn("[generate-pdf] Failed to embed image", { contentType, size: bytes.length });
+    return null;
+  }
 }
 
 function drawImageFit(page: PDFPage, image: PDFImage, x: number, y: number, width: number, height: number) {
@@ -82,7 +97,11 @@ serve(async (req) => {
       service.from("incident_witnesses").select("name, contact").eq("incident_id", incidentId),
       service.from("incident_media").select("storage_path, kind, taken_at").eq("incident_id", incidentId).order("uploaded_at"),
     ]);
-    if (incidentError || partiesError || !incident || !parties) return json({ error: "not_found" }, 404);
+    if (incidentError || partiesError || !incident || !parties) {
+      console.error("[generate-pdf] Data fetch failed", { incidentError: incidentError?.message, partiesError: partiesError?.message });
+      return json({ error: "not_found" }, 404);
+    }
+
     let submissionParty = parties.find((party) => party.profile_id === authData.user.id);
     if (!submissionParty) {
       const { data: requester } = await service.from("profiles").select("org_id, role").eq("id", authData.user.id).maybeSingle();
@@ -95,13 +114,30 @@ serve(async (req) => {
       submissionParty = parties.find((party) => party.profile_id === orgProfile?.id);
     }
     if (!submissionParty) return json({ error: "forbidden" }, 403);
-    if (!["signed", "submitted"].includes(incident.status) || parties.length === 0 || parties.some((party) => !party.signed_at)) return json({ error: "incident_not_completed" }, 409);
+
+    // Defensive status check: if all parties have signed_at, accept even if status hasn't been updated yet
+    const allSigned = parties.length > 0 && parties.every((party) => party.signed_at);
+    if (!["signed", "submitted"].includes(incident.status)) {
+      if (allSigned) {
+        console.log("[generate-pdf] Auto-fixing incident status to signed", { incidentId, currentStatus: incident.status });
+        const { error: fixError } = await service.from("incidents")
+          .update({ status: "signed", version: incident.version + 1, updated_at: new Date().toISOString() })
+          .eq("id", incidentId).eq("version", incident.version);
+        if (fixError) console.warn("[generate-pdf] Could not auto-fix status", { error: fixError.message });
+      } else {
+        return json({ error: "incident_not_completed" }, 409);
+      }
+    }
 
     const downloaded = new Map<string, { bytes: Uint8Array; contentType?: string }>();
 
     for (const item of media ?? []) {
       const { data, error } = await service.storage.from("incident-media").download(item.storage_path);
-      if (!error && data) downloaded.set(item.storage_path, { bytes: new Uint8Array(await data.arrayBuffer()), contentType: data.type });
+      if (error) {
+        console.warn("[generate-pdf] Could not download media", { path: item.storage_path, error: error.message });
+        continue;
+      }
+      if (data) downloaded.set(item.storage_path, { bytes: new Uint8Array(await data.arrayBuffer()), contentType: data.type });
     }
 
     const pdf = await PDFDocument.create();
@@ -137,14 +173,14 @@ serve(async (req) => {
       field(page, regular, bold, "11 Schäden / 14 Bemerkungen", party.damage_description, x, 318, columnWidth, 62);
     };
     drawParty(partyA, leftA, { r: 0.12, g: 0.45, b: 0.72 });
-    drawParty(partyB, leftB, { r: 0.94, g: 0.72, b: 0.12 });
+    if (partyB) drawParty(partyB, leftB, { r: 0.94, g: 0.72, b: 0.12 });
 
     const checkX = 304;
     page.drawText("12 UNFALLHERGANG", { x: checkX + 34, y: 460, size: 10, font: bold, color: navy });
     circumstances.forEach((label, index) => {
       const y = 442 - index * 13.2;
       const checkedA = (partyA.circumstances_checked ?? []).includes(index);
-      const checkedB = (partyB.circumstances_checked ?? []).includes(index);
+      const checkedB = partyB ? (partyB.circumstances_checked ?? []).includes(index) : false;
       page.drawRectangle({ x: checkX, y: y - 2, width: 9, height: 9, borderWidth: 0.6, borderColor: navy, color: checkedA ? rgb(0.12, 0.45, 0.72) : rgb(1, 1, 1) });
       page.drawRectangle({ x: checkX + 225, y: y - 2, width: 9, height: 9, borderWidth: 0.6, borderColor: navy, color: checkedB ? rgb(0.94, 0.72, 0.12) : rgb(1, 1, 1) });
       page.drawText(`${index + 1}. ${clean(label)}`, { x: checkX + 15, y, size: 6.5, font: regular, color: rgb(0.15, 0.2, 0.26) });
@@ -157,18 +193,24 @@ serve(async (req) => {
       const stored = downloaded.get(sketchItem.storage_path)!;
       const image = await embedImage(pdf, stored.bytes, stored.contentType);
       if (image) drawImageFit(page, image, 36, 44, 510, 158);
+      else page.drawText("(Skizze konnte nicht eingebettet werden)", { x: 100, y: 120, size: 8, font: regular, color: rgb(0.5, 0.5, 0.5) });
     }
 
-    const drawSignature = async (party: Record<string, unknown>, x: number, width: number) => {
+    const drawSignature = async (party: Record<string, unknown> | undefined, x: number, width: number) => {
       page.drawRectangle({ x, y: 36, width, height: 190, borderWidth: 0.8, borderColor: rgb(0.55, 0.62, 0.68) });
-      page.drawText(`15 UNTERSCHRIFT ${clean(party.party_label)}`, { x: x + 8, y: 210, size: 8, font: bold, color: navy });
-      const signatureItem = (media ?? []).find((item) => item.storage_path.includes(`/${party.id}/signature.`));
-      if (signatureItem && downloaded.has(signatureItem.storage_path)) {
-        const stored = downloaded.get(signatureItem.storage_path)!;
-        const image = await embedImage(pdf, stored.bytes, stored.contentType);
-        if (image) drawImageFit(page, image, x + 8, 82, width - 16, 112);
+      page.drawText(`15 UNTERSCHRIFT ${clean(party?.party_label)}`, { x: x + 8, y: 210, size: 8, font: bold, color: navy });
+      if (party) {
+        const signatureItem = (media ?? []).find((item) => item.storage_path.includes(`/${party.id}/signature.`));
+        if (signatureItem && downloaded.has(signatureItem.storage_path)) {
+          const stored = downloaded.get(signatureItem.storage_path)!;
+          const image = await embedImage(pdf, stored.bytes, stored.contentType);
+          if (image) drawImageFit(page, image, x + 8, 82, width - 16, 112);
+          else page.drawText("(Signatur konnte nicht eingebettet werden)", { x: x + 8, y: 120, size: 7, font: regular, color: rgb(0.5, 0.5, 0.5) });
+        }
+        page.drawText(`Signiert: ${clean(party.signed_at ? new Date(party.signed_at as string).toLocaleString("de-CH") : "—")}`, { x: x + 8, y: 53, size: 7, font: regular, color: rgb(0.3, 0.35, 0.4) });
+      } else {
+        page.drawText("Keine zweite Partei", { x: x + 8, y: 120, size: 8, font: regular, color: rgb(0.5, 0.5, 0.5) });
       }
-      page.drawText(`Signiert: ${clean(party.signed_at ? new Date(party.signed_at as string).toLocaleString("de-CH") : "—")}`, { x: x + 8, y: 53, size: 7, font: regular, color: rgb(0.3, 0.35, 0.4) });
     };
     await drawSignature(partyA, 566, 120);
     await drawSignature(partyB, 694, 120);
@@ -196,27 +238,38 @@ serve(async (req) => {
     const pdfBytes = await pdf.save();
     const storagePath = `${incidentId}/unfallprotokoll-${incident.share_code}.pdf`;
     const { error: uploadError } = await service.storage.from("incident-pdfs").upload(storagePath, pdfBytes, { upsert: true, contentType: "application/pdf" });
-    if (uploadError) throw uploadError;
+    if (uploadError) {
+      console.error("[generate-pdf] Storage upload failed", { error: uploadError.message, storagePath });
+      throw uploadError;
+    }
 
     const { data: existing } = await service.from("submissions").select("id, status").eq("incident_id", incidentId).eq("party_id", submissionParty.id).maybeSingle();
     let submissionId: string;
     if (existing) {
       const { error } = await service.from("submissions").update({ pdf_storage_path: storagePath }).eq("id", existing.id);
-
-      if (error) throw error;
+      if (error) {
+        console.error("[generate-pdf] Failed to update submission", { error: error.message });
+        throw error;
+      }
       submissionId = existing.id;
     } else {
       const { data: submission, error } = await service.from("submissions").insert({ incident_id: incidentId, party_id: submissionParty.id, target: "pending", status: "generated", pdf_storage_path: storagePath }).select("id").single();
-      if (error) throw error;
+      if (error) {
+        console.error("[generate-pdf] Failed to create submission", { error: error.message });
+        throw error;
+      }
       submissionId = submission.id;
     }
 
     const { data: signed, error: signError } = await service.storage.from("incident-pdfs").createSignedUrl(storagePath, 3600, { download: `Unfallprotokoll-${incident.share_code}.pdf` });
-    if (signError) throw signError;
-    console.log("[generate-pdf] PDF generated", { incidentId, submissionId, photoCount: photos.length });
+    if (signError) {
+      console.error("[generate-pdf] Failed to create signed URL", { error: signError.message });
+      throw signError;
+    }
+    console.log("[generate-pdf] PDF generated successfully", { incidentId, submissionId, photoCount: photos.length, storagePath });
     return json({ submissionId, storagePath, downloadUrl: signed.signedUrl });
   } catch (error) {
-    console.error("[generate-pdf] generation failed", { error: error instanceof Error ? error.message : String(error) });
+    console.error("[generate-pdf] generation failed", { error: error instanceof Error ? error.message : String(error), stack: error instanceof Error ? error.stack : undefined });
     return json({ error: "pdf_generation_failed" }, 500);
   }
 });

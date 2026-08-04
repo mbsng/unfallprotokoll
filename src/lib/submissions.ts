@@ -6,25 +6,26 @@ export class SubmissionError extends Error {
   }
 }
 
-async function errorCode(error: unknown, fallback: string) {
+async function extractErrorCode(error: unknown, fallback: string) {
   const context = (error as { context?: Response } | null)?.context;
-  if (!context) return fallback;
-  try {
-    const body = await context.clone().json() as { error?: string };
-    return body.error ?? fallback;
-  } catch {
-    return fallback;
+  if (context) {
+    try {
+      const body = await context.clone().json() as { error?: string };
+      return body.error ?? fallback;
+    } catch { /* not JSON */ }
   }
+  if (error instanceof Error && error.message) return error.message.includes(":") ? error.message.split(":")[1] ?? fallback : error.message;
+  return fallback;
 }
 
 export async function generateIncidentPdf(incidentId: string) {
   const { data, error } = await supabase.functions.invoke("generate-pdf", { body: { incidentId } });
-  if (error || !data?.downloadUrl) throw new SubmissionError(await errorCode(error, data?.error ?? "pdf_generation_failed"));
+  if (error || !data?.downloadUrl) throw new SubmissionError(await extractErrorCode(error, data?.error ?? "pdf_generation_failed"));
   return data as { submissionId: string; storagePath: string; downloadUrl: string };
 }
 
 export async function submitIncident(incidentId: string, targetEmail: string) {
   const { data, error } = await supabase.functions.invoke("submit-incident", { body: { incidentId, targetEmail } });
-  if (error || !data?.downloadUrl) throw new SubmissionError(await errorCode(error, data?.error ?? "submission_failed"));
+  if (error || !data?.downloadUrl) throw new SubmissionError(await extractErrorCode(error, data?.error ?? "submission_failed"));
   return data as { submissionId: string; status: "submitted"; submittedAt?: string; downloadUrl: string };
 }

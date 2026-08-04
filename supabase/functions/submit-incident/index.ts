@@ -40,70 +40,114 @@ serve(async (req) => {
       service.from("incidents").select("id, share_code, status, version").eq("id", incidentId).single(),
       service.from("incident_parties").select("id").eq("incident_id", incidentId).eq("profile_id", authData.user.id).maybeSingle(),
     ]);
-    if (incidentError || partyError || !incident) return json({ error: "not_found" }, 404);
+    if (incidentError || partyError || !incident) {
+      console.error("[submit-incident] Data fetch failed", { incidentError: incidentError?.message, partyError: partyError?.message });
+      return json({ error: "not_found" }, 404);
+    }
     if (!ownParty) return json({ error: "forbidden" }, 403);
-    if (!["signed", "submitted"].includes(incident.status)) return json({ error: "incident_not_completed" }, 409);
+
+    // Defensive status check: auto-fix if all parties signed but status not updated
+    if (!["signed", "submitted"].includes(incident.status)) {
+      const { data: allParties } = await service.from("incident_parties").select("signed_at").eq("incident_id", incidentId);
+      const allSigned = allParties && allParties.length > 0 && allParties.every((p) => p.signed_at);
+      if (allSigned) {
+        console.log("[submit-incident] Auto-fixing incident status to signed", { incidentId, currentStatus: incident.status });
+        await service.from("incidents").update({ status: "signed", version: incident.version + 1, updated_at: new Date().toISOString() }).eq("id", incidentId).eq("version", incident.version);
+      } else {
+        return json({ error: "incident_not_completed" }, 409);
+      }
+    }
 
     let { data: submission } = await service.from("submissions").select("id, status, pdf_storage_path").eq("incident_id", incidentId).eq("party_id", ownParty.id).maybeSingle();
     if (!submission?.pdf_storage_path) {
-      const generated = await fetch("https://itdkfzzajyxfofnrgkqx.supabase.co/functions/v1/generate-pdf", {
+      const generated = await fetch(`${supabaseUrl}/functions/v1/generate-pdf`, {
         method: "POST",
         headers: { Authorization: authHeader, apikey: Deno.env.get("SUPABASE_ANON_KEY")!, "Content-Type": "application/json" },
         body: JSON.stringify({ incidentId }),
       });
       const generatedBody = await generated.json();
-      if (!generated.ok || !generatedBody.storagePath) throw new Error(`pdf_generation_failed:${generatedBody.error ?? generated.status}`);
+      if (!generated.ok || !generatedBody.storagePath) {
+        console.error("[submit-incident] PDF generation failed", { status: generated.status, body: generatedBody });
+        throw new Error(`pdf_generation_failed:${generatedBody.error ?? generated.status}`);
+      }
       const result = await service.from("submissions").select("id, status, pdf_storage_path").eq("id", generatedBody.submissionId).single();
       if (result.error) throw result.error;
       submission = result.data;
     }
 
-    if (submission.status === "submitted" && incident.status === "submitted") {
+    // Already submitted — return the existing result
+    if (submission.status === "submitted") {
       const { data: signed } = await service.storage.from("incident-pdfs").createSignedUrl(submission.pdf_storage_path, 3600, { download: `Unfallprotokoll-${incident.share_code}.pdf` });
       return json({ submissionId: submission.id, status: "submitted", downloadUrl: signed?.signedUrl });
     }
 
     const { data: pdfBlob, error: downloadError } = await service.storage.from("incident-pdfs").download(submission.pdf_storage_path);
-    if (downloadError || !pdfBlob) throw downloadError ?? new Error("pdf_not_found");
+    if (downloadError || !pdfBlob) {
+      console.error("[submit-incident] PDF download from storage failed", { error: downloadError?.message, path: submission.pdf_storage_path });
+      throw downloadError ?? new Error("pdf_not_found");
+    }
     const pdfBytes = new Uint8Array(await pdfBlob.arrayBuffer());
-    const email = await sendEmail({
-      to: targetEmail,
-      subject: `Europäisches Unfallprotokoll ${incident.share_code}`,
-      html: `<p>Guten Tag</p><p>Im Anhang erhalten Sie das abgeschlossene Europäische Unfallprotokoll zum Fall <strong>${incident.share_code}</strong>.</p><p>Freundliche Grüsse<br>Unfallprotokoll</p>`,
-      attachments: [{ filename: `Unfallprotokoll-${incident.share_code}.pdf`, content: toBase64(pdfBytes) }],
-    });
+
+    let email;
+    try {
+      email = await sendEmail({
+        to: targetEmail,
+        subject: `Europäisches Unfallprotokoll ${incident.share_code}`,
+        html: `<p>Guten Tag</p><p>Im Anhang erhalten Sie das abgeschlossene Europäische Unfallprotokoll zum Fall <strong>${incident.share_code}</strong>.</p><p>Freundliche Grüsse<br>Unfallprotokoll</p>`,
+        attachments: [{ filename: `Unfallprotokoll-${incident.share_code}.pdf`, content: toBase64(pdfBytes) }],
+      });
+    } catch (emailError) {
+      const message = emailError instanceof Error ? emailError.message : String(emailError);
+      console.error("[submit-incident] Email sending failed", { error: message });
+      // Record the failed attempt so it can be retried
+      await service.from("submissions").update({ target: targetEmail, status: "failed" }).eq("id", submission.id);
+      if (message === "email_provider_not_configured") return json({ error: "email_provider_not_configured" }, 503);
+      throw new Error(`email_send_failed:${message}`);
+    }
 
     const submittedAt = new Date().toISOString();
     const { error: submissionError } = await service.from("submissions").update({ target: targetEmail, status: "submitted", submitted_at: submittedAt }).eq("id", submission.id);
-    if (submissionError) throw submissionError;
+    if (submissionError) {
+      console.error("[submit-incident] Failed to update submission status", { error: submissionError.message });
+      throw submissionError;
+    }
     if (incident.status === "signed") {
       const { data: updatedIncident, error: incidentUpdateError } = await service.from("incidents")
         .update({ status: "submitted", version: incident.version + 1, updated_at: submittedAt })
         .eq("id", incidentId).eq("version", incident.version).select("status").maybeSingle();
-      if (incidentUpdateError) throw incidentUpdateError;
+      if (incidentUpdateError) {
+        console.error("[submit-incident] Failed to update incident status", { error: incidentUpdateError.message });
+        throw incidentUpdateError;
+      }
       if (!updatedIncident) {
         const { data: current } = await service.from("incidents").select("status").eq("id", incidentId).single();
-        if (current?.status !== "submitted") throw new Error("incident_status_conflict");
+        if (current?.status !== "submitted") {
+          console.warn("[submit-incident] Incident status conflict, but email was already sent", { incidentId });
+        }
       }
     }
     const { data: signed, error: signError } = await service.storage.from("incident-pdfs").createSignedUrl(submission.pdf_storage_path, 3600, { download: `Unfallprotokoll-${incident.share_code}.pdf` });
-    if (signError) throw signError;
+    if (signError) {
+      console.error("[submit-incident] Failed to create signed URL", { error: signError.message });
+      throw signError;
+    }
     try {
-      const webhookResponse = await fetch("https://itdkfzzajyxfofnrgkqx.supabase.co/functions/v1/push-webhook", {
+      const webhookResponse = await fetch(`${supabaseUrl}/functions/v1/push-webhook`, {
         method: "POST",
         headers: { Authorization: authHeader, apikey: Deno.env.get("SUPABASE_ANON_KEY")!, "Content-Type": "application/json" },
         body: JSON.stringify({ submissionId: submission.id, incidentId }),
       });
-      if (!webhookResponse.ok) console.warn("[submit-incident] webhook event was not accepted", { incidentId, responseCode: webhookResponse.status });
+      if (!webhookResponse.ok) console.warn("[submit-incident] Webhook not accepted", { incidentId, responseCode: webhookResponse.status });
     } catch (webhookError) {
-      console.warn("[submit-incident] webhook event failed", { incidentId, error: webhookError instanceof Error ? webhookError.message : String(webhookError) });
+      console.warn("[submit-incident] Webhook failed", { incidentId, error: webhookError instanceof Error ? webhookError.message : String(webhookError) });
     }
-    console.log("[submit-incident] incident submitted", { incidentId, submissionId: submission.id, emailId: email.id });
+    console.log("[submit-incident] Incident submitted successfully", { incidentId, submissionId: submission.id, emailId: email.id, targetEmail });
     return json({ submissionId: submission.id, status: "submitted", submittedAt, downloadUrl: signed.signedUrl });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    console.error("[submit-incident] submission failed", { error: message });
+    console.error("[submit-incident] Submission failed", { error: message, stack: error instanceof Error ? error.stack : undefined });
     if (message === "email_provider_not_configured") return json({ error: "email_provider_not_configured" }, 503);
+    if (message.startsWith("email_send_failed:")) return json({ error: "email_send_failed" }, 502);
     return json({ error: "submission_failed" }, 500);
   }
 });

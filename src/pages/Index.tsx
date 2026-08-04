@@ -7,6 +7,7 @@ import { AlertTriangle, ArrowLeft, ArrowRight, Camera, Car, Check, CheckCircle2,
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
@@ -582,8 +583,12 @@ function SubmissionPanel({ incidentId }: { incidentId: string }) {
   const [generating, setGenerating] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [submitted, setSubmitted] = useState(false);
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
 
   const download = async () => {
+    if (busy) return;
+    setBusy(true);
     setGenerating(true);
     try {
       const result = await generateIncidentPdf(incidentId);
@@ -593,14 +598,18 @@ function SubmissionPanel({ incidentId }: { incidentId: string }) {
       anchor.click();
     } catch (error) {
       const code = error instanceof SubmissionError ? error.code : "pdf_generation_failed";
+      console.error("[SubmissionPanel] PDF download failed", { code, error });
       toast.error(t(`submission.errors.${code}`, { defaultValue: t("submission.errors.pdf_generation_failed") }));
     } finally {
       setGenerating(false);
+      setBusy(false);
     }
   };
 
   const submit = async () => {
     if (!/^\S+@\S+\.\S+$/.test(targetEmail)) return toast.error(t("submission.invalidEmail"));
+    setConfirmOpen(false);
+    setBusy(true);
     setSubmitting(true);
     try {
       await submitIncident(incidentId, targetEmail);
@@ -608,13 +617,50 @@ function SubmissionPanel({ incidentId }: { incidentId: string }) {
       toast.success(t("submission.success"));
     } catch (error) {
       const code = error instanceof SubmissionError ? error.code : "submission_failed";
+      console.error("[SubmissionPanel] Submission failed", { code, error });
       toast.error(t(`submission.errors.${code}`, { defaultValue: t("submission.errors.submission_failed") }));
     } finally {
       setSubmitting(false);
+      setBusy(false);
     }
   };
 
-  return <section className="rounded-2xl border border-[#B8CDDC] bg-[#F4F8FB] p-5"><div className="flex items-start gap-3"><span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-white text-[#153B66]"><Mail className="h-5 w-5" /></span><div><h3 className="font-bold text-[#153B66]">{t("submission.title")}</h3><p className="mt-1 text-sm leading-relaxed text-slate-600">{t("submission.description")}</p></div></div><div className="mt-4 space-y-3"><Input type="email" value={targetEmail} onChange={(event) => setTargetEmail(event.target.value)} placeholder={t("submission.emailPlaceholder")} className={fieldClass} disabled={submitted} /><div className="grid gap-2 sm:grid-cols-2"><Button type="button" variant="outline" onClick={() => void download()} disabled={generating || submitting} className="h-12 rounded-xl border-[#9FBACD] text-[#153B66]"><Download className="mr-2 h-4 w-4" />{t(generating ? "submission.generating" : "submission.download")}</Button><Button type="button" onClick={() => void submit()} disabled={generating || submitting || submitted} className="h-12 rounded-xl bg-[#153B66]"><Send className="mr-2 h-4 w-4" />{t(submitted ? "submission.submitted" : submitting ? "submission.submitting" : "submission.submit")}</Button></div></div></section>;
+  return (
+    <section className="rounded-2xl border border-[#B8CDDC] bg-[#F4F8FB] p-5">
+      <div className="flex items-start gap-3">
+        <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-white text-[#153B66]"><Mail className="h-5 w-5" /></span>
+        <div>
+          <h3 className="font-bold text-[#153B66]">{t("submission.title")}</h3>
+          <p className="mt-1 text-sm leading-relaxed text-slate-600">{t("submission.description")}</p>
+        </div>
+      </div>
+      <div className="mt-4 space-y-3">
+        <Input type="email" value={targetEmail} onChange={(event) => setTargetEmail(event.target.value)} placeholder={t("submission.emailPlaceholder")} className={fieldClass} disabled={submitted} />
+        <div className="grid gap-2 sm:grid-cols-2">
+          <Button type="button" variant="outline" onClick={() => void download()} disabled={busy} className="h-12 rounded-xl border-[#9FBACD] text-[#153B66]">
+            {generating ? <><RefreshCw className="mr-2 h-4 w-4 animate-spin" />{t("submission.generating")}</> : <><Download className="mr-2 h-4 w-4" />{t(submitted ? "submission.downloadAgain" : "submission.download")}</>}
+          </Button>
+          <Button type="button" onClick={() => submitted ? void download() : setConfirmOpen(true)} disabled={busy || submitted} className="h-12 rounded-xl bg-[#153B66]">
+            {submitting ? <><RefreshCw className="mr-2 h-4 w-4 animate-spin" />{t("submission.submitting")}</> : submitted ? <><Check className="mr-2 h-4 w-4" />{t("submission.submitted")}</> : <><Send className="mr-2 h-4 w-4" />{t("submission.submit")}</>}
+          </Button>
+        </div>
+        {submitted && <p className="flex items-center gap-1.5 text-xs text-emerald-700"><CheckCircle2 className="h-3.5 w-3.5" />{t("submission.submittedHint")}</p>}
+      </div>
+      <Dialog open={confirmOpen} onOpenChange={setConfirmOpen}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>{t("submission.confirmTitle")}</DialogTitle>
+            <DialogDescription>{t("submission.confirmText", { email: targetEmail })}</DialogDescription>
+          </DialogHeader>
+          <div className="mt-2 rounded-lg bg-amber-50 p-3 text-xs text-amber-800">{t("submission.confirmIrreversible")}</div>
+          <div className="mt-4 flex gap-3">
+            <Button variant="outline" onClick={() => setConfirmOpen(false)} className="h-11 flex-1 rounded-xl">{t("app.close")}</Button>
+            <Button onClick={() => void submit()} className="h-11 flex-1 rounded-xl bg-[#153B66]"><Send className="mr-2 h-4 w-4" />{t("submission.submit")}</Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+    </section>
+  );
 }
 
 export function AppHeader() {
