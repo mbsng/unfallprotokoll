@@ -36,7 +36,7 @@ serve(async (req) => {
     if (claims.user.is_anonymous || !claims.user.email_confirmed_at) return json({ error: "verified_account_required" }, 403);
 
     const { code: rawCode, action = "preview" } = await req.json();
-    const code = typeof rawCode === "string" ? rawCode.trim().toUpperCase() : "";
+    const code = typeof rawCode === "string" ? rawCode.replace(/[\s-]+/g, "").toUpperCase() : "";
     if (action !== "preview" && action !== "join") return json({ error: "invalid_action" }, 400);
 
     const serviceClient = createClient(supabaseUrl, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!, {

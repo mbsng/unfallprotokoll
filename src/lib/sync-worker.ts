@@ -80,7 +80,7 @@ async function createRemoteDraft(draft: LocalDraft, entry: OutboxEntry) {
     initial_insurance: { company: draft.data.insurer, policyNumber: draft.data.policy },
   });
   const row = data?.[0];
-  if (error || !row) throw error ?? new Error("create_failed");
+  if (error || !row || !row.share_code) throw error ?? new Error("create_failed");
   draft.ref = {
     incidentId: row.incident_id,
     partyId: row.party_id,

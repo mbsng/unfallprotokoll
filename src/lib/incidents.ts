@@ -1,4 +1,5 @@
 import { supabase } from "@/integrations/supabase/client";
+import { normalizeShareCode } from "@/lib/share-code";
 import type { IncidentDraftRef, IncidentPreview, IncidentSummaryData, JoinedIncidentState, PendingPhoto } from "@/types/incident";
 
 export class IncidentSaveError extends Error {
@@ -32,7 +33,7 @@ export async function createIncidentWithParty(driver: object, vehicle: object, i
     initial_insurance: insurance,
   });
   const row = data?.[0];
-  if (error || !row) throw new IncidentSaveError("create");
+  if (error || !row || !row.share_code) throw new IncidentSaveError("create");
   return {
     incidentId: row.incident_id,
     partyId: row.party_id,
@@ -44,14 +45,16 @@ export async function createIncidentWithParty(driver: object, vehicle: object, i
 }
 
 export async function previewIncident(code: string): Promise<IncidentPreview> {
-  const { data, error } = await supabase.functions.invoke("join-incident", { body: { action: "preview", code } });
+  const normalizedCode = normalizeShareCode(code);
+  const { data, error } = await supabase.functions.invoke("join-incident", { body: { action: "preview", code: normalizedCode } });
   if (error) throw new IncidentJoinError(await functionErrorCode(error, "not_found"));
   if (!data?.incident) throw new IncidentJoinError(data?.error ?? "not_found");
   return data.incident as IncidentPreview;
 }
 
 export async function joinIncident(code: string): Promise<JoinedIncidentState> {
-  const { data, error } = await supabase.functions.invoke("join-incident", { body: { action: "join", code } });
+  const normalizedCode = normalizeShareCode(code);
+  const { data, error } = await supabase.functions.invoke("join-incident", { body: { action: "join", code: normalizedCode } });
   if (error) throw new IncidentJoinError(await functionErrorCode(error, "join_failed"));
   if (!data?.draftRef || !data?.incident) throw new IncidentJoinError(data?.error ?? "join_failed");
   return data as JoinedIncidentState;
