@@ -3,7 +3,7 @@ import { useLiveQuery } from "dexie-react-hooks";
 import { useTranslation } from "react-i18next";
 
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import { AlertTriangle, ArrowLeft, ArrowRight, Camera, Car, Check, ChevronRight, Clock3, Download, FileText, LocateFixed, LockKeyhole, Mail, MapPin, Plus, QrCode, Radio, Send, ShieldCheck, Trash2, UserRound } from "lucide-react";
+import { AlertTriangle, ArrowLeft, ArrowRight, Camera, Car, Check, CheckCircle2, ChevronRight, Clock3, Download, FileText, LocateFixed, Mail, MapPin, PenLine, Plus, QrCode, Radio, Send, ShieldCheck, Trash2, UserRound } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -20,23 +20,18 @@ import { useAuth } from "@/contexts/AuthContext";
 import { localeForLanguage } from "@/i18n";
 import { supabase } from "@/integrations/supabase/client";
 import { getPlanEntitlement } from "@/lib/billing";
-import { loadIncidentSummary, subscribeToIncident, type RealtimeConnectionStatus } from "@/lib/incidents";
+import { computeCaseStatus, loadIncidentSummary, loadUserIncidents, subscribeToIncident, subscribeToUserIncidents, type RealtimeConnectionStatus } from "@/lib/incidents";
 import { createLocalDraft, db, deleteLocalPhoto, getLatestDraft, markDraftComplete, saveDraftField, saveLocalPhoto, type LocalDraft } from "@/lib/local-db";
 import { captureAccidentPhoto, getCurrentCoordinates, isNativeApp } from "@/lib/native-device";
 import { processOutbox } from "@/lib/sync-worker";
 import { generateIncidentPdf, SubmissionError, submitIncident } from "@/lib/submissions";
 
-import type { AccidentData, IncidentDraftRef, IncidentPartySummary, JoinedIncidentState, PendingPhoto } from "@/types/incident";
+import type { AccidentData, IncidentDraftRef, IncidentPartySummary, IncidentSummaryData, JoinedIncidentState, PendingPhoto } from "@/types/incident";
+import type { CaseStatus, UserIncidentItem } from "@/types/incident";
 
 import type { Profile } from "@/types/profile";
 
-interface CaseItem { id: string; date: string; time: string; location: string; status: "draft" | "completed"; plate: string }
-
-const initialCases: CaseItem[] = [
-  { id: "UK-2408", date: "2025-05-18", time: "16:42", location: "Zürich, Hardbrücke", status: "draft", plate: "ZH 824 391" },
-  { id: "UK-2311", date: "2025-02-03", time: "08:15", location: "Basel, Aeschenplatz", status: "completed", plate: "BS 118 602" },
-  { id: "UK-2194", date: "2024-11-12", time: "19:30", location: "Bern, Wankdorf", status: "completed", plate: "BE 544 208" },
-];
+interface CaseItem { id: string; date: string; time: string; location: string; plate: string; incidentId: string; partyId: string; partyLabel: "A" | "B"; shareCode: string; caseStatus: CaseStatus }
 
 const emptyData = (profile?: Profile | null): AccidentData => {
   const now = new Date();
@@ -54,6 +49,27 @@ const joinedData = (joined: JoinedIncidentState, profile?: Profile | null): Acci
   return data;
 };
 
+const summaryToData = (summary: IncidentSummaryData, ownParty: IncidentPartySummary, profile?: Profile | null): AccidentData => {
+  const data = emptyData(profile);
+  if (summary.occurredAt) {
+    const occurredAt = new Date(summary.occurredAt);
+    data.date = `${occurredAt.getFullYear()}-${String(occurredAt.getMonth() + 1).padStart(2, "0")}-${String(occurredAt.getDate()).padStart(2, "0")}`;
+    data.time = `${String(occurredAt.getHours()).padStart(2, "0")}:${String(occurredAt.getMinutes()).padStart(2, "0")}`;
+  }
+  data.location = summary.locationText ?? "";
+  data.driverName = ownParty.driver.fullName ?? "";
+  data.driverAddress = ownParty.driver.address ?? "";
+  data.phone = ownParty.driver.phone ?? "";
+  data.plate = ownParty.vehicle.plate ?? "";
+  data.vehicle = ownParty.vehicle.makeModel ?? "";
+  data.insurer = ownParty.insurance.company ?? "";
+  data.policy = ownParty.insurance.policyNumber ?? "";
+  data.damage = ownParty.damageDescription ?? "";
+  data.situations = ownParty.circumstancesChecked ?? [];
+  data.hasSignature = Boolean(ownParty.signedAt);
+  return data;
+};
+
 const hasText = (value?: string | null) => Boolean(value?.trim());
 const partyRequiredFieldsComplete = (party: IncidentPartySummary) =>
   hasText(party.driver.fullName) && hasText(party.driver.address) && hasText(party.driver.phone)
@@ -62,6 +78,30 @@ const partyRequiredFieldsComplete = (party: IncidentPartySummary) =>
   && hasText(party.damageDescription);
 
 const fieldClass = "h-12 rounded-xl border-slate-200 bg-white text-base focus-visible:ring-[#153B66]";
+
+const statusColors: Record<CaseStatus, string> = {
+  draft: "bg-slate-100 text-slate-700",
+  waiting: "bg-amber-100 text-amber-800",
+  action_needed: "bg-orange-100 text-orange-900 ring-2 ring-orange-300",
+  signed: "bg-emerald-100 text-emerald-700",
+  submitted: "bg-blue-100 text-blue-700",
+};
+
+const toCaseItem = (item: UserIncidentItem): CaseItem => {
+  const occurredAt = item.occurredAt ? new Date(item.occurredAt) : new Date();
+  return {
+    id: item.incidentId,
+    incidentId: item.incidentId,
+    partyId: item.partyId,
+    partyLabel: item.partyLabel,
+    shareCode: item.shareCode,
+    date: occurredAt.toISOString().slice(0, 10),
+    time: occurredAt.toTimeString().slice(0, 5),
+    location: item.locationText ?? "",
+    plate: item.plate ?? "",
+    caseStatus: computeCaseStatus(item),
+  };
+};
 
 export default function Index() {
   const { t, i18n } = useTranslation();
@@ -75,7 +115,7 @@ export default function Index() {
   const titles = t("wizard.titles", { returnObjects: true }) as string[];
   const descriptions = t("wizard.descriptions", { returnObjects: true }) as string[];
   const circumstances = t("circumstances.items", { returnObjects: true }) as string[];
-  const [view, setView] = useState<"home" | "wizard">(joinedIncident ? "wizard" : "home");
+  const [view, setView] = useState<"home" | "wizard" | "signed">(joinedIncident ? "wizard" : "home");
   const [step, setStep] = useState(joinedIncident ? 1 : 0);
   const [data, setData] = useState<AccidentData>(() => joinedIncident ? joinedData(joinedIncident, profile) : emptyData(profile));
   const [draftRef, setDraftRef] = useState<IncidentDraftRef | null>(joinedIncident?.draftRef ?? null);
@@ -83,28 +123,24 @@ export default function Index() {
 
   const [parties, setParties] = useState<IncidentPartySummary[]>([]);
   const [summaryLoading, setSummaryLoading] = useState(false);
-  const [serverLoaded, setServerLoaded] = useState(false);
   const [realtimeStatus, setRealtimeStatus] = useState<RealtimeConnectionStatus>(navigator.onLine ? "connecting" : "offline");
-  const [signatureGateReady, setSignatureGateReady] = useState(false);
-  const [signatureGateIssue, setSignatureGateIssue] = useState<"check" | "own" | "party" | "pending" | "server" | null>("check");
-  const [checkingSignatureGate, setCheckingSignatureGate] = useState(false);
-  const [completionPending, setCompletionPending] = useState(false);
   const [dirty, setDirty] = useState(false);
-  const [completed, setCompleted] = useState(false);
+  const [signedJustNow, setSignedJustNow] = useState(false);
   const [creating, setCreating] = useState(false);
   const [saving, setSaving] = useState(false);
 
-  const [cases, setCases] = useState(initialCases);
+  const [serverCases, setServerCases] = useState<UserIncidentItem[]>([]);
+  const [casesLoading, setCasesLoading] = useState(false);
   const [locating, setLocating] = useState(false);
   const photoInputRef = useRef<HTMLInputElement>(null);
-  const pendingOutboxCount = useLiveQuery(
-    () => user && localDraftId ? db.outbox.where("draftId").equals(localDraftId).filter((entry) => entry.ownerId === user.id).count() : 0,
-    [user?.id, localDraftId],
-    0,
+
+  const localDrafts = useLiveQuery(
+    () => user ? db.drafts.where("ownerId").equals(user.id).reverse().sortBy("updatedAt") : [],
+    [user?.id],
+    [] as LocalDraft[],
   );
 
   const applyLocalDraft = (draft: LocalDraft) => {
-
     setLocalDraftId(draft.id);
     setDraftRef(draft.ref);
     setData(draft.data);
@@ -112,18 +148,15 @@ export default function Index() {
 
   const update = <K extends keyof AccidentData>(key: K, value: AccidentData[K]) => {
     setDirty(true);
-    if (key !== "hasSignature" && key !== "signatureDataUrl") {
-      setSignatureGateReady(false);
-      setSignatureGateIssue("check");
-    }
     setData((previous) => ({ ...previous, [key]: value }));
     if (user && localDraftId) void saveDraftField(user.id, localDraftId, key, value);
   };
 
   const formatNumber = (value: number) => new Intl.NumberFormat(locale).format(value);
 
-  const formatCaseDate = (item: CaseItem) => {
+  const formatCaseDate = (item: { date: string; time: string }) => {
     const date = new Date(`${item.date}T${item.time}:00`);
+    if (isNaN(date.getTime())) return "";
     return `${new Intl.DateTimeFormat(locale, { day: "2-digit", month: "long", year: "numeric" }).format(date)} · ${new Intl.DateTimeFormat(locale, { hour: "2-digit", minute: "2-digit" }).format(date)}`;
   };
 
@@ -142,7 +175,6 @@ export default function Index() {
         if (active) applyLocalDraft(created);
       } else if (latest) {
         applyLocalDraft(latest);
-        if (!localDraftId) setView("wizard");
       }
     });
     const onDraftChange = (event: Event) => {
@@ -154,7 +186,7 @@ export default function Index() {
       active = false;
       window.removeEventListener("local-draft-change", onDraftChange);
     };
-  }, [user?.id, joinedIncident?.draftRef.partyId, localDraftId]);
+  }, [user?.id, joinedIncident?.draftRef.partyId]);
 
   useEffect(() => {
     const showUpgrade = () => navigate("/upgrade?reason=limit");
@@ -169,33 +201,25 @@ export default function Index() {
     let refreshing = false;
     let refreshQueued = false;
     setSummaryLoading(true);
-    setServerLoaded(false);
 
     const refreshIncident = async () => {
-      if (refreshing) {
-        refreshQueued = true;
-        return;
-      }
+      if (refreshing) { refreshQueued = true; return; }
       refreshing = true;
       try {
         const summary = await loadIncidentSummary(draftRef);
         if (!active) return;
         setParties(summary.parties);
-        setServerLoaded(true);
         setDraftRef((current) => {
           if (!current) return current;
           const ownParty = summary.parties.find((party) => party.id === current.partyId);
           return { ...current, incidentVersion: summary.incidentVersion, partyVersion: ownParty?.version ?? current.partyVersion };
         });
       } catch {
-        if (active) toast.error(t("incident.saveError"));
+        /* offline or error — local data still usable */
       } finally {
         refreshing = false;
         if (active) setSummaryLoading(false);
-        if (active && refreshQueued) {
-          refreshQueued = false;
-          void refreshIncident();
-        }
+        if (active && refreshQueued) { refreshQueued = false; void refreshIncident(); }
       }
     };
 
@@ -203,33 +227,43 @@ export default function Index() {
     const unsubscribe = subscribeToIncident(draftRef.incidentId, () => void refreshIncident(), (status) => {
       if (active) setRealtimeStatus(status);
     });
-    return () => {
-      active = false;
-      unsubscribe();
-    };
+    return () => { active = false; unsubscribe(); };
   }, [view, draftRef?.incidentId]);
 
   useEffect(() => {
-    const handleSynced = (event: Event) => {
-      const detail = (event as CustomEvent<{ draftId: string }>).detail;
-      if (detail.draftId !== localDraftId) return;
-      setCompletionPending(false);
-      setCompleted(true);
-      toast.success(t("signature.saved"));
+    if (view !== "home" || !user || isAnonymous) return;
+    let active = true;
+    const loadCases = async () => {
+      setCasesLoading(true);
+      try {
+        const cases = await loadUserIncidents(user.id);
+        if (active) setServerCases(cases);
+      } catch { /* offline */ } finally {
+        if (active) setCasesLoading(false);
+      }
     };
-    const handleError = (event: Event) => {
-      const detail = (event as CustomEvent<{ draftId: string }>).detail;
-      if (detail.draftId !== localDraftId) return;
-      setCompletionPending(true);
-      toast.error(t("signature.uploadError"));
-    };
-    window.addEventListener("incident-signature-synced", handleSynced);
-    window.addEventListener("incident-signature-error", handleError);
-    return () => {
-      window.removeEventListener("incident-signature-synced", handleSynced);
-      window.removeEventListener("incident-signature-error", handleError);
-    };
-  }, [localDraftId, t]);
+    void loadCases();
+    const unsubscribe = subscribeToUserIncidents(() => { if (active) void loadCases(); });
+    return () => { active = false; unsubscribe(); };
+  }, [view, user?.id, isAnonymous, signedJustNow]);
+
+  const allCases = useMemo<CaseItem[]>(() => {
+    const items = serverCases.map(toCaseItem);
+    for (const draft of localDrafts ?? []) {
+      if (draft.ref.incidentId.startsWith("local:") && !items.some((item) => item.incidentId === draft.ref.incidentId)) {
+        items.unshift({
+          id: draft.id, incidentId: draft.ref.incidentId, partyId: draft.ref.partyId, partyLabel: draft.ref.partyLabel,
+          shareCode: draft.ref.shareCode, date: draft.data.date, time: draft.data.time,
+          location: draft.data.location, plate: draft.data.plate, caseStatus: "draft",
+        });
+      }
+    }
+    return items.sort((a, b) => {
+      if (a.caseStatus === "action_needed" && b.caseStatus !== "action_needed") return -1;
+      if (b.caseStatus === "action_needed" && a.caseStatus !== "action_needed") return 1;
+      return new Date(`${b.date}T${b.time}`).getTime() - new Date(`${a.date}T${a.time}`).getTime();
+    });
+  }, [serverCases, localDrafts]);
 
   const startAccident = async () => {
     if (creating) return;
@@ -251,15 +285,10 @@ export default function Index() {
       }
       const created = await createLocalDraft(ownerId, initial);
       applyLocalDraft(created);
-
       setParties([]);
-      setServerLoaded(false);
       setRealtimeStatus(navigator.onLine ? "connecting" : "offline");
-      setSignatureGateReady(false);
-      setSignatureGateIssue("check");
-      setCompletionPending(false);
       setDirty(false);
-      setCompleted(false);
+      setSignedJustNow(false);
       setStep(0);
       setView("wizard");
       window.scrollTo(0, 0);
@@ -267,6 +296,40 @@ export default function Index() {
       toast.error(t("incident.createError"));
     } finally {
       setCreating(false);
+    }
+  };
+
+  const openCase = async (item: CaseItem, targetStep: number) => {
+    if (item.incidentId.startsWith("local:")) {
+      const draft = localDrafts?.find((d) => d.id === item.id);
+      if (draft) { applyLocalDraft(draft); setStep(targetStep); setView("wizard"); window.scrollTo(0, 0); }
+      return;
+    }
+    try {
+      const ref: IncidentDraftRef = {
+        incidentId: item.incidentId, partyId: item.partyId, partyLabel: item.partyLabel,
+        shareCode: item.shareCode, incidentVersion: 0, partyVersion: 0,
+      };
+      const summary = await loadIncidentSummary(ref);
+      const ownParty = summary.parties.find((p) => p.id === item.partyId);
+      if (!ownParty) throw new Error("party_not_found");
+      const serverData = summaryToData(summary, ownParty, profile);
+      const existingDraft = localDrafts?.find((d) => d.ref.incidentId === item.incidentId);
+      let draft: LocalDraft;
+      if (existingDraft) {
+        draft = existingDraft;
+        draft.ref = { ...ref, incidentVersion: summary.incidentVersion, partyVersion: ownParty.version };
+      } else {
+        draft = await createLocalDraft(user!.id, serverData, { ...ref, incidentVersion: summary.incidentVersion, partyVersion: ownParty.version });
+      }
+      applyLocalDraft(draft);
+      setParties(summary.parties);
+      setStep(targetStep);
+      setSignedJustNow(false);
+      setView("wizard");
+      window.scrollTo(0, 0);
+    } catch {
+      toast.error(t("incident.saveError"));
     }
   };
 
@@ -287,8 +350,8 @@ export default function Index() {
     setLocating(true);
     try {
       const coords = await getCurrentCoordinates();
-      const location = `${coords.latitude.toLocaleString(locale, { maximumFractionDigits: 5 })}, ${coords.longitude.toLocaleString(locale, { maximumFractionDigits: 5 })}`;
-      update("location", location);
+      const loc = `${coords.latitude.toLocaleString(locale, { maximumFractionDigits: 5 })}, ${coords.longitude.toLocaleString(locale, { maximumFractionDigits: 5 })}`;
+      update("location", loc);
       update("locationLat", coords.latitude);
       update("locationLng", coords.longitude);
       toast.success(t("location.success"));
@@ -305,99 +368,50 @@ export default function Index() {
   };
 
   const takePhoto = async () => {
-    if (!isNativeApp()) {
-      photoInputRef.current?.click();
-      return;
-    }
+    if (!isNativeApp()) { photoInputRef.current?.click(); return; }
     if (!user || !localDraftId) return;
     try {
       const file = await captureAccidentPhoto();
       if (file) await saveLocalPhoto(user.id, localDraftId, file);
-    } catch {
-      toast.error(t("incident.saveError"));
-    }
+    } catch { toast.error(t("incident.saveError")); }
   };
 
   const removePhoto = async (photo: PendingPhoto) => {
-
     if (!user || !localDraftId) return;
-    try {
-      await deleteLocalPhoto(user.id, localDraftId, photo.id);
-    } catch {
-      toast.error(t("incident.saveError"));
-    }
+    try { await deleteLocalPhoto(user.id, localDraftId, photo.id); } catch { toast.error(t("incident.saveError")); }
   };
 
-  const verifySignatureGate = async () => {
-    if (!user || !draftRef || !localDraftId || checkingSignatureGate) return;
-    if (!ownRequiredFieldsComplete) {
-      setSignatureGateReady(false);
-      setSignatureGateIssue("own");
-      return;
-    }
-    if (!navigator.onLine) {
-      setSignatureGateReady(true);
-      setSignatureGateIssue(null);
-      return;
-    }
+  const ownRequiredFieldsComplete = [data.driverName, data.driverAddress, data.phone, data.plate, data.vehicle, data.insurer, data.policy, data.damage].every(hasText);
+  const ownParty = parties.find((party) => party.id === draftRef?.partyId);
+  const counterpart = parties.find((party) => party.id !== draftRef?.partyId);
+  const alreadySigned = Boolean(ownParty?.signedAt || data.hasSignature);
+  const hasMultiParty = parties.length > 1;
 
-    setCheckingSignatureGate(true);
-    try {
-      await processOutbox();
-      const remaining = await db.outbox.where("draftId").equals(localDraftId).filter((entry) => entry.ownerId === user.id).count();
-      if (remaining > 0) {
-        setSignatureGateReady(false);
-        setSignatureGateIssue("pending");
-        return;
-      }
-      const latestDraft = await db.drafts.get(localDraftId);
-      const ref = latestDraft?.ref ?? draftRef;
-      if (ref.incidentId.startsWith("local:")) {
-        setSignatureGateReady(false);
-        setSignatureGateIssue("server");
-        return;
-      }
-      const summary = await loadIncidentSummary(ref);
-      setParties(summary.parties);
-      setServerLoaded(true);
-      const own = summary.parties.find((party) => party.id === ref.partyId);
-      setDraftRef({ ...ref, incidentVersion: summary.incidentVersion, partyVersion: own?.version ?? ref.partyVersion });
-      if (summary.parties.length > 1 && !summary.parties.every(partyRequiredFieldsComplete)) {
-        setSignatureGateReady(false);
-        setSignatureGateIssue("party");
-        return;
-      }
-      setSignatureGateReady(true);
-      setSignatureGateIssue(null);
-      setDirty(false);
-    } catch {
-      setSignatureGateReady(false);
-      setSignatureGateIssue("server");
-    } finally {
-      setCheckingSignatureGate(false);
-    }
-  };
+  const missingRequiredFields = useMemo(() => {
+    const fields: { key: string; step: number }[] = [];
+    if (!hasText(data.driverName)) fields.push({ key: "fields.fullName", step: 1 });
+    if (!hasText(data.driverAddress)) fields.push({ key: "fields.address", step: 1 });
+    if (!hasText(data.phone)) fields.push({ key: "fields.phone", step: 1 });
+    if (!hasText(data.plate)) fields.push({ key: "fields.plate", step: 1 });
+    if (!hasText(data.vehicle)) fields.push({ key: "fields.vehicle", step: 1 });
+    if (!hasText(data.insurer)) fields.push({ key: "fields.insurer", step: 1 });
+    if (!hasText(data.policy)) fields.push({ key: "fields.policy", step: 1 });
+    if (!hasText(data.damage)) fields.push({ key: "fields.visibleDamage", step: 3 });
+    return fields;
+  }, [data]);
 
   const complete = async () => {
-    if (!signatureUnlocked) return toast.error(t(`signatureGate.${signatureGateIssue ?? "check"}`, { count: pendingOutboxCount }));
+    if (!ownRequiredFieldsComplete) return;
     if (!data.hasSignature || !data.signatureDataUrl) return toast.error(t("validation.signatureRequired"));
     if (!user || !draftRef || !localDraftId || saving) return;
     setSaving(true);
     try {
-      const entryId = await markDraftComplete(user.id, localDraftId);
-      if (!entryId) throw new Error("completion_not_queued");
-      setCompletionPending(true);
-      if (!navigator.onLine) {
-        toast.success(t("signature.savedOffline"));
-        return;
-      }
-      await processOutbox();
-      const stillPending = await db.outbox.get(entryId);
-      if (!stillPending) {
-        setCases((previous) => [{ id: draftRef.shareCode, date: data.date, time: data.time, location: data.location || t("fields.notProvided"), status: "completed", plate: data.plate || t("fields.noPlate") }, ...previous]);
-      }
+      await markDraftComplete(user.id, localDraftId);
+      if (navigator.onLine) await processOutbox();
+      setSignedJustNow(true);
+      setView("signed");
+      window.scrollTo(0, 0);
     } catch {
-      setCompletionPending(true);
       toast.error(t("signature.uploadError"));
     } finally {
       setSaving(false);
@@ -405,25 +419,22 @@ export default function Index() {
   };
 
   const selectedSummary = useMemo(() => data.situations.map((index) => circumstances[index]), [data.situations, circumstances]);
-  const ownParty = parties.find((party) => party.id === draftRef?.partyId);
-  const counterpart = parties.find((party) => party.id !== draftRef?.partyId);
-  const partyB = parties.find((party) => party.partyLabel === "B");
-  const partyBStatus = !partyB ? "waiting" : partyB.signedAt ? "signed" : partyB.version === 1 ? "joined" : "filling";
-  const ownRequiredFieldsComplete = [data.driverName, data.driverAddress, data.phone, data.plate, data.vehicle, data.insurer, data.policy, data.damage].every(hasText);
-  const offlineDraft = Boolean(draftRef?.incidentId.startsWith("local:") || !navigator.onLine);
-  const signatureUnlocked = ownRequiredFieldsComplete && (offlineDraft || (signatureGateReady && pendingOutboxCount === 0));
-  const signatureStatusKey = completionPending
-    ? "completionPending"
-    : checkingSignatureGate
-      ? "checking"
-      : !ownRequiredFieldsComplete
-        ? "own"
-        : pendingOutboxCount > 0 && !offlineDraft
-          ? "pending"
-          : signatureGateIssue ?? (data.hasSignature ? "ready" : "draw");
+
+  if (view === "signed") return (
+    <div className="min-h-screen bg-[#F5F7FA] text-slate-900">
+      <AppHeader />
+      <main className="mx-auto max-w-lg px-5 py-16">
+        <div className="rounded-3xl border border-slate-200 bg-white p-8 text-center shadow-sm">
+          <span className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-emerald-100"><CheckCircle2 className="h-9 w-9 text-emerald-600" /></span>
+          <h1 className="mt-5 text-2xl font-bold tracking-tight text-[#102F52]">{t("signature.confirmTitle")}</h1>
+          <p className="mt-3 text-sm leading-relaxed text-slate-600">{t(hasMultiParty && !counterpart?.signedAt ? "signature.confirmWaiting" : "signature.confirmComplete")}</p>
+          <Button onClick={() => setView("home")} className="mt-6 h-14 w-full rounded-2xl bg-[#153B66] text-base font-semibold">{t("signature.backHome")}</Button>
+        </div>
+      </main>
+    </div>
+  );
 
   if (view === "home") return (
-
     <div className="min-h-screen bg-[#F5F7FA] text-slate-900">
       <AppHeader />
       <main className="mx-auto max-w-5xl px-5 pb-12 pt-8 md:pt-12">
@@ -436,14 +447,41 @@ export default function Index() {
           <button onClick={() => navigate("/join")} className="group flex min-h-44 flex-col items-start justify-between rounded-3xl border-2 border-[#D8E3EC] bg-white p-6 text-left text-[#153B66] shadow-sm active:scale-[0.98]"><span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-[#EAF1F6]"><QrCode className="h-7 w-7" /></span><span className="flex w-full items-end justify-between gap-4"><span><span className="block text-xl font-bold">{t("home.join")}</span><span className="mt-1 block text-sm text-slate-500">{t("home.joinHint")}</span></span><ChevronRight className="mb-1 h-6 w-6 group-hover:translate-x-1" /></span></button>
         </section>
 
-        <section className="mt-10"><div className="mb-4 flex items-center justify-between"><h2 className="text-xl font-bold text-[#102F52]">{t("home.recent")}</h2><Button variant="ghost" className="text-[#39719D]">{t("home.showAll")}</Button></div><div className="space-y-3">{cases.slice(0, 3).map((item) => <article key={item.id} className="flex items-center gap-4 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-[#EDF3F7] text-[#153B66]"><FileText className="h-6 w-6" /></div><div className="min-w-0 flex-1"><div className="flex items-center gap-2"><h3 className="truncate font-bold text-[#153B66]">{item.location}</h3><span className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] font-semibold ${item.status === "draft" ? "bg-amber-100 text-amber-800" : "bg-emerald-100 text-emerald-700"}`}>{t(`home.${item.status}`)}</span></div><p className="mt-1 truncate text-sm text-slate-500">{formatCaseDate(item)} · {item.plate}</p></div><ChevronRight className="h-5 w-5 shrink-0 text-slate-400" /></article>)}</div></section>
+        {allCases.length > 0 && <section className="mt-10">
+          <div className="mb-4 flex items-center justify-between"><h2 className="text-xl font-bold text-[#102F52]">{t("home.recent")}</h2></div>
+          <div className="space-y-3">
+            {allCases.map((item) => {
+              const targetStep = item.caseStatus === "draft" ? 0 : item.caseStatus === "action_needed" ? 5 : 5;
+              return (
+                <button key={item.id} onClick={() => void openCase(item, targetStep)} className="flex w-full items-center gap-4 rounded-2xl border border-slate-200 bg-white p-4 text-left shadow-sm transition hover:shadow-md active:scale-[0.99]">
+                  <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-[#EDF3F7] text-[#153B66]"><FileText className="h-6 w-6" /></div>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2"><h3 className="truncate font-bold text-[#153B66]">{item.location || t("fields.notProvided")}</h3>
+                      <span className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] font-semibold ${statusColors[item.caseStatus]}`}>{t(`caseStatus.${item.caseStatus}`)}</span>
+                    </div>
+                    <p className="mt-1 truncate text-sm text-slate-500">{formatCaseDate(item) || t("fields.notProvided")} · {item.plate || t("fields.noPlate")}</p>
+                  </div>
+                  {item.caseStatus === "action_needed" && <PenLine className="h-5 w-5 shrink-0 text-orange-500" />}
+                  <ChevronRight className="h-5 w-5 shrink-0 text-slate-400" />
+                </button>
+              );
+            })}
+          </div>
+        </section>}
+        {allCases.length === 0 && !casesLoading && (user && !isAnonymous) && (
+          <section className="mt-10 flex flex-col items-center justify-center rounded-3xl border border-dashed border-slate-300 bg-white py-16 text-center">
+            <FileText className="mb-3 h-10 w-10 text-slate-300" />
+            <p className="font-semibold text-slate-600">{t("home.noCases")}</p>
+            <p className="mt-1 text-sm text-slate-400">{t("home.noCasesHint")}</p>
+          </section>
+        )}
       </main>
     </div>
   );
 
   return (
     <div className="min-h-screen bg-[#F5F7FA] pb-28 text-slate-900">
-      <header className="sticky top-0 z-20 border-b border-slate-200 bg-white/95 backdrop-blur"><div className="mx-auto max-w-3xl px-4 py-3"><div className="flex items-center justify-between gap-2"><Button variant="ghost" size="icon" onClick={back} className="h-11 w-11 shrink-0 rounded-xl" aria-label={t("app.back")}><ArrowLeft className="h-6 w-6 text-[#153B66]" /></Button><div className="min-w-0 text-center"><p className="text-xs font-semibold uppercase tracking-wider text-slate-500">{t("wizard.stepOf", { current: formatNumber(step + 1), total: formatNumber(6) })}</p><p className="truncate font-bold text-[#153B66]">{steps[step]}</p></div><LanguageSwitcher /></div><div className="mt-3 flex items-center gap-3"><Progress value={((step + 1) / 6) * 100} className="h-1.5 flex-1 bg-slate-200 [&>div]:bg-[#39719D]" /><div className="flex items-center gap-2"><ConnectionStatusBadge status={realtimeStatus} /><PartyStatusBadge status={partyBStatus} /></div></div></div></header>
+      <header className="sticky top-0 z-20 border-b border-slate-200 bg-white/95 backdrop-blur"><div className="mx-auto max-w-3xl px-4 py-3"><div className="flex items-center justify-between gap-2"><Button variant="ghost" size="icon" onClick={back} className="h-11 w-11 shrink-0 rounded-xl" aria-label={t("app.back")}><ArrowLeft className="h-6 w-6 text-[#153B66]" /></Button><div className="min-w-0 text-center"><p className="text-xs font-semibold uppercase tracking-wider text-slate-500">{t("wizard.stepOf", { current: formatNumber(step + 1), total: formatNumber(6) })}</p><p className="truncate font-bold text-[#153B66]">{steps[step]}</p></div><LanguageSwitcher /></div><div className="mt-3 flex items-center gap-3"><Progress value={((step + 1) / 6) * 100} className="h-1.5 flex-1 bg-slate-200 [&>div]:bg-[#39719D]" /><ConnectionStatusBadge status={realtimeStatus} /></div></div></header>
       <main className="mx-auto max-w-3xl px-5 py-7"><div className="mb-7"><div className="mb-2 flex flex-wrap items-center gap-2"><p className="text-sm font-semibold text-[#39719D]">{formatNumber(step + 1).padStart(2, "0")} — {steps[step]}</p>{draftRef && <span className="rounded-full bg-[#E7F0F6] px-2.5 py-1 font-mono text-xs font-bold tracking-wider text-[#153B66]">{t("incident.shareCode")}: {draftRef.shareCode}</span>}</div><h1 className="text-2xl font-bold tracking-tight text-[#102F52]">{titles[step]}</h1><p className="mt-2 text-sm leading-relaxed text-slate-500">{descriptions[step]}</p></div>
 
         {(!user || isAnonymous) && <div className="mb-5 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-amber-950"><div className="flex gap-3"><AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-700" /><div><p className="font-semibold">{t("guest.notice")}</p><p className="mt-1 text-sm leading-relaxed text-amber-800">{t("guest.detail")}</p><Button asChild variant="link" className="mt-1 h-auto p-0 font-semibold text-amber-900"><Link to="/auth">{t("guest.createAccount")}</Link></Button></div></div></div>}
@@ -456,13 +494,29 @@ export default function Index() {
           {step === 3 && <div className="space-y-6"><Field number="11" label={t("fields.visibleDamage")}><Textarea value={data.damage} onChange={(event) => update("damage", event.target.value)} placeholder={t("fields.damagePlaceholder")} className="min-h-28 rounded-xl text-base" /></Field><Field number="14" label={t("fields.remarks")}><Textarea value={data.notes} onChange={(event) => update("notes", event.target.value)} placeholder={t("fields.remarksPlaceholder")} className="min-h-24 rounded-xl text-base" /></Field><Field number="11" label={t("fields.photos")}><button type="button" onClick={() => void takePhoto()} className="flex min-h-32 w-full cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed border-[#9FBACD] bg-[#F7FAFC] p-5 text-center"><Camera className="mb-2 h-8 w-8 text-[#39719D]" /><span className="font-semibold text-[#153B66]">{t("fields.photoAction")}</span><span className="mt-1 text-xs text-slate-500">{t("fields.photoHint")}</span></button><input ref={photoInputRef} type="file" accept="image/*" capture="environment" multiple className="sr-only" onChange={(event) => { addPhotos(event.target.files); event.target.value = ""; }} /></Field>{data.photos.length > 0 && <div className="grid grid-cols-3 gap-3">{data.photos.map((photo, index) => <div key={photo.id} className="relative aspect-square overflow-hidden rounded-xl bg-slate-100"><img src={photo.url} alt={t("fields.photoAlt", { number: formatNumber(index + 1) })} className="h-full w-full object-cover" /><button type="button" onClick={() => void removePhoto(photo)} className="absolute right-1 top-1 flex h-8 w-8 items-center justify-center rounded-full bg-slate-900/75 text-white" aria-label={t("fields.deletePhoto")}><Trash2 className="h-4 w-4" /></button></div>)}</div>}</div>}
 
           {step === 4 && <div className="space-y-5"><div><FieldBadge number="10" /><p className="text-sm font-semibold text-slate-700">{t("fields.initialImpact")}</p></div><FieldBadge number="13" /><div className="rounded-xl bg-[#EDF4F8] p-4 text-sm leading-relaxed text-[#153B66]"><strong>{t("sketch.tipTitle")}</strong> {t("sketch.tip")}</div><DrawingCanvas label={t("fields.sketch")} height={320} initialDataUrl={data.sketchDataUrl} onChange={(value, dataUrl) => { update("hasSketch", value); update("sketchDataUrl", dataUrl ?? ""); }} /><div className="flex flex-wrap gap-3 text-xs text-slate-500"><span className="rounded-full bg-slate-100 px-3 py-1.5">{t("sketch.myVehicle")}</span><span className="rounded-full bg-slate-100 px-3 py-1.5">{t("sketch.otherVehicle")}</span><span className="rounded-full bg-slate-100 px-3 py-1.5">{t("sketch.impact")}</span></div></div>}
-          {step === 5 && <div className="space-y-6">{draftRef?.partyLabel === "A" && <InviteParty shareCode={draftRef.shareCode} loading={draftRef.incidentId.startsWith("local:")} />}<div className="grid gap-3 sm:grid-cols-2"><Summary number="1" icon={<Clock3 />} label={t("fields.dateTime")} value={formatCaseDate({ ...initialCases[0], date: data.date, time: data.time })} /><Summary number="2" icon={<MapPin />} label={t("fields.place")} value={data.location || t("fields.notProvided")} /><Summary number="9" icon={<UserRound />} label={t("fields.driver")} value={data.driverName || t("fields.notProvided")} /><Summary number="7" icon={<Car />} label={t("fields.vehicle")} value={`${data.plate || t("fields.noPlate")}${data.vehicle ? ` · ${data.vehicle}` : ""}`} /><Summary number="8" icon={<ShieldCheck />} label={t("fields.insurer")} value={data.insurer || t("fields.notProvided")} /><Summary number="11–13" icon={<Camera />} label={t("fields.documentation")} value={`${t("fields.photosCount", { formattedCount: formatNumber(data.photos.length) })} · ${t(data.hasSketch ? "fields.sketchAvailable" : "fields.withoutSketch")}`} /></div><div className="rounded-2xl border border-slate-200 p-4"><FieldBadge number="12" /><p className="mb-2 mt-2 text-xs font-bold uppercase tracking-wider text-slate-500">{t("summary.circumstances")}</p>{selectedSummary.length ? <ul className="space-y-1.5">{selectedSummary.map((item) => <li key={item} className="flex gap-2 text-sm text-slate-700"><Check className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />{item}</li>)}</ul> : <p className="text-sm text-slate-500">{t("summary.noneSelected")}</p>}</div><CounterpartSummary party={counterpart} loading={summaryLoading} /><FieldBadge number="15" />{signatureUnlocked || completed ? <DrawingCanvas label={t("fields.signature")} height={170} initialDataUrl={data.signatureDataUrl} confirmable onChange={(value, dataUrl) => { update("hasSignature", value); update("signatureDataUrl", dataUrl ?? ""); }} /> : <SignatureGate issue={!ownRequiredFieldsComplete ? "own" : signatureGateIssue ?? "check"} pendingCount={pendingOutboxCount} checking={checkingSignatureGate} onCheck={() => void verifySignatureGate()} />}{(completed || ownParty?.signedAt) && draftRef && !draftRef.incidentId.startsWith("local:") && <SubmissionPanel incidentId={draftRef.incidentId} />}<p className="text-xs leading-relaxed text-slate-500">{t("summary.disclaimer")}</p></div>}
+          {step === 5 && <div className="space-y-6">
+            {draftRef?.partyLabel === "A" && !alreadySigned && <InviteParty shareCode={draftRef.shareCode} loading={draftRef.incidentId.startsWith("local:")} />}
+            <div className="grid gap-3 sm:grid-cols-2"><Summary number="1" icon={<Clock3 />} label={t("fields.dateTime")} value={formatCaseDate(data)} /><Summary number="2" icon={<MapPin />} label={t("fields.place")} value={data.location || t("fields.notProvided")} /><Summary number="9" icon={<UserRound />} label={t("fields.driver")} value={data.driverName || t("fields.notProvided")} /><Summary number="7" icon={<Car />} label={t("fields.vehicle")} value={`${data.plate || t("fields.noPlate")}${data.vehicle ? ` · ${data.vehicle}` : ""}`} /><Summary number="8" icon={<ShieldCheck />} label={t("fields.insurer")} value={data.insurer || t("fields.notProvided")} /><Summary number="11–13" icon={<Camera />} label={t("fields.documentation")} value={`${t("fields.photosCount", { formattedCount: formatNumber(data.photos.length) })} · ${t(data.hasSketch ? "fields.sketchAvailable" : "fields.withoutSketch")}`} /></div>
+            <div className="rounded-2xl border border-slate-200 p-4"><FieldBadge number="12" /><p className="mb-2 mt-2 text-xs font-bold uppercase tracking-wider text-slate-500">{t("summary.circumstances")}</p>{selectedSummary.length ? <ul className="space-y-1.5">{selectedSummary.map((item) => <li key={item} className="flex gap-2 text-sm text-slate-700"><Check className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />{item}</li>)}</ul> : <p className="text-sm text-slate-500">{t("summary.noneSelected")}</p>}</div>
+            {counterpart && <CounterpartSummary party={counterpart} loading={summaryLoading} />}
+            <FieldBadge number="15" />
+            {alreadySigned
+              ? <div className="rounded-2xl border-2 border-emerald-300 bg-emerald-50 p-5 text-center"><CheckCircle2 className="mx-auto h-10 w-10 text-emerald-600" /><p className="mt-2 font-bold text-emerald-900">{t("signature.alreadySigned")}</p></div>
+              : !ownRequiredFieldsComplete
+                ? <div className="rounded-2xl border-2 border-dashed border-amber-300 bg-amber-50 p-5"><p className="text-sm font-semibold text-amber-900">{t("signature.missingFieldsTitle")}</p><div className="mt-3 flex flex-wrap gap-2">{missingRequiredFields.map((field) => <button key={field.key} onClick={() => setStep(field.step)} className="rounded-lg bg-amber-100 px-3 py-1.5 text-xs font-semibold text-amber-900 transition hover:bg-amber-200">{t(field.key)}</button>)}</div></div>
+                : <DrawingCanvas label={t("fields.signature")} height={170} confirmable onChange={(value, dataUrl) => { update("hasSignature", value); update("signatureDataUrl", dataUrl ?? ""); }} />}
+            {alreadySigned && draftRef && !draftRef.incidentId.startsWith("local:") && <SubmissionPanel incidentId={draftRef.incidentId} />}
+            <p className="text-xs leading-relaxed text-slate-500">{t("summary.disclaimer")}</p>
+          </div>}
 
         </div>
       </main>
-      <div className="fixed inset-x-0 bottom-0 z-20 border-t border-slate-200 bg-white/95 px-5 py-3 backdrop-blur"><div className="mx-auto max-w-3xl">{!completed && step === 5 && <p className="mb-2 text-center text-xs font-semibold text-slate-600">{t(`signatureGate.${signatureStatusKey}`, { count: pendingOutboxCount })}</p>}<div className="flex gap-3">{completed ? <Button onClick={() => setView("home")} className="h-14 flex-1 rounded-2xl bg-[#153B66] text-base font-semibold"><Check className="mr-2 h-5 w-5" />{t("summary.toOverview")}</Button> : <><Button variant="outline" onClick={back} disabled={saving} className="h-14 w-14 shrink-0 rounded-2xl border-slate-300" aria-label={t("app.back")}><ArrowLeft className="h-5 w-5" /></Button>{step < 5 ? <Button onClick={() => void next()} disabled={saving} className="h-14 flex-1 rounded-2xl bg-[#153B66] text-base font-semibold hover:bg-[#102F52]">{saving ? t("incident.saving") : t("wizard.next", { step: steps[step + 1] })}<ArrowRight className="ml-2 h-5 w-5" /></Button> : <Button onClick={() => void complete()} disabled={saving || !signatureUnlocked || !data.hasSignature || completionPending} className="h-14 flex-1 rounded-2xl bg-emerald-700 text-base font-semibold hover:bg-emerald-800"><Check className="mr-2 h-5 w-5" />{saving ? t("incident.saving") : completionPending ? t("signature.pending") : t("wizard.complete")}</Button>}</>}</div></div></div>
+      <div className="fixed inset-x-0 bottom-0 z-20 border-t border-slate-200 bg-white/95 px-5 py-4 backdrop-blur"><div className="mx-auto flex max-w-3xl gap-3">
+        {alreadySigned
+          ? <Button onClick={() => setView("home")} className="h-14 flex-1 rounded-2xl bg-[#153B66] text-base font-semibold"><ArrowLeft className="mr-2 h-5 w-5" />{t("summary.toOverview")}</Button>
+          : <><Button variant="outline" onClick={back} disabled={saving} className="h-14 w-14 shrink-0 rounded-2xl border-slate-300" aria-label={t("app.back")}><ArrowLeft className="h-5 w-5" /></Button>{step < 5 ? <Button onClick={() => void next()} disabled={saving} className="h-14 flex-1 rounded-2xl bg-[#153B66] text-base font-semibold hover:bg-[#102F52]">{saving ? t("incident.saving") : t("wizard.next", { step: steps[step + 1] })}<ArrowRight className="ml-2 h-5 w-5" /></Button> : <Button onClick={() => void complete()} disabled={saving || !ownRequiredFieldsComplete || !data.hasSignature} className="h-14 flex-1 rounded-2xl bg-emerald-700 text-base font-semibold hover:bg-emerald-800"><Check className="mr-2 h-5 w-5" />{saving ? t("incident.saving") : t("wizard.complete")}</Button>}</>}
+      </div></div>
     </div>
-
   );
 }
 
@@ -528,19 +582,7 @@ function ConnectionStatusBadge({ status }: { status: RealtimeConnectionStatus })
   return <div className={`flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-semibold ${colors}`}><Radio className={`h-3.5 w-3.5 ${status === "connected" ? "animate-pulse" : ""}`} /><span>{t(`realtime.${status}`)}</span></div>;
 }
 
-function PartyStatusBadge({ status }: { status: "waiting" | "joined" | "filling" | "signed" }) {
-  const { t } = useTranslation();
-  const colors = status === "signed" ? "bg-emerald-100 text-emerald-800" : status === "filling" ? "bg-blue-100 text-blue-800" : "bg-amber-100 text-amber-800";
-  return <div className={`hidden min-w-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-semibold sm:flex ${colors}`}><span className="max-w-44 truncate">{t(`partyStatus.${status}`)}</span></div>;
-}
-
-function SignatureGate({ issue, pendingCount, checking, onCheck }: { issue: "check" | "own" | "party" | "pending" | "server"; pendingCount: number; checking: boolean; onCheck: () => void }) {
-  const { t } = useTranslation();
-  return <div className="rounded-2xl border-2 border-dashed border-amber-300 bg-amber-50 p-6 text-center"><span className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-amber-100 text-amber-800"><LockKeyhole className="h-6 w-6" /></span><h3 className="mt-4 font-bold text-amber-950">{t("signatureGate.title")}</h3><p className="mx-auto mt-2 max-w-md text-sm leading-relaxed text-amber-800">{t(`signatureGate.${checking ? "checking" : issue}`, { count: pendingCount })}</p><Button type="button" onClick={onCheck} disabled={checking} className="mt-4 rounded-xl bg-amber-800 hover:bg-amber-900">{t(checking ? "signatureGate.checking" : "signatureGate.check")}</Button></div>;
-}
-
 function CounterpartSummary({ party, loading }: { party?: IncidentPartySummary; loading: boolean }) {
-
   const { t } = useTranslation();
   const circumstances = t("circumstances.items", { returnObjects: true }) as string[];
   return <section className="rounded-2xl border-2 border-[#C9D9E5] bg-[#F7FAFC] p-5"><div className="mb-4 flex items-center justify-between gap-3"><div><p className="text-xs font-bold uppercase tracking-wider text-[#39719D]">{t("summary.counterpartEyebrow")}</p><h2 className="mt-1 text-lg font-bold text-[#153B66]">{t("summary.counterpartTitle", { label: party?.partyLabel ?? "–" })}</h2></div><span className="rounded-full bg-white px-3 py-1 text-xs font-semibold text-slate-500">{t("summary.readOnly")}</span></div>{loading ? <p className="text-sm text-slate-500">{t("auth.loading")}</p> : !party ? <p className="rounded-xl bg-white p-4 text-sm leading-relaxed text-slate-600">{t("summary.waitingForParty")}</p> : <div className="grid gap-3 sm:grid-cols-2"><Summary number="9" icon={<UserRound />} label={t("fields.driver")} value={party.driver.fullName || t("fields.notProvided")} /><Summary number="7" icon={<Car />} label={t("fields.vehicle")} value={`${party.vehicle.plate || t("fields.noPlate")}${party.vehicle.makeModel ? ` · ${party.vehicle.makeModel}` : ""}`} /><Summary number="8" icon={<ShieldCheck />} label={t("fields.insurer")} value={`${party.insurance.company || t("fields.notProvided")}${party.insurance.policyNumber ? ` · ${party.insurance.policyNumber}` : ""}`} /><Summary number="11" icon={<FileText />} label={t("fields.visibleDamage")} value={party.damageDescription || t("fields.notProvided")} /><div className="rounded-2xl bg-white p-4 sm:col-span-2"><p className="text-xs font-semibold uppercase tracking-wide text-slate-500">{t("summary.circumstances")}</p><p className="mt-2 text-sm leading-relaxed text-slate-700">{party.circumstancesChecked.length ? party.circumstancesChecked.map((index) => circumstances[index]).filter(Boolean).join(" · ") : t("summary.noneSelected")}</p></div></div>}</section>;

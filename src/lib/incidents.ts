@@ -1,6 +1,18 @@
 import { supabase } from "@/integrations/supabase/client";
 import { normalizeShareCode } from "@/lib/share-code";
-import type { IncidentDraftRef, IncidentPreview, IncidentSummaryData, JoinedIncidentState, PendingPhoto } from "@/types/incident";
+import type { CaseStatus, IncidentDraftRef, IncidentPreview, IncidentSummaryData, JoinedIncidentState, PendingPhoto, UserIncidentItem } from "@/types/incident";
+
+const hasText = (value?: string | null) => Boolean(value?.trim());
+
+const isPartyComplete = (driver: unknown, vehicle: unknown, insurance: unknown, damage: string | null) => {
+  const d = driver as Record<string, string> | null;
+  const v = vehicle as Record<string, string> | null;
+  const i = insurance as Record<string, string> | null;
+  return hasText(d?.fullName) && hasText(d?.address) && hasText(d?.phone)
+    && hasText(v?.plate) && hasText(v?.makeModel)
+    && hasText(i?.company) && hasText(i?.policyNumber)
+    && hasText(damage);
+};
 
 export class IncidentSaveError extends Error {
   constructor(public code: "save" | "conflict" | "create") {
@@ -62,13 +74,15 @@ export async function joinIncident(code: string): Promise<JoinedIncidentState> {
 
 export async function loadIncidentSummary(ref: IncidentDraftRef): Promise<IncidentSummaryData> {
   const [incidentResult, partiesResult] = await Promise.all([
-    supabase.from("incidents").select("version, status").eq("id", ref.incidentId).single(),
+    supabase.from("incidents").select("version, status, occurred_at, location_text").eq("id", ref.incidentId).single(),
     supabase.from("incident_parties").select("id, party_label, version, driver_json, vehicle_json, insurance_json, damage_description, circumstances_checked, signed_at").eq("incident_id", ref.incidentId).order("party_label"),
   ]);
   if (incidentResult.error || partiesResult.error) throw new IncidentSaveError("save");
   return {
     incidentVersion: incidentResult.data.version,
     status: incidentResult.data.status,
+    occurredAt: incidentResult.data.occurred_at,
+    locationText: incidentResult.data.location_text,
     parties: partiesResult.data.map((party) => ({
       id: party.id,
       partyLabel: party.party_label as "A" | "B",
@@ -80,6 +94,62 @@ export async function loadIncidentSummary(ref: IncidentDraftRef): Promise<Incide
       circumstancesChecked: party.circumstances_checked,
       signedAt: party.signed_at,
     })),
+  };
+}
+
+export async function loadUserIncidents(userId: string): Promise<UserIncidentItem[]> {
+  const { data: ownParties, error } = await supabase
+    .from("incident_parties")
+    .select("id, incident_id, party_label, signed_at, driver_json, vehicle_json, insurance_json, damage_description, incident:incidents(id, share_code, status, occurred_at, location_text, updated_at)")
+    .eq("profile_id", userId)
+    .order("incident.updated_at", { ascending: false });
+
+  if (error) throw error;
+  if (!ownParties?.length) return [];
+
+  const incidentIds = ownParties.map((p) => p.incident_id);
+  const { data: allParties } = await supabase
+    .from("incident_parties")
+    .select("id, incident_id, signed_at")
+    .in("incident_id", incidentIds);
+
+  return ownParties.map((own) => {
+    const incidentRow = (Array.isArray(own.incident) ? own.incident[0] : own.incident) as Record<string, unknown> | null;
+    const others = (allParties ?? []).filter((p) => p.incident_id === own.incident_id && p.id !== own.id);
+    return {
+      incidentId: own.incident_id,
+      partyId: own.id,
+      partyLabel: own.party_label as "A" | "B",
+      shareCode: (incidentRow?.share_code as string) ?? "",
+      status: (incidentRow?.status as string) ?? "draft",
+      ownSignedAt: own.signed_at,
+      counterpartSignedAt: others[0]?.signed_at ?? null,
+      counterpartExists: others.length > 0,
+      ownFieldsComplete: isPartyComplete(own.driver_json, own.vehicle_json, own.insurance_json, own.damage_description),
+      occurredAt: (incidentRow?.occurred_at as string) ?? null,
+      locationText: (incidentRow?.location_text as string) ?? null,
+      plate: (own.vehicle_json as Record<string, string> | null)?.plate ?? "",
+    };
+  });
+}
+
+export function computeCaseStatus(item: UserIncidentItem): CaseStatus {
+  if (item.status === "submitted") return "submitted";
+  if (item.status === "signed") return "signed";
+  if (!item.ownFieldsComplete) return "draft";
+  if (!item.ownSignedAt) return "action_needed";
+  return "waiting";
+}
+
+export function subscribeToUserIncidents(onChange: () => void) {
+  const channel = supabase
+    .channel(`user-incidents:${Date.now()}`)
+    .on("postgres_changes", { event: "*", schema: "public", table: "incidents" }, onChange)
+    .on("postgres_changes", { event: "*", schema: "public", table: "incident_parties" }, onChange)
+    .subscribe();
+
+  return () => {
+    void supabase.removeChannel(channel);
   };
 }
 

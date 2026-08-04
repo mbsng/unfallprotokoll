@@ -33,7 +33,26 @@ export interface JoinedIncidentState {
 export interface IncidentSummaryData {
   incidentVersion: number;
   status: string;
+  occurredAt: string | null;
+  locationText: string | null;
   parties: IncidentPartySummary[];
+}
+
+export type CaseStatus = "draft" | "action_needed" | "waiting" | "signed" | "submitted";
+
+export interface UserIncidentItem {
+  incidentId: string;
+  partyId: string;
+  partyLabel: "A" | "B";
+  shareCode: string;
+  status: string;
+  ownSignedAt: string | null;
+  counterpartSignedAt: string | null;
+  counterpartExists: boolean;
+  ownFieldsComplete: boolean;
+  occurredAt: string | null;
+  locationText: string | null;
+  plate: string;
 }
 
 export interface PendingPhoto {
