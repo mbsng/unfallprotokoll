@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useLiveQuery } from "dexie-react-hooks";
 import { useTranslation } from "react-i18next";
 
 import { Link, useLocation, useNavigate } from "react-router-dom";
@@ -19,9 +20,10 @@ import { useAuth } from "@/contexts/AuthContext";
 import { localeForLanguage } from "@/i18n";
 import { supabase } from "@/integrations/supabase/client";
 import { getPlanEntitlement } from "@/lib/billing";
-import { loadIncidentSummary, subscribeToIncident } from "@/lib/incidents";
-import { createLocalDraft, deleteLocalPhoto, getLatestDraft, markDraftComplete, saveDraftField, saveLocalPhoto, type LocalDraft } from "@/lib/local-db";
+import { loadIncidentSummary, subscribeToIncident, type RealtimeConnectionStatus } from "@/lib/incidents";
+import { createLocalDraft, db, deleteLocalPhoto, getLatestDraft, markDraftComplete, saveDraftField, saveLocalPhoto, type LocalDraft } from "@/lib/local-db";
 import { captureAccidentPhoto, getCurrentCoordinates, isNativeApp } from "@/lib/native-device";
+import { processOutbox } from "@/lib/sync-worker";
 import { generateIncidentPdf, SubmissionError, submitIncident } from "@/lib/submissions";
 
 import type { AccidentData, IncidentDraftRef, IncidentPartySummary, JoinedIncidentState, PendingPhoto } from "@/types/incident";
@@ -82,7 +84,11 @@ export default function Index() {
   const [parties, setParties] = useState<IncidentPartySummary[]>([]);
   const [summaryLoading, setSummaryLoading] = useState(false);
   const [serverLoaded, setServerLoaded] = useState(false);
-  const [realtimeConnected, setRealtimeConnected] = useState(false);
+  const [realtimeStatus, setRealtimeStatus] = useState<RealtimeConnectionStatus>(navigator.onLine ? "connecting" : "offline");
+  const [signatureGateReady, setSignatureGateReady] = useState(false);
+  const [signatureGateIssue, setSignatureGateIssue] = useState<"check" | "own" | "party" | "pending" | "server" | null>("check");
+  const [checkingSignatureGate, setCheckingSignatureGate] = useState(false);
+  const [completionPending, setCompletionPending] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [completed, setCompleted] = useState(false);
   const [creating, setCreating] = useState(false);
@@ -91,6 +97,11 @@ export default function Index() {
   const [cases, setCases] = useState(initialCases);
   const [locating, setLocating] = useState(false);
   const photoInputRef = useRef<HTMLInputElement>(null);
+  const pendingOutboxCount = useLiveQuery(
+    () => user && localDraftId ? db.outbox.where("draftId").equals(localDraftId).filter((entry) => entry.ownerId === user.id).count() : 0,
+    [user?.id, localDraftId],
+    0,
+  );
 
   const applyLocalDraft = (draft: LocalDraft) => {
 
@@ -101,6 +112,10 @@ export default function Index() {
 
   const update = <K extends keyof AccidentData>(key: K, value: AccidentData[K]) => {
     setDirty(true);
+    if (key !== "hasSignature" && key !== "signatureDataUrl") {
+      setSignatureGateReady(false);
+      setSignatureGateIssue("check");
+    }
     setData((previous) => ({ ...previous, [key]: value }));
     if (user && localDraftId) void saveDraftField(user.id, localDraftId, key, value);
   };
@@ -185,14 +200,36 @@ export default function Index() {
     };
 
     void refreshIncident();
-    const unsubscribe = subscribeToIncident(draftRef.incidentId, () => void refreshIncident(), (connected) => {
-      if (active) setRealtimeConnected(connected);
+    const unsubscribe = subscribeToIncident(draftRef.incidentId, () => void refreshIncident(), (status) => {
+      if (active) setRealtimeStatus(status);
     });
     return () => {
       active = false;
       unsubscribe();
     };
   }, [view, draftRef?.incidentId]);
+
+  useEffect(() => {
+    const handleSynced = (event: Event) => {
+      const detail = (event as CustomEvent<{ draftId: string }>).detail;
+      if (detail.draftId !== localDraftId) return;
+      setCompletionPending(false);
+      setCompleted(true);
+      toast.success(t("signature.saved"));
+    };
+    const handleError = (event: Event) => {
+      const detail = (event as CustomEvent<{ draftId: string }>).detail;
+      if (detail.draftId !== localDraftId) return;
+      setCompletionPending(true);
+      toast.error(t("signature.uploadError"));
+    };
+    window.addEventListener("incident-signature-synced", handleSynced);
+    window.addEventListener("incident-signature-error", handleError);
+    return () => {
+      window.removeEventListener("incident-signature-synced", handleSynced);
+      window.removeEventListener("incident-signature-error", handleError);
+    };
+  }, [localDraftId, t]);
 
   const startAccident = async () => {
     if (creating) return;
@@ -217,7 +254,10 @@ export default function Index() {
 
       setParties([]);
       setServerLoaded(false);
-      setRealtimeConnected(false);
+      setRealtimeStatus(navigator.onLine ? "connecting" : "offline");
+      setSignatureGateReady(false);
+      setSignatureGateIssue("check");
+      setCompletionPending(false);
       setDirty(false);
       setCompleted(false);
       setStep(0);
@@ -288,18 +328,77 @@ export default function Index() {
     }
   };
 
+  const verifySignatureGate = async () => {
+    if (!user || !draftRef || !localDraftId || checkingSignatureGate) return;
+    if (!ownRequiredFieldsComplete) {
+      setSignatureGateReady(false);
+      setSignatureGateIssue("own");
+      return;
+    }
+    if (!navigator.onLine) {
+      setSignatureGateReady(true);
+      setSignatureGateIssue(null);
+      return;
+    }
+
+    setCheckingSignatureGate(true);
+    try {
+      await processOutbox();
+      const remaining = await db.outbox.where("draftId").equals(localDraftId).filter((entry) => entry.ownerId === user.id).count();
+      if (remaining > 0) {
+        setSignatureGateReady(false);
+        setSignatureGateIssue("pending");
+        return;
+      }
+      const latestDraft = await db.drafts.get(localDraftId);
+      const ref = latestDraft?.ref ?? draftRef;
+      if (ref.incidentId.startsWith("local:")) {
+        setSignatureGateReady(false);
+        setSignatureGateIssue("server");
+        return;
+      }
+      const summary = await loadIncidentSummary(ref);
+      setParties(summary.parties);
+      setServerLoaded(true);
+      const own = summary.parties.find((party) => party.id === ref.partyId);
+      setDraftRef({ ...ref, incidentVersion: summary.incidentVersion, partyVersion: own?.version ?? ref.partyVersion });
+      if (summary.parties.length > 1 && !summary.parties.every(partyRequiredFieldsComplete)) {
+        setSignatureGateReady(false);
+        setSignatureGateIssue("party");
+        return;
+      }
+      setSignatureGateReady(true);
+      setSignatureGateIssue(null);
+      setDirty(false);
+    } catch {
+      setSignatureGateReady(false);
+      setSignatureGateIssue("server");
+    } finally {
+      setCheckingSignatureGate(false);
+    }
+  };
+
   const complete = async () => {
-    if (!signatureUnlocked) return toast.error(t("signatureGate.syncing"));
+    if (!signatureUnlocked) return toast.error(t(`signatureGate.${signatureGateIssue ?? "check"}`, { count: pendingOutboxCount }));
     if (!data.hasSignature || !data.signatureDataUrl) return toast.error(t("validation.signatureRequired"));
     if (!user || !draftRef || !localDraftId || saving) return;
     setSaving(true);
     try {
-      await markDraftComplete(user.id, localDraftId);
-      setCompleted(true);
-      setCases((previous) => [{ id: draftRef.shareCode, date: data.date, time: data.time, location: data.location || t("fields.notProvided"), status: "completed", plate: data.plate || t("fields.noPlate") }, ...previous]);
-      toast.success(t("wizard.saved"));
+      const entryId = await markDraftComplete(user.id, localDraftId);
+      if (!entryId) throw new Error("completion_not_queued");
+      setCompletionPending(true);
+      if (!navigator.onLine) {
+        toast.success(t("signature.savedOffline"));
+        return;
+      }
+      await processOutbox();
+      const stillPending = await db.outbox.get(entryId);
+      if (!stillPending) {
+        setCases((previous) => [{ id: draftRef.shareCode, date: data.date, time: data.time, location: data.location || t("fields.notProvided"), status: "completed", plate: data.plate || t("fields.noPlate") }, ...previous]);
+      }
     } catch {
-      toast.error(t("incident.saveError"));
+      setCompletionPending(true);
+      toast.error(t("signature.uploadError"));
     } finally {
       setSaving(false);
     }
@@ -310,12 +409,18 @@ export default function Index() {
   const counterpart = parties.find((party) => party.id !== draftRef?.partyId);
   const partyB = parties.find((party) => party.partyLabel === "B");
   const partyBStatus = !partyB ? "waiting" : partyB.signedAt ? "signed" : partyB.version === 1 ? "joined" : "filling";
-  const allRequiredFieldsComplete = parties.length >= 2 && parties.every(partyRequiredFieldsComplete);
   const ownRequiredFieldsComplete = [data.driverName, data.driverAddress, data.phone, data.plate, data.vehicle, data.insurer, data.policy, data.damage].every(hasText);
-  const localStateSynced = Boolean(serverLoaded && realtimeConnected && !dirty && !saving && ownParty && draftRef && ownParty.version === draftRef.partyVersion);
   const offlineDraft = Boolean(draftRef?.incidentId.startsWith("local:") || !navigator.onLine);
-  const signatureUnlocked = ownRequiredFieldsComplete && (offlineDraft || (allRequiredFieldsComplete && localStateSynced));
-  const signatureGateReason = !partyB ? "waiting" : !allRequiredFieldsComplete ? "required" : "syncing";
+  const signatureUnlocked = ownRequiredFieldsComplete && (offlineDraft || (signatureGateReady && pendingOutboxCount === 0));
+  const signatureStatusKey = completionPending
+    ? "completionPending"
+    : checkingSignatureGate
+      ? "checking"
+      : !ownRequiredFieldsComplete
+        ? "own"
+        : pendingOutboxCount > 0 && !offlineDraft
+          ? "pending"
+          : signatureGateIssue ?? (data.hasSignature ? "ready" : "draw");
 
   if (view === "home") return (
 
@@ -338,7 +443,7 @@ export default function Index() {
 
   return (
     <div className="min-h-screen bg-[#F5F7FA] pb-28 text-slate-900">
-      <header className="sticky top-0 z-20 border-b border-slate-200 bg-white/95 backdrop-blur"><div className="mx-auto max-w-3xl px-4 py-3"><div className="flex items-center justify-between gap-2"><Button variant="ghost" size="icon" onClick={back} className="h-11 w-11 shrink-0 rounded-xl" aria-label={t("app.back")}><ArrowLeft className="h-6 w-6 text-[#153B66]" /></Button><div className="min-w-0 text-center"><p className="text-xs font-semibold uppercase tracking-wider text-slate-500">{t("wizard.stepOf", { current: formatNumber(step + 1), total: formatNumber(6) })}</p><p className="truncate font-bold text-[#153B66]">{steps[step]}</p></div><LanguageSwitcher /></div><div className="mt-3 flex items-center gap-3"><Progress value={((step + 1) / 6) * 100} className="h-1.5 flex-1 bg-slate-200 [&>div]:bg-[#39719D]" /><PartyStatusBadge status={partyBStatus} connected={realtimeConnected} /></div></div></header>
+      <header className="sticky top-0 z-20 border-b border-slate-200 bg-white/95 backdrop-blur"><div className="mx-auto max-w-3xl px-4 py-3"><div className="flex items-center justify-between gap-2"><Button variant="ghost" size="icon" onClick={back} className="h-11 w-11 shrink-0 rounded-xl" aria-label={t("app.back")}><ArrowLeft className="h-6 w-6 text-[#153B66]" /></Button><div className="min-w-0 text-center"><p className="text-xs font-semibold uppercase tracking-wider text-slate-500">{t("wizard.stepOf", { current: formatNumber(step + 1), total: formatNumber(6) })}</p><p className="truncate font-bold text-[#153B66]">{steps[step]}</p></div><LanguageSwitcher /></div><div className="mt-3 flex items-center gap-3"><Progress value={((step + 1) / 6) * 100} className="h-1.5 flex-1 bg-slate-200 [&>div]:bg-[#39719D]" /><div className="flex items-center gap-2"><ConnectionStatusBadge status={realtimeStatus} /><PartyStatusBadge status={partyBStatus} /></div></div></div></header>
       <main className="mx-auto max-w-3xl px-5 py-7"><div className="mb-7"><div className="mb-2 flex flex-wrap items-center gap-2"><p className="text-sm font-semibold text-[#39719D]">{formatNumber(step + 1).padStart(2, "0")} — {steps[step]}</p>{draftRef && <span className="rounded-full bg-[#E7F0F6] px-2.5 py-1 font-mono text-xs font-bold tracking-wider text-[#153B66]">{t("incident.shareCode")}: {draftRef.shareCode}</span>}</div><h1 className="text-2xl font-bold tracking-tight text-[#102F52]">{titles[step]}</h1><p className="mt-2 text-sm leading-relaxed text-slate-500">{descriptions[step]}</p></div>
 
         {(!user || isAnonymous) && <div className="mb-5 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-amber-950"><div className="flex gap-3"><AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-700" /><div><p className="font-semibold">{t("guest.notice")}</p><p className="mt-1 text-sm leading-relaxed text-amber-800">{t("guest.detail")}</p><Button asChild variant="link" className="mt-1 h-auto p-0 font-semibold text-amber-900"><Link to="/auth">{t("guest.createAccount")}</Link></Button></div></div></div>}
@@ -350,12 +455,12 @@ export default function Index() {
           {step === 2 && <div className="space-y-3"><FieldBadge number="12" />{circumstances.map((circumstance, index) => { const selected = data.situations.includes(index); return <label key={index} className={`flex min-h-16 cursor-pointer items-center gap-4 rounded-2xl border-2 p-4 ${selected ? "border-[#39719D] bg-[#EDF4F8]" : "border-slate-200"}`}><Checkbox checked={selected} onCheckedChange={() => update("situations", selected ? data.situations.filter((value) => value !== index) : [...data.situations, index])} className="h-6 w-6 rounded-md data-[state=checked]:border-[#153B66] data-[state=checked]:bg-[#153B66]" /><span className="flex-1 text-sm font-medium leading-snug text-slate-700"><span className="mr-2 text-xs font-bold text-[#39719D]">{formatNumber(index + 1)}.</span>{circumstance}</span></label>; })}<p className="pt-3 text-center text-sm font-medium text-slate-500">{t("circumstances.selected", { count: data.situations.length, formattedCount: formatNumber(data.situations.length) })}</p></div>}
           {step === 3 && <div className="space-y-6"><Field number="11" label={t("fields.visibleDamage")}><Textarea value={data.damage} onChange={(event) => update("damage", event.target.value)} placeholder={t("fields.damagePlaceholder")} className="min-h-28 rounded-xl text-base" /></Field><Field number="14" label={t("fields.remarks")}><Textarea value={data.notes} onChange={(event) => update("notes", event.target.value)} placeholder={t("fields.remarksPlaceholder")} className="min-h-24 rounded-xl text-base" /></Field><Field number="11" label={t("fields.photos")}><button type="button" onClick={() => void takePhoto()} className="flex min-h-32 w-full cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed border-[#9FBACD] bg-[#F7FAFC] p-5 text-center"><Camera className="mb-2 h-8 w-8 text-[#39719D]" /><span className="font-semibold text-[#153B66]">{t("fields.photoAction")}</span><span className="mt-1 text-xs text-slate-500">{t("fields.photoHint")}</span></button><input ref={photoInputRef} type="file" accept="image/*" capture="environment" multiple className="sr-only" onChange={(event) => { addPhotos(event.target.files); event.target.value = ""; }} /></Field>{data.photos.length > 0 && <div className="grid grid-cols-3 gap-3">{data.photos.map((photo, index) => <div key={photo.id} className="relative aspect-square overflow-hidden rounded-xl bg-slate-100"><img src={photo.url} alt={t("fields.photoAlt", { number: formatNumber(index + 1) })} className="h-full w-full object-cover" /><button type="button" onClick={() => void removePhoto(photo)} className="absolute right-1 top-1 flex h-8 w-8 items-center justify-center rounded-full bg-slate-900/75 text-white" aria-label={t("fields.deletePhoto")}><Trash2 className="h-4 w-4" /></button></div>)}</div>}</div>}
 
-          {step === 4 && <div className="space-y-5"><div><FieldBadge number="10" /><p className="text-sm font-semibold text-slate-700">{t("fields.initialImpact")}</p></div><FieldBadge number="13" /><div className="rounded-xl bg-[#EDF4F8] p-4 text-sm leading-relaxed text-[#153B66]"><strong>{t("sketch.tipTitle")}</strong> {t("sketch.tip")}</div><DrawingCanvas label={t("fields.sketch")} height={320} onChange={(value, dataUrl) => { update("hasSketch", value); update("sketchDataUrl", dataUrl ?? ""); }} /><div className="flex flex-wrap gap-3 text-xs text-slate-500"><span className="rounded-full bg-slate-100 px-3 py-1.5">{t("sketch.myVehicle")}</span><span className="rounded-full bg-slate-100 px-3 py-1.5">{t("sketch.otherVehicle")}</span><span className="rounded-full bg-slate-100 px-3 py-1.5">{t("sketch.impact")}</span></div></div>}
-          {step === 5 && <div className="space-y-6">{draftRef?.partyLabel === "A" && <InviteParty shareCode={draftRef.shareCode} loading={draftRef.incidentId.startsWith("local:")} />}<div className="grid gap-3 sm:grid-cols-2"><Summary number="1" icon={<Clock3 />} label={t("fields.dateTime")} value={formatCaseDate({ ...initialCases[0], date: data.date, time: data.time })} /><Summary number="2" icon={<MapPin />} label={t("fields.place")} value={data.location || t("fields.notProvided")} /><Summary number="9" icon={<UserRound />} label={t("fields.driver")} value={data.driverName || t("fields.notProvided")} /><Summary number="7" icon={<Car />} label={t("fields.vehicle")} value={`${data.plate || t("fields.noPlate")}${data.vehicle ? ` · ${data.vehicle}` : ""}`} /><Summary number="8" icon={<ShieldCheck />} label={t("fields.insurer")} value={data.insurer || t("fields.notProvided")} /><Summary number="11–13" icon={<Camera />} label={t("fields.documentation")} value={`${t("fields.photosCount", { formattedCount: formatNumber(data.photos.length) })} · ${t(data.hasSketch ? "fields.sketchAvailable" : "fields.withoutSketch")}`} /></div><div className="rounded-2xl border border-slate-200 p-4"><FieldBadge number="12" /><p className="mb-2 mt-2 text-xs font-bold uppercase tracking-wider text-slate-500">{t("summary.circumstances")}</p>{selectedSummary.length ? <ul className="space-y-1.5">{selectedSummary.map((item) => <li key={item} className="flex gap-2 text-sm text-slate-700"><Check className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />{item}</li>)}</ul> : <p className="text-sm text-slate-500">{t("summary.noneSelected")}</p>}</div><CounterpartSummary party={counterpart} loading={summaryLoading} /><FieldBadge number="15" />{signatureUnlocked || completed ? <DrawingCanvas label={t("fields.signature")} height={170} onChange={(value, dataUrl) => { update("hasSignature", value); update("signatureDataUrl", dataUrl ?? ""); }} /> : <SignatureGate reason={signatureGateReason} connected={realtimeConnected} />}{(completed || ownParty?.signedAt) && draftRef && !draftRef.incidentId.startsWith("local:") && <SubmissionPanel incidentId={draftRef.incidentId} />}<p className="text-xs leading-relaxed text-slate-500">{t("summary.disclaimer")}</p></div>}
+          {step === 4 && <div className="space-y-5"><div><FieldBadge number="10" /><p className="text-sm font-semibold text-slate-700">{t("fields.initialImpact")}</p></div><FieldBadge number="13" /><div className="rounded-xl bg-[#EDF4F8] p-4 text-sm leading-relaxed text-[#153B66]"><strong>{t("sketch.tipTitle")}</strong> {t("sketch.tip")}</div><DrawingCanvas label={t("fields.sketch")} height={320} initialDataUrl={data.sketchDataUrl} onChange={(value, dataUrl) => { update("hasSketch", value); update("sketchDataUrl", dataUrl ?? ""); }} /><div className="flex flex-wrap gap-3 text-xs text-slate-500"><span className="rounded-full bg-slate-100 px-3 py-1.5">{t("sketch.myVehicle")}</span><span className="rounded-full bg-slate-100 px-3 py-1.5">{t("sketch.otherVehicle")}</span><span className="rounded-full bg-slate-100 px-3 py-1.5">{t("sketch.impact")}</span></div></div>}
+          {step === 5 && <div className="space-y-6">{draftRef?.partyLabel === "A" && <InviteParty shareCode={draftRef.shareCode} loading={draftRef.incidentId.startsWith("local:")} />}<div className="grid gap-3 sm:grid-cols-2"><Summary number="1" icon={<Clock3 />} label={t("fields.dateTime")} value={formatCaseDate({ ...initialCases[0], date: data.date, time: data.time })} /><Summary number="2" icon={<MapPin />} label={t("fields.place")} value={data.location || t("fields.notProvided")} /><Summary number="9" icon={<UserRound />} label={t("fields.driver")} value={data.driverName || t("fields.notProvided")} /><Summary number="7" icon={<Car />} label={t("fields.vehicle")} value={`${data.plate || t("fields.noPlate")}${data.vehicle ? ` · ${data.vehicle}` : ""}`} /><Summary number="8" icon={<ShieldCheck />} label={t("fields.insurer")} value={data.insurer || t("fields.notProvided")} /><Summary number="11–13" icon={<Camera />} label={t("fields.documentation")} value={`${t("fields.photosCount", { formattedCount: formatNumber(data.photos.length) })} · ${t(data.hasSketch ? "fields.sketchAvailable" : "fields.withoutSketch")}`} /></div><div className="rounded-2xl border border-slate-200 p-4"><FieldBadge number="12" /><p className="mb-2 mt-2 text-xs font-bold uppercase tracking-wider text-slate-500">{t("summary.circumstances")}</p>{selectedSummary.length ? <ul className="space-y-1.5">{selectedSummary.map((item) => <li key={item} className="flex gap-2 text-sm text-slate-700"><Check className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />{item}</li>)}</ul> : <p className="text-sm text-slate-500">{t("summary.noneSelected")}</p>}</div><CounterpartSummary party={counterpart} loading={summaryLoading} /><FieldBadge number="15" />{signatureUnlocked || completed ? <DrawingCanvas label={t("fields.signature")} height={170} initialDataUrl={data.signatureDataUrl} confirmable onChange={(value, dataUrl) => { update("hasSignature", value); update("signatureDataUrl", dataUrl ?? ""); }} /> : <SignatureGate issue={!ownRequiredFieldsComplete ? "own" : signatureGateIssue ?? "check"} pendingCount={pendingOutboxCount} checking={checkingSignatureGate} onCheck={() => void verifySignatureGate()} />}{(completed || ownParty?.signedAt) && draftRef && !draftRef.incidentId.startsWith("local:") && <SubmissionPanel incidentId={draftRef.incidentId} />}<p className="text-xs leading-relaxed text-slate-500">{t("summary.disclaimer")}</p></div>}
 
         </div>
       </main>
-      <div className="fixed inset-x-0 bottom-0 z-20 border-t border-slate-200 bg-white/95 px-5 py-4 backdrop-blur"><div className="mx-auto flex max-w-3xl gap-3">{completed ? <Button onClick={() => setView("home")} className="h-14 flex-1 rounded-2xl bg-[#153B66] text-base font-semibold"><Check className="mr-2 h-5 w-5" />{t("summary.toOverview")}</Button> : <><Button variant="outline" onClick={back} disabled={saving} className="h-14 w-14 shrink-0 rounded-2xl border-slate-300" aria-label={t("app.back")}><ArrowLeft className="h-5 w-5" /></Button>{step < 5 ? <Button onClick={() => void next()} disabled={saving} className="h-14 flex-1 rounded-2xl bg-[#153B66] text-base font-semibold hover:bg-[#102F52]">{saving ? t("incident.saving") : t("wizard.next", { step: steps[step + 1] })}<ArrowRight className="ml-2 h-5 w-5" /></Button> : <Button onClick={() => void complete()} disabled={saving || !signatureUnlocked} className="h-14 flex-1 rounded-2xl bg-emerald-700 text-base font-semibold hover:bg-emerald-800"><Check className="mr-2 h-5 w-5" />{saving ? t("incident.saving") : signatureUnlocked ? t("wizard.complete") : t("signatureGate.locked")}</Button>}</>}</div></div>
+      <div className="fixed inset-x-0 bottom-0 z-20 border-t border-slate-200 bg-white/95 px-5 py-3 backdrop-blur"><div className="mx-auto max-w-3xl">{!completed && step === 5 && <p className="mb-2 text-center text-xs font-semibold text-slate-600">{t(`signatureGate.${signatureStatusKey}`, { count: pendingOutboxCount })}</p>}<div className="flex gap-3">{completed ? <Button onClick={() => setView("home")} className="h-14 flex-1 rounded-2xl bg-[#153B66] text-base font-semibold"><Check className="mr-2 h-5 w-5" />{t("summary.toOverview")}</Button> : <><Button variant="outline" onClick={back} disabled={saving} className="h-14 w-14 shrink-0 rounded-2xl border-slate-300" aria-label={t("app.back")}><ArrowLeft className="h-5 w-5" /></Button>{step < 5 ? <Button onClick={() => void next()} disabled={saving} className="h-14 flex-1 rounded-2xl bg-[#153B66] text-base font-semibold hover:bg-[#102F52]">{saving ? t("incident.saving") : t("wizard.next", { step: steps[step + 1] })}<ArrowRight className="ml-2 h-5 w-5" /></Button> : <Button onClick={() => void complete()} disabled={saving || !signatureUnlocked || !data.hasSignature || completionPending} className="h-14 flex-1 rounded-2xl bg-emerald-700 text-base font-semibold hover:bg-emerald-800"><Check className="mr-2 h-5 w-5" />{saving ? t("incident.saving") : completionPending ? t("signature.pending") : t("wizard.complete")}</Button>}</>}</div></div></div>
     </div>
 
   );
@@ -417,16 +522,21 @@ function SectionTitle({ number, icon, title }: { number: string; icon: React.Rea
 function Choice({ active, warning, onClick, children }: { active: boolean; warning?: boolean; onClick: () => void; children: React.ReactNode }) { return <button type="button" onClick={onClick} className={`h-14 rounded-xl border-2 text-base font-semibold ${active ? warning ? "border-amber-500 bg-amber-50 text-amber-900" : "border-[#153B66] bg-[#EDF3F7] text-[#153B66]" : "border-slate-200 text-slate-600"}`}>{children}</button>; }
 function Summary({ number, icon, label, value }: { number: string; icon: React.ReactNode; label: string; value: string }) { return <div className="flex gap-3 rounded-2xl bg-[#F6F8FA] p-4"><span className="mt-0.5 text-[#39719D] [&>svg]:h-5 [&>svg]:w-5">{icon}</span><div className="min-w-0"><FieldBadge number={number} /><p className="text-xs font-semibold uppercase tracking-wide text-slate-500">{label}</p><p className="mt-1 break-words text-sm font-semibold text-slate-800">{value}</p></div></div>; }
 
-function PartyStatusBadge({ status, connected }: { status: "waiting" | "joined" | "filling" | "signed"; connected: boolean }) {
+function ConnectionStatusBadge({ status }: { status: RealtimeConnectionStatus }) {
   const { t } = useTranslation();
-  const colors = status === "signed" ? "bg-emerald-100 text-emerald-800" : status === "filling" ? "bg-blue-100 text-blue-800" : "bg-amber-100 text-amber-800";
-  return <div title={t(connected ? "realtime.connected" : "realtime.connecting")} className={`flex min-w-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-semibold ${colors}`}><Radio className={`h-3.5 w-3.5 shrink-0 ${connected ? "animate-pulse" : "opacity-40"}`} /><span className="max-w-44 truncate">{t(`partyStatus.${status}`)}</span></div>;
+  const colors = status === "connected" ? "bg-emerald-100 text-emerald-800" : status === "connecting" ? "bg-blue-100 text-blue-800" : "bg-slate-200 text-slate-700";
+  return <div className={`flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-semibold ${colors}`}><Radio className={`h-3.5 w-3.5 ${status === "connected" ? "animate-pulse" : ""}`} /><span>{t(`realtime.${status}`)}</span></div>;
 }
 
-function SignatureGate({ reason, connected }: { reason: "waiting" | "required" | "syncing"; connected: boolean }) {
-
+function PartyStatusBadge({ status }: { status: "waiting" | "joined" | "filling" | "signed" }) {
   const { t } = useTranslation();
-  return <div className="rounded-2xl border-2 border-dashed border-amber-300 bg-amber-50 p-6 text-center"><span className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-amber-100 text-amber-800"><LockKeyhole className="h-6 w-6" /></span><h3 className="mt-4 font-bold text-amber-950">{t("signatureGate.title")}</h3><p className="mx-auto mt-2 max-w-md text-sm leading-relaxed text-amber-800">{t(`signatureGate.${reason}`)}</p><p className="mt-3 text-xs font-semibold text-amber-700">{t(connected ? "realtime.connected" : "realtime.connecting")}</p></div>;
+  const colors = status === "signed" ? "bg-emerald-100 text-emerald-800" : status === "filling" ? "bg-blue-100 text-blue-800" : "bg-amber-100 text-amber-800";
+  return <div className={`hidden min-w-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-semibold sm:flex ${colors}`}><span className="max-w-44 truncate">{t(`partyStatus.${status}`)}</span></div>;
+}
+
+function SignatureGate({ issue, pendingCount, checking, onCheck }: { issue: "check" | "own" | "party" | "pending" | "server"; pendingCount: number; checking: boolean; onCheck: () => void }) {
+  const { t } = useTranslation();
+  return <div className="rounded-2xl border-2 border-dashed border-amber-300 bg-amber-50 p-6 text-center"><span className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-amber-100 text-amber-800"><LockKeyhole className="h-6 w-6" /></span><h3 className="mt-4 font-bold text-amber-950">{t("signatureGate.title")}</h3><p className="mx-auto mt-2 max-w-md text-sm leading-relaxed text-amber-800">{t(`signatureGate.${checking ? "checking" : issue}`, { count: pendingCount })}</p><Button type="button" onClick={onCheck} disabled={checking} className="mt-4 rounded-xl bg-amber-800 hover:bg-amber-900">{t(checking ? "signatureGate.checking" : "signatureGate.check")}</Button></div>;
 }
 
 function CounterpartSummary({ party, loading }: { party?: IncidentPartySummary; loading: boolean }) {

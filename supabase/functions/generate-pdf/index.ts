@@ -95,7 +95,7 @@ serve(async (req) => {
       submissionParty = parties.find((party) => party.profile_id === orgProfile?.id);
     }
     if (!submissionParty) return json({ error: "forbidden" }, 403);
-    if (!["signed", "submitted"].includes(incident.status) || parties.length < 2 || parties.some((party) => !party.signed_at)) return json({ error: "incident_not_completed" }, 409);
+    if (!["signed", "submitted"].includes(incident.status) || parties.length === 0 || parties.some((party) => !party.signed_at)) return json({ error: "incident_not_completed" }, 409);
 
     const downloaded = new Map<string, { bytes: Uint8Array; contentType?: string }>();
 

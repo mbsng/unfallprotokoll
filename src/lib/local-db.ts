@@ -142,11 +142,13 @@ export async function saveDraftField<K extends keyof AccidentData>(ownerId: stri
     const table = tableForField(field);
     const version = table === "incidents" ? draft.ref.incidentVersion : draft.ref.partyVersion;
     await db.drafts.put(draft);
-    await db.outbox.add({
-      id: crypto.randomUUID(), ownerId, draftId, table, operation: "update",
-      payload: { field, value, modifiedAt }, version, device_id: deviceId,
-      attempts: 0, nextAttemptAt: Date.now(), createdAt: modifiedAt,
-    });
+    if (field !== "hasSignature" && field !== "signatureDataUrl") {
+      await db.outbox.add({
+        id: crypto.randomUUID(), ownerId, draftId, table, operation: "update",
+        payload: { field, value, modifiedAt }, version, device_id: deviceId,
+        attempts: 0, nextAttemptAt: Date.now(), createdAt: modifiedAt,
+      });
+    }
     updatedDraft = draft;
   });
   if (updatedDraft) notifyDraft(updatedDraft);
@@ -215,14 +217,22 @@ export async function getLatestDraft(ownerId: string) {
 
 export async function markDraftComplete(ownerId: string, draftId: string) {
   const draft = await db.drafts.get(draftId);
-  if (!owns(ownerId, draft)) return;
+  if (!owns(ownerId, draft)) return null;
+  const existing = await db.outbox.where("draftId").equals(draftId).filter((entry) => entry.ownerId === ownerId && entry.operation === "complete").first();
+  if (existing) {
+    await db.outbox.update(existing.id, { attempts: 0, nextAttemptAt: Date.now() });
+    requestSync();
+    return existing.id;
+  }
   const now = new Date().toISOString();
+  const id = crypto.randomUUID();
   await db.outbox.add({
-    id: crypto.randomUUID(), ownerId, draftId, table: "incident_parties", operation: "complete",
+    id, ownerId, draftId, table: "incident_parties", operation: "complete",
     payload: {}, version: draft.ref.partyVersion, device_id: deviceId,
     attempts: 0, nextAttemptAt: Date.now(), createdAt: now,
   });
   requestSync();
+  return id;
 }
 
 export async function applyDraftFromSync(draft: LocalDraft) {

@@ -83,16 +83,80 @@ export async function loadIncidentSummary(ref: IncidentDraftRef): Promise<Incide
   };
 }
 
-export function subscribeToIncident(incidentId: string, onChange: () => void, onStatus: (connected: boolean) => void) {
-  const channel = supabase
-    .channel(`incident:${incidentId}`)
-    .on("postgres_changes", { event: "*", schema: "public", table: "incidents", filter: `id=eq.${incidentId}` }, onChange)
-    .on("postgres_changes", { event: "*", schema: "public", table: "incident_parties", filter: `incident_id=eq.${incidentId}` }, onChange)
-    .subscribe((status) => onStatus(status === "SUBSCRIBED"));
+export type RealtimeConnectionStatus = "connected" | "connecting" | "offline";
+
+export function subscribeToIncident(incidentId: string, onChange: () => void, onStatus: (status: RealtimeConnectionStatus) => void) {
+  let stopped = false;
+  let retryTimer: number | null = null;
+  let attempt = 0;
+  let channel: ReturnType<typeof supabase.channel> | null = null;
+
+  const clearChannel = () => {
+    const current = channel;
+    channel = null;
+    if (current) void supabase.removeChannel(current);
+  };
+
+  const scheduleReconnect = () => {
+    if (stopped || retryTimer !== null || !navigator.onLine) return;
+    onStatus("offline");
+    const delay = Math.min(30_000, 1_000 * 2 ** Math.min(attempt, 5));
+    attempt += 1;
+    retryTimer = window.setTimeout(() => {
+      retryTimer = null;
+      connect();
+    }, delay);
+  };
+
+  const connect = () => {
+    if (stopped) return;
+    if (!navigator.onLine) {
+      onStatus("offline");
+      return;
+    }
+    clearChannel();
+    onStatus("connecting");
+    const current = supabase
+      .channel(`incident:${incidentId}:${Date.now()}`)
+      .on("postgres_changes", { event: "*", schema: "public", table: "incidents", filter: `id=eq.${incidentId}` }, onChange)
+      .on("postgres_changes", { event: "*", schema: "public", table: "incident_parties", filter: `incident_id=eq.${incidentId}` }, onChange);
+    channel = current;
+    current.subscribe((status) => {
+      if (stopped || channel !== current) return;
+      if (status === "SUBSCRIBED") {
+        attempt = 0;
+        onStatus("connected");
+        onChange();
+      } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+        clearChannel();
+        scheduleReconnect();
+      }
+    });
+  };
+
+  const handleOnline = () => {
+    attempt = 0;
+    if (retryTimer !== null) window.clearTimeout(retryTimer);
+    retryTimer = null;
+    connect();
+  };
+  const handleOffline = () => {
+    if (retryTimer !== null) window.clearTimeout(retryTimer);
+    retryTimer = null;
+    clearChannel();
+    onStatus("offline");
+  };
+
+  window.addEventListener("online", handleOnline);
+  window.addEventListener("offline", handleOffline);
+  connect();
 
   return () => {
-    onStatus(false);
-    void supabase.removeChannel(channel);
+    stopped = true;
+    if (retryTimer !== null) window.clearTimeout(retryTimer);
+    window.removeEventListener("online", handleOnline);
+    window.removeEventListener("offline", handleOffline);
+    clearChannel();
   };
 }
 

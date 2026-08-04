@@ -3,7 +3,7 @@ import { supabase } from "@/integrations/supabase/client";
 import { db, deviceId, applyDraftFromSync, requestSync, type LocalDraft, type OutboxEntry, type SyncConflict } from "@/lib/local-db";
 import type { AccidentData } from "@/types/incident";
 
-let running = false;
+let activeRun: Promise<void> | null = null;
 let started = false;
 let activeOwnerId: string | null = null;
 
@@ -238,28 +238,45 @@ async function syncMedia(draft: LocalDraft, entry: OutboxEntry) {
 }
 
 async function completeDraft(draft: LocalDraft, entry: OutboxEntry) {
-  if (!draft.data.signatureDataUrl) {
-    await db.outbox.delete(entry.id);
-    return;
-  }
+  if (!draft.data.signatureDataUrl) throw new Error("signature_missing");
+
   const path = await uploadCanvas(draft, "signature", draft.data.signatureDataUrl);
-  const { data, error } = await supabase.from("incident_parties")
-    .update({ signature_storage_path: path, signed_at: new Date().toISOString(), version: draft.ref.partyVersion + 1, updated_at: new Date().toISOString() })
-    .eq("id", draft.ref.partyId).eq("version", draft.ref.partyVersion).select("version").maybeSingle();
-  if (error || !data) throw error ?? new Error("complete_conflict");
-  draft.ref = { ...draft.ref, partyVersion: data.version };
+  const { data: currentParty, error: partyError } = await supabase.from("incident_parties")
+    .select("version, signed_at, signature_storage_path")
+    .eq("id", draft.ref.partyId)
+    .single();
+  if (partyError) throw partyError;
+
+  if (!currentParty.signed_at || currentParty.signature_storage_path !== path) {
+    const signedAt = new Date().toISOString();
+    const { data: signedParty, error: signPartyError } = await supabase.from("incident_parties")
+      .update({ signature_storage_path: path, signed_at: signedAt, version: currentParty.version + 1, updated_at: signedAt })
+      .eq("id", draft.ref.partyId)
+      .eq("version", currentParty.version)
+      .select("version")
+      .maybeSingle();
+    if (signPartyError || !signedParty) throw signPartyError ?? new Error("complete_conflict");
+    draft.ref = { ...draft.ref, partyVersion: signedParty.version };
+  } else {
+    draft.ref = { ...draft.ref, partyVersion: currentParty.version };
+  }
 
   const { data: signedParties, error: partiesError } = await supabase.from("incident_parties").select("signed_at").eq("incident_id", draft.ref.incidentId);
   if (partiesError) throw partiesError;
-  if (signedParties.length >= 2 && signedParties.every((party) => party.signed_at)) {
+  if (signedParties.length > 0 && signedParties.every((party) => party.signed_at)) {
     const { data: incident, error: incidentError } = await supabase.from("incidents").select("status, version").eq("id", draft.ref.incidentId).single();
     if (incidentError) throw incidentError;
-    if (incident.status !== "signed") {
+    if (incident.status !== "signed" && incident.status !== "submitted") {
       const { data: signedIncident, error: signError } = await supabase.from("incidents")
         .update({ status: "signed", version: incident.version + 1, updated_at: new Date().toISOString() })
-        .eq("id", draft.ref.incidentId).eq("version", incident.version).select("version").single();
-      if (signError) throw signError;
+        .eq("id", draft.ref.incidentId)
+        .eq("version", incident.version)
+        .select("version")
+        .maybeSingle();
+      if (signError || !signedIncident) throw signError ?? new Error("incident_sign_conflict");
       draft.ref = { ...draft.ref, incidentVersion: signedIncident.version };
+    } else {
+      draft.ref = { ...draft.ref, incidentVersion: incident.version };
     }
   }
 
@@ -268,6 +285,7 @@ async function completeDraft(draft: LocalDraft, entry: OutboxEntry) {
     await db.outbox.delete(entry.id);
   });
   await applyDraftFromSync(draft);
+  window.dispatchEvent(new CustomEvent("incident-signature-synced", { detail: { draftId: draft.id, incidentId: draft.ref.incidentId } }));
 }
 
 async function processEntry(entry: OutboxEntry) {
@@ -278,7 +296,10 @@ async function processEntry(entry: OutboxEntry) {
     await db.outbox.delete(entry.id);
     return;
   }
-  if (entry.operation !== "create" && draft.ref.incidentId.startsWith("local:")) return;
+  if (entry.operation !== "create" && draft.ref.incidentId.startsWith("local:")) {
+    await db.outbox.update(entry.id, { nextAttemptAt: Date.now() + 2_000 });
+    return;
+  }
   if (entry.operation === "create") return createRemoteDraft(draft, entry);
   if (entry.table === "incident_media") return syncMedia(draft, entry);
   if (entry.table === "incident_witnesses") return replaceWitness(draft, entry);
@@ -292,14 +313,15 @@ async function defer(entry: OutboxEntry) {
   await db.outbox.update(entry.id, { attempts, nextAttemptAt: Date.now() + delay });
 }
 
-export async function processOutbox() {
+async function runOutbox() {
   const ownerId = activeOwnerId;
-  if (running || !navigator.onLine || !ownerId) return;
-  running = true;
-  try {
+  if (!navigator.onLine || !ownerId) return;
+
+  while (activeOwnerId === ownerId) {
     const entries = await db.outbox.where("[ownerId+nextAttemptAt]").between([ownerId, Dexie.minKey], [ownerId, Date.now()]).sortBy("createdAt");
+    if (!entries.length) return;
     for (const entry of entries) {
-      if (activeOwnerId !== ownerId) break;
+      if (activeOwnerId !== ownerId) return;
       try {
         await processEntry(entry);
       } catch (error) {
@@ -307,14 +329,20 @@ export async function processOutbox() {
         if (entry.operation === "create" && message.includes("plan_limit_reached")) {
           window.dispatchEvent(new CustomEvent("plan-limit-reached", { detail: { draftId: entry.draftId } }));
         }
+        if (entry.operation === "complete" && entry.attempts === 0) {
+          window.dispatchEvent(new CustomEvent("incident-signature-error", { detail: { draftId: entry.draftId, message } }));
+        }
         if (activeOwnerId === ownerId) await defer(entry);
-        break;
+        return;
       }
     }
-
-  } finally {
-    running = false;
   }
+}
+
+export function processOutbox() {
+  if (activeRun) return activeRun;
+  activeRun = runOutbox().finally(() => { activeRun = null; });
+  return activeRun;
 }
 
 export function startSyncWorker(ownerId: string) {
