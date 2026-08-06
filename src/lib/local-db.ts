@@ -240,6 +240,15 @@ export async function applyDraftFromSync(draft: LocalDraft) {
   notifyDraft(await hydrateDraft(draft));
 }
 
+export async function deleteLocalDraft(ownerId: string, draftId: string) {
+  await db.transaction("rw", db.drafts, db.photos, db.outbox, db.conflicts, async () => {
+    await db.drafts.delete(draftId);
+    await db.photos.where("draftId").equals(draftId).delete();
+    await db.outbox.where("draftId").equals(draftId).delete();
+    await db.conflicts.where("draftId").equals(draftId).delete();
+  });
+}
+
 export async function clearLocalAccidentData(ownerId: string) {
   await db.transaction("rw", db.drafts, db.photos, db.outbox, db.conflicts, async () => {
     await Promise.all([

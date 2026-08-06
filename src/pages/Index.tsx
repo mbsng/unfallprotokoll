@@ -3,7 +3,7 @@ import { useLiveQuery } from "dexie-react-hooks";
 import { useTranslation } from "react-i18next";
 
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import { AlertTriangle, ArrowLeft, ArrowRight, Camera, Car, Check, CheckCircle2, ChevronRight, Clock3, Download, FileText, LocateFixed, Mail, MapPin, PenLine, Plus, QrCode, Radio, RefreshCw, Send, ShieldCheck, Trash2, UserRound } from "lucide-react";
+import { AlertTriangle, ArrowLeft, ArrowRight, Camera, Car, Check, CheckCircle2, ChevronRight, Clock3, Download, FileText, LocateFixed, Mail, MapPin, PenLine, Plus, QrCode, Radio, RefreshCw, RotateCcw, Send, ShieldCheck, Trash2, UserRound } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -22,7 +22,7 @@ import { localeForLanguage } from "@/i18n";
 import { supabase } from "@/integrations/supabase/client";
 import { getPlanEntitlement } from "@/lib/billing";
 import { computeCaseStatus, loadIncidentSummary, loadUserIncidents, subscribeToIncident, subscribeToUserIncidents, type RealtimeConnectionStatus } from "@/lib/incidents";
-import { createLocalDraft, db, deleteLocalPhoto, getLatestDraft, markDraftComplete, saveDraftField, saveLocalPhoto, type LocalDraft } from "@/lib/local-db";
+import { createLocalDraft, db, deleteLocalDraft, deleteLocalPhoto, getLatestDraft, markDraftComplete, saveDraftField, saveLocalPhoto, type LocalDraft } from "@/lib/local-db";
 import { captureAccidentPhoto, getCurrentCoordinates, isNativeApp } from "@/lib/native-device";
 import { processOutbox } from "@/lib/sync-worker";
 import { generateIncidentPdf, SubmissionError, submitIncident } from "@/lib/submissions";
@@ -135,6 +135,8 @@ export default function Index() {
   const [casesError, setCasesError] = useState(false);
   const [ensuringServerCase, setEnsuringServerCase] = useState(false);
   const [locating, setLocating] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<CaseItem | null>(null);
+  const [withdrawOpen, setWithdrawOpen] = useState(false);
   const photoInputRef = useRef<HTMLInputElement>(null);
 
   const localDrafts = useLiveQuery(
@@ -293,6 +295,50 @@ export default function Index() {
       toast.error(t("incident.saveError"));
     } finally {
       setEnsuringServerCase(false);
+    }
+  };
+
+  const confirmDelete = async () => {
+    if (!deleteTarget || !user) return;
+    const target = deleteTarget;
+    setDeleteTarget(null);
+    try {
+      if (target.incidentId.startsWith("local:")) {
+        await deleteLocalDraft(user.id, target.id);
+      } else if (target.partyLabel === "A") {
+        const { error } = await supabase.from("incidents").delete().eq("id", target.incidentId);
+        if (error) throw error;
+        await deleteLocalDraft(user.id, localDrafts?.find((d) => d.ref.incidentId === target.incidentId)?.id ?? "");
+      } else {
+        const { error } = await supabase.from("incident_parties").delete().eq("id", target.partyId);
+        if (error) throw error;
+        const localId = localDrafts?.find((d) => d.ref.incidentId === target.incidentId)?.id;
+        if (localId) await deleteLocalDraft(user.id, localId);
+      }
+      setServerCases((prev) => prev.filter((c) => c.incidentId !== target.incidentId));
+      toast.success(t(target.partyLabel === "A" ? "delete.caseDeleted" : "delete.participationRemoved"));
+    } catch {
+      toast.error(t("incident.saveError"));
+    }
+  };
+
+  const withdrawSignature = async () => {
+    setWithdrawOpen(false);
+    if (!user || !draftRef || !localDraftId) return;
+    try {
+      update("hasSignature", false);
+      update("signatureDataUrl", "");
+      if (!draftRef.incidentId.startsWith("local:")) {
+        const { error } = await supabase.from("incident_parties")
+          .update({ signed_at: null, signature_storage_path: null, version: draftRef.partyVersion + 1, updated_at: new Date().toISOString() })
+          .eq("id", draftRef.partyId)
+          .eq("version", draftRef.partyVersion);
+        if (error) throw error;
+      }
+      setParties((prev) => prev.map((p) => p.id === draftRef.partyId ? { ...p, signedAt: null } : p));
+      toast.success(t("signature.withdrawn"));
+    } catch {
+      toast.error(t("incident.saveError"));
     }
   };
 
@@ -501,17 +547,22 @@ export default function Index() {
               {allCases.map((item) => {
                 const targetStep = item.caseStatus === "draft" ? 0 : item.caseStatus === "action_needed" ? 5 : 5;
                 return (
-                  <button key={item.id} onClick={() => void openCase(item, targetStep)} className="flex w-full items-center gap-4 rounded-2xl border border-slate-200 bg-white p-4 text-left shadow-sm transition hover:shadow-md active:scale-[0.99]">
-                    <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-[#EDF3F7] text-[#153B66]"><FileText className="h-6 w-6" /></div>
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center gap-2"><h3 className="truncate font-bold text-[#153B66]">{item.location || t("fields.notProvided")}</h3>
-                        <span className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] font-semibold ${statusColors[item.caseStatus]}`}>{t(`caseStatus.${item.caseStatus}`)}</span>
+                  <div key={item.id} className="flex items-center gap-2 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm transition hover:shadow-md">
+                    <button onClick={() => void openCase(item, targetStep)} className="flex min-w-0 flex-1 items-center gap-4 text-left active:scale-[0.99]">
+                      <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-[#EDF3F7] text-[#153B66]"><FileText className="h-6 w-6" /></div>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2"><h3 className="truncate font-bold text-[#153B66]">{item.location || t("fields.notProvided")}</h3>
+                          <span className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] font-semibold ${statusColors[item.caseStatus]}`}>{t(`caseStatus.${item.caseStatus}`)}</span>
+                        </div>
+                        <p className="mt-1 truncate text-sm text-slate-500">{formatCaseDate(item) || t("fields.notProvided")} · {item.plate || t("fields.noPlate")}</p>
                       </div>
-                      <p className="mt-1 truncate text-sm text-slate-500">{formatCaseDate(item) || t("fields.notProvided")} · {item.plate || t("fields.noPlate")}</p>
-                    </div>
-                    {item.caseStatus === "action_needed" && <PenLine className="h-5 w-5 shrink-0 text-orange-500" />}
-                    <ChevronRight className="h-5 w-5 shrink-0 text-slate-400" />
-                  </button>
+                      {item.caseStatus === "action_needed" && <PenLine className="h-5 w-5 shrink-0 text-orange-500" />}
+                      <ChevronRight className="h-5 w-5 shrink-0 text-slate-400" />
+                    </button>
+                    {item.caseStatus !== "signed" && item.caseStatus !== "submitted" && (
+                      <button onClick={() => setDeleteTarget(item)} className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-slate-400 transition hover:bg-rose-50 hover:text-rose-500" aria-label={t(item.partyLabel === "A" ? "delete.case" : "delete.participation")}><Trash2 className="h-4 w-4" /></button>
+                    )}
+                  </div>
                 );
               })}
             </div>
@@ -527,6 +578,18 @@ export default function Index() {
           </section>
         )}
       </main>
+      <Dialog open={Boolean(deleteTarget)} onOpenChange={(open) => { if (!open) setDeleteTarget(null); }}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>{t(deleteTarget?.partyLabel === "A" ? "delete.caseTitle" : "delete.participationTitle")}</DialogTitle>
+            <DialogDescription>{t(deleteTarget?.partyLabel === "A" ? "delete.caseConfirm" : "delete.participationConfirm")}</DialogDescription>
+          </DialogHeader>
+          <div className="mt-4 flex gap-3">
+            <Button variant="outline" onClick={() => setDeleteTarget(null)} className="h-11 flex-1 rounded-xl">{t("app.close")}</Button>
+            <Button onClick={() => void confirmDelete()} className="h-11 flex-1 rounded-xl bg-rose-600 hover:bg-rose-700"><Trash2 className="mr-2 h-4 w-4" />{t(deleteTarget?.partyLabel === "A" ? "delete.case" : "delete.participation")}</Button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 
@@ -558,7 +621,11 @@ export default function Index() {
             {counterpart && <CounterpartSummary party={counterpart} loading={summaryLoading} />}
             <FieldBadge number="15" />
             {alreadySigned
-              ? <div className="rounded-2xl border-2 border-emerald-300 bg-emerald-50 p-5 text-center"><CheckCircle2 className="mx-auto h-10 w-10 text-emerald-600" /><p className="mt-2 font-bold text-emerald-900">{t("signature.alreadySigned")}</p></div>
+              ? <div className="rounded-2xl border-2 border-emerald-300 bg-emerald-50 p-5 text-center">
+                  <CheckCircle2 className="mx-auto h-10 w-10 text-emerald-600" />
+                  <p className="mt-2 font-bold text-emerald-900">{t("signature.alreadySigned")}</p>
+                  {!counterpart?.signedAt && <Button variant="outline" onClick={() => setWithdrawOpen(true)} className="mt-3 rounded-xl border-emerald-300 text-emerald-800"><RotateCcw className="mr-2 h-4 w-4" />{t("signature.withdraw")}</Button>}
+                </div>
               : !ownRequiredFieldsComplete
                 ? <div className="rounded-2xl border-2 border-dashed border-amber-300 bg-amber-50 p-5"><p className="text-sm font-semibold text-amber-900">{t("signature.missingFieldsTitle")}</p><div className="mt-3 flex flex-wrap gap-2">{missingRequiredFields.map((field) => <button key={field.key} onClick={() => setStep(field.step)} className="rounded-lg bg-amber-100 px-3 py-1.5 text-xs font-semibold text-amber-900 transition hover:bg-amber-200">{t(field.key)}</button>)}</div></div>
                 : <DrawingCanvas label={t("fields.signature")} height={170} confirmable onChange={(value, dataUrl) => { update("hasSignature", value); update("signatureDataUrl", dataUrl ?? ""); }} />}
@@ -573,6 +640,15 @@ export default function Index() {
           ? <Button onClick={() => setView("home")} className="h-14 flex-1 rounded-2xl bg-[#153B66] text-base font-semibold"><ArrowLeft className="mr-2 h-5 w-5" />{t("summary.toOverview")}</Button>
           : <><Button variant="outline" onClick={back} disabled={saving} className="h-14 w-14 shrink-0 rounded-2xl border-slate-300" aria-label={t("app.back")}><ArrowLeft className="h-5 w-5" /></Button>{step < 5 ? <Button onClick={() => void next()} disabled={saving} className="h-14 flex-1 rounded-2xl bg-[#153B66] text-base font-semibold hover:bg-[#102F52]">{saving ? t("incident.saving") : t("wizard.next", { step: steps[step + 1] })}<ArrowRight className="ml-2 h-5 w-5" /></Button> : <Button onClick={() => void complete()} disabled={saving || !ownRequiredFieldsComplete || !data.hasSignature} className="h-14 flex-1 rounded-2xl bg-emerald-700 text-base font-semibold hover:bg-emerald-800"><Check className="mr-2 h-5 w-5" />{saving ? t("incident.saving") : t("wizard.complete")}</Button>}</>}
       </div></div>
+      <Dialog open={withdrawOpen} onOpenChange={setWithdrawOpen}>
+        <DialogContent className="max-w-md">
+          <DialogHeader><DialogTitle>{t("signature.withdrawTitle")}</DialogTitle><DialogDescription>{t("signature.withdrawConfirm")}</DialogDescription></DialogHeader>
+          <div className="mt-4 flex gap-3">
+            <Button variant="outline" onClick={() => setWithdrawOpen(false)} className="h-11 flex-1 rounded-xl">{t("app.close")}</Button>
+            <Button onClick={() => void withdrawSignature()} className="h-11 flex-1 rounded-xl bg-amber-600 hover:bg-amber-700"><RotateCcw className="mr-2 h-4 w-4" />{t("signature.withdraw")}</Button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
