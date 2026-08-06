@@ -503,19 +503,27 @@ export default function Index() {
       await markDraftComplete(user.id, localDraftId);
       if (navigator.onLine) {
         await processOutbox();
+        // Verify server-side that signed_at is actually set
         const summary = await loadIncidentSummary(draftRef);
         setParties(summary.parties);
         const ownPartyAfter = summary.parties.find((p) => p.id === draftRef.partyId);
         if (!ownPartyAfter?.signedAt) {
+          console.error("[complete] Signature was not persisted server-side", { partyId: draftRef.partyId });
           toast.error(t("signature.uploadError"));
+          setSaving(false);
           return;
         }
         setDraftRef((current) => current ? { ...current, incidentVersion: summary.incidentVersion, partyVersion: ownPartyAfter.version } : current);
+        const allSigned = summary.parties.length > 0 && summary.parties.every((p) => p.signedAt);
+        toast.success(allSigned ? t("signature.allSigned") : t("signature.saved"));
+      } else {
+        toast.success(t("signature.savedOffline"));
       }
       setSignedJustNow(true);
       setView("signed");
       window.scrollTo(0, 0);
-    } catch {
+    } catch (error) {
+      console.error("[complete] Signature save failed", { error: error instanceof Error ? error.message : String(error) });
       toast.error(t("signature.uploadError"));
     } finally {
       setSaving(false);

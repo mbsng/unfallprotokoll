@@ -115,13 +115,21 @@ async function createRemoteDraft(draft: LocalDraft, entry: OutboxEntry) {
 async function uploadCanvas(draft: LocalDraft, kind: "sketch" | "signature", dataUrl: string) {
   const blob = await (await fetch(dataUrl)).blob();
   const path = `${draft.ref.incidentId}/${draft.ref.partyId}/${kind}.png`;
+  console.log("[sync-worker] Uploading canvas", { kind, path, size: blob.size });
   const { error } = await supabase.storage.from("incident-media").upload(path, blob, { upsert: true, contentType: "image/png" });
-  if (error) throw error;
+  if (error) {
+    console.error("[sync-worker] Storage upload failed", { kind, path, error: error.message });
+    throw new Error(`storage_upload_failed:${error.message}`);
+  }
   const { error: mediaError } = await supabase.from("incident_media").upsert({
     incident_id: draft.ref.incidentId, party_id: draft.ref.partyId, storage_path: path,
     kind: kind === "sketch" ? "sketch" : "document",
   }, { onConflict: "storage_path" });
-  if (mediaError) throw mediaError;
+  if (mediaError) {
+    console.error("[sync-worker] Media DB insert failed", { kind, path, error: mediaError.message });
+    throw new Error(`media_db_failed:${mediaError.message}`);
+  }
+  console.log("[sync-worker] Canvas uploaded successfully", { kind, path });
   return path;
 }
 
@@ -240,33 +248,67 @@ async function syncMedia(draft: LocalDraft, entry: OutboxEntry) {
 async function completeDraft(draft: LocalDraft, entry: OutboxEntry) {
   if (!draft.data.signatureDataUrl) throw new Error("signature_missing");
 
+  // Step 1: Upload signature PNG to storage
   const path = await uploadCanvas(draft, "signature", draft.data.signatureDataUrl);
-  const { data: currentParty, error: partyError } = await supabase.from("incident_parties")
-    .select("version, signed_at, signature_storage_path")
-    .eq("id", draft.ref.partyId)
-    .single();
-  if (partyError) throw partyError;
+  console.log("[sync-worker] Signature uploaded to storage", { path });
 
-  if (!currentParty.signed_at || currentParty.signature_storage_path !== path) {
+  // Step 2: Update incident_parties with signed_at and signature_storage_path
+  // Retry up to 3 times in case of version conflicts
+  let lastError: Error | null = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const { data: currentParty, error: fetchError } = await supabase.from("incident_parties")
+      .select("version, signed_at, signature_storage_path")
+      .eq("id", draft.ref.partyId)
+      .maybeSingle();
+    if (fetchError) { lastError = fetchError; continue; }
+    if (!currentParty) { lastError = new Error("party_not_found"); continue; }
+
+    // Already signed with the same path — idempotent success
+    if (currentParty.signed_at && currentParty.signature_storage_path === path) {
+      draft.ref = { ...draft.ref, partyVersion: currentParty.version };
+      await db.transaction("rw", db.drafts, db.outbox, async () => {
+        await db.drafts.put(draft);
+        await db.outbox.delete(entry.id);
+      });
+      await applyDraftFromSync(draft);
+      window.dispatchEvent(new CustomEvent("incident-signature-synced", { detail: { draftId: draft.id, incidentId: draft.ref.incidentId } }));
+      return;
+    }
+
     const signedAt = new Date().toISOString();
     const { data: signedParty, error: signPartyError } = await supabase.from("incident_parties")
       .update({ signature_storage_path: path, signed_at: signedAt, version: currentParty.version + 1, updated_at: signedAt })
       .eq("id", draft.ref.partyId)
       .eq("version", currentParty.version)
-      .select("version")
+      .select("version, signed_at")
       .maybeSingle();
-    if (signPartyError || !signedParty) throw signPartyError ?? new Error("complete_conflict");
+
+    if (signPartyError) {
+      console.error("[sync-worker] Signature DB update error", { attempt, error: signPartyError.message });
+      lastError = signPartyError;
+      continue;
+    }
+    if (!signedParty) {
+      console.warn("[sync-worker] Signature DB update affected 0 rows, retrying", { attempt, serverVersion: currentParty.version });
+      lastError = new Error("complete_conflict");
+      continue;
+    }
+
+    // Success!
     draft.ref = { ...draft.ref, partyVersion: signedParty.version };
-  } else {
-    draft.ref = { ...draft.ref, partyVersion: currentParty.version };
+    console.log("[sync-worker] Signature saved to DB", { partyId: draft.ref.partyId, version: signedParty.version, signedAt });
+    await db.transaction("rw", db.drafts, db.outbox, async () => {
+      await db.drafts.put(draft);
+      await db.outbox.delete(entry.id);
+    });
+    await applyDraftFromSync(draft);
+    window.dispatchEvent(new CustomEvent("incident-signature-synced", { detail: { draftId: draft.id, incidentId: draft.ref.incidentId } }));
+    return;
   }
 
-  await db.transaction("rw", db.drafts, db.outbox, async () => {
-    await db.drafts.put(draft);
-    await db.outbox.delete(entry.id);
-  });
-  await applyDraftFromSync(draft);
-  window.dispatchEvent(new CustomEvent("incident-signature-synced", { detail: { draftId: draft.id, incidentId: draft.ref.incidentId } }));
+  // All retries exhausted
+  console.error("[sync-worker] Signature save failed after retries", { partyId: draft.ref.partyId, error: lastError?.message });
+  throw lastError ?? new Error("complete_failed");
 }
 
 async function processEntry(entry: OutboxEntry) {
@@ -292,6 +334,12 @@ async function defer(entry: OutboxEntry) {
   const attempts = entry.attempts + 1;
   const delay = Math.min(300_000, 2_000 * 2 ** Math.min(attempts, 7));
   await db.outbox.update(entry.id, { attempts, nextAttemptAt: Date.now() + delay });
+  if (attempts >= 5) {
+    console.error("[sync-worker] Outbox entry exhausted retries", { operation: entry.operation, draftId: entry.draftId, attempts });
+    if (entry.operation === "complete") {
+      window.dispatchEvent(new CustomEvent("incident-signature-error", { detail: { draftId: entry.draftId, message: "max_retries_exceeded" } }));
+    }
+  }
 }
 
 async function runOutbox() {
@@ -307,10 +355,11 @@ async function runOutbox() {
         await processEntry(entry);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        console.error("[sync-worker] Outbox entry failed", { operation: entry.operation, draftId: entry.draftId, error: message });
         if (entry.operation === "create" && message.includes("plan_limit_reached")) {
           window.dispatchEvent(new CustomEvent("plan-limit-reached", { detail: { draftId: entry.draftId } }));
         }
-        if (entry.operation === "complete" && entry.attempts === 0) {
+        if (entry.operation === "complete") {
           window.dispatchEvent(new CustomEvent("incident-signature-error", { detail: { draftId: entry.draftId, message } }));
         }
         if (activeOwnerId === ownerId) await defer(entry);
