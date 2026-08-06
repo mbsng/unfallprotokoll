@@ -291,10 +291,27 @@ export default function Index() {
     setEnsuringServerCase(true);
     try {
       await processOutbox();
+      await refreshFromServer();
     } catch {
       toast.error(t("incident.saveError"));
     } finally {
       setEnsuringServerCase(false);
+    }
+  };
+
+  const refreshFromServer = async () => {
+    if (!draftRef || draftRef.incidentId.startsWith("local:")) return;
+    setSummaryLoading(true);
+    try {
+      const summary = await loadIncidentSummary(draftRef);
+      setParties(summary.parties);
+      setDraftRef((current) => {
+        if (!current) return current;
+        const ownParty = summary.parties.find((party) => party.id === current.partyId);
+        return { ...current, incidentVersion: summary.incidentVersion, partyVersion: ownParty?.version ?? current.partyVersion };
+      });
+    } catch { /* offline or error */ } finally {
+      setSummaryLoading(false);
     }
   };
 
@@ -334,8 +351,8 @@ export default function Index() {
           .eq("id", draftRef.partyId)
           .eq("version", draftRef.partyVersion);
         if (error) throw error;
+        await refreshFromServer();
       }
-      setParties((prev) => prev.map((p) => p.id === draftRef.partyId ? { ...p, signedAt: null } : p));
       toast.success(t("signature.withdrawn"));
     } catch {
       toast.error(t("incident.saveError"));
@@ -484,7 +501,17 @@ export default function Index() {
     setSaving(true);
     try {
       await markDraftComplete(user.id, localDraftId);
-      if (navigator.onLine) await processOutbox();
+      if (navigator.onLine) {
+        await processOutbox();
+        const summary = await loadIncidentSummary(draftRef);
+        setParties(summary.parties);
+        const ownPartyAfter = summary.parties.find((p) => p.id === draftRef.partyId);
+        if (!ownPartyAfter?.signedAt) {
+          toast.error(t("signature.uploadError"));
+          return;
+        }
+        setDraftRef((current) => current ? { ...current, incidentVersion: summary.incidentVersion, partyVersion: ownPartyAfter.version } : current);
+      }
       setSignedJustNow(true);
       setView("signed");
       window.scrollTo(0, 0);
@@ -595,7 +622,7 @@ export default function Index() {
 
   return (
     <div className="min-h-screen bg-[#F5F7FA] pb-28 text-slate-900">
-      <header className="sticky top-0 z-20 border-b border-slate-200 bg-white/95 backdrop-blur"><div className="mx-auto max-w-3xl px-4 py-3"><div className="flex items-center justify-between gap-2"><Button variant="ghost" size="icon" onClick={back} className="h-11 w-11 shrink-0 rounded-xl" aria-label={t("app.back")}><ArrowLeft className="h-6 w-6 text-[#153B66]" /></Button><div className="min-w-0 text-center"><p className="text-xs font-semibold uppercase tracking-wider text-slate-500">{t("wizard.stepOf", { current: formatNumber(step + 1), total: formatNumber(6) })}</p><p className="truncate font-bold text-[#153B66]">{steps[step]}</p></div><LanguageSwitcher /></div><div className="mt-3 flex items-center gap-3"><Progress value={((step + 1) / 6) * 100} className="h-1.5 flex-1 bg-slate-200 [&>div]:bg-[#39719D]" /><ConnectionStatusBadge status={realtimeStatus} /></div></div></header>
+      <header className="sticky top-0 z-20 border-b border-slate-200 bg-white/95 backdrop-blur"><div className="mx-auto max-w-3xl px-4 py-3"><div className="flex items-center justify-between gap-2"><Button variant="ghost" size="icon" onClick={back} className="h-11 w-11 shrink-0 rounded-xl" aria-label={t("app.back")}><ArrowLeft className="h-6 w-6 text-[#153B66]" /></Button><div className="min-w-0 text-center"><p className="text-xs font-semibold uppercase tracking-wider text-slate-500">{t("wizard.stepOf", { current: formatNumber(step + 1), total: formatNumber(6) })}</p><p className="truncate font-bold text-[#153B66]">{steps[step]}</p></div><div className="flex items-center gap-1"><Button variant="ghost" size="icon" onClick={() => void refreshFromServer()} disabled={summaryLoading} className="h-9 w-9 rounded-lg" aria-label={t("home.refresh")}><RefreshCw className={`h-4 w-4 text-[#153B66] ${summaryLoading ? "animate-spin" : ""}`} /></Button><LanguageSwitcher /></div></div><div className="mt-3 flex items-center gap-3"><Progress value={((step + 1) / 6) * 100} className="h-1.5 flex-1 bg-slate-200 [&>div]:bg-[#39719D]" /><ConnectionStatusBadge status={realtimeStatus} /></div></div></header>
       <main className="mx-auto max-w-3xl px-5 py-7"><div className="mb-7"><div className="mb-2 flex flex-wrap items-center gap-2"><p className="text-sm font-semibold text-[#39719D]">{formatNumber(step + 1).padStart(2, "0")} — {steps[step]}</p>{draftRef && <span className="rounded-full bg-[#E7F0F6] px-2.5 py-1 font-mono text-xs font-bold tracking-wider text-[#153B66]">{t("incident.shareCode")}: {draftRef.shareCode}</span>}</div><h1 className="text-2xl font-bold tracking-tight text-[#102F52]">{titles[step]}</h1><p className="mt-2 text-sm leading-relaxed text-slate-500">{descriptions[step]}</p></div>
 
         {(!user || isAnonymous) && <div className="mb-5 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-amber-950"><div className="flex gap-3"><AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-700" /><div><p className="font-semibold">{t("guest.notice")}</p><p className="mt-1 text-sm leading-relaxed text-amber-800">{t("guest.detail")}</p><Button asChild variant="link" className="mt-1 h-auto p-0 font-semibold text-amber-900"><Link to="/auth">{t("guest.createAccount")}</Link></Button></div></div></div>}
