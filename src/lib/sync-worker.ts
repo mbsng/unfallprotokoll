@@ -143,7 +143,10 @@ async function writeVersioned(draft: LocalDraft, entry: OutboxEntry) {
   let patch = table === "incidents" ? incidentPatch(draft.data, field) : partyPatch(draft.data, field);
 
   if (table === "incidents" && (field === "sketchDataUrl" || field === "hasSketch") && draft.data.sketchDataUrl) {
-    const storagePath = await uploadCanvas(draft, "sketch", draft.data.sketchDataUrl);
+    // Only upload if not already uploaded for this entry (avoid re-upload on retry)
+    const cachedPath = entry.payload.storagePath as string | undefined;
+    const storagePath = cachedPath ?? await uploadCanvas(draft, "sketch", draft.data.sketchDataUrl);
+    await db.outbox.update(entry.id, { payload: { ...entry.payload, storagePath } });
     patch = { sketch_json: { storagePath } };
   }
   if (!Object.keys(patch).length) {
@@ -382,13 +385,18 @@ async function runOutbox() {
   const ownerId = activeOwnerId;
   if (!navigator.onLine || !ownerId) return;
 
+  let processed = 0;
+  let failed = 0;
   while (activeOwnerId === ownerId) {
     const entries = await db.outbox.where("[ownerId+nextAttemptAt]").between([ownerId, Dexie.minKey], [ownerId, Date.now()]).sortBy("createdAt");
-    if (!entries.length) return;
+    if (!entries.length) break;
+    processed = 0;
+    failed = 0;
     for (const entry of entries) {
       if (activeOwnerId !== ownerId) return;
       try {
         await processEntry(entry);
+        processed++;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         console.error("[sync-worker] Outbox entry failed", { operation: entry.operation, draftId: entry.draftId, error: message });
@@ -399,9 +407,12 @@ async function runOutbox() {
           window.dispatchEvent(new CustomEvent("incident-signature-error", { detail: { draftId: entry.draftId, message } }));
         }
         if (activeOwnerId === ownerId) await defer(entry);
-        return;
+        failed++;
+        // Continue to next entry instead of returning — one failed entry must not block others
       }
     }
+    // If every entry failed, stop to avoid a busy loop
+    if (processed === 0 && failed > 0) break;
   }
 }
 
