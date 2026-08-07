@@ -115,8 +115,11 @@ serve(async (req) => {
     }
     if (!submissionParty) return json({ error: "forbidden" }, 403);
 
-    // Defensive status check: if all parties have signed_at, accept even if status hasn't been updated yet
-    const allSigned = parties.length > 0 && parties.every((party) => party.signed_at);
+    // Check actual signature state — all parties with a profile_id must have signed_at
+    const realParties = parties.filter((p) => p.profile_id);
+    const unsignedParties = realParties.filter((p) => !p.signed_at);
+    const allSigned = realParties.length > 0 && unsignedParties.length === 0;
+
     if (!["signed", "submitted"].includes(incident.status)) {
       if (allSigned) {
         console.log("[generate-pdf] Auto-fixing incident status to signed", { incidentId, currentStatus: incident.status });
@@ -125,7 +128,9 @@ serve(async (req) => {
           .eq("id", incidentId).eq("version", incident.version);
         if (fixError) console.warn("[generate-pdf] Could not auto-fix status", { error: fixError.message });
       } else {
-        return json({ error: "incident_not_completed" }, 409);
+        const unsignedLabels = unsignedParties.map((p) => p.party_label).join(", ");
+        console.log("[generate-pdf] Incident not completed — unsigned parties", { incidentId, unsignedLabels });
+        return json({ error: "incident_not_completed", detail: `Unsigned parties: ${unsignedLabels}` }, 409);
       }
     }
 

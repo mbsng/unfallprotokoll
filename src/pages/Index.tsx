@@ -513,23 +513,57 @@ export default function Index() {
     if (!user || !draftRef || !localDraftId || saving) return;
     setSaving(true);
     try {
-      await markDraftComplete(user.id, localDraftId);
-      if (navigator.onLine) {
-        await processOutbox();
-        // Verify server-side that signed_at is actually set
+      if (navigator.onLine && !draftRef.incidentId.startsWith("local:")) {
+        // Direct server upload — bypass outbox to avoid being blocked by other entries
+        const blob = await (await fetch(data.signatureDataUrl)).blob();
+        const storagePath = `${draftRef.incidentId}/${draftRef.partyId}/signature.png`;
+        const { error: uploadError } = await supabase.storage.from("incident-media").upload(storagePath, blob, { upsert: true, contentType: "image/png" });
+        if (uploadError) {
+          console.error("[complete] Signature storage upload failed", { error: uploadError.message });
+          throw new Error(`upload:${uploadError.message}`);
+        }
+
+        // Fetch current version to avoid stale version conflict
+        const { data: currentParty, error: fetchError } = await supabase.from("incident_parties")
+          .select("version, signed_at")
+          .eq("id", draftRef.partyId)
+          .maybeSingle();
+        if (fetchError || !currentParty) {
+          console.error("[complete] Failed to fetch party", { error: fetchError?.message });
+          throw new Error("fetch_failed");
+        }
+        if (currentParty.signed_at) {
+          console.log("[complete] Already signed, skipping");
+        } else {
+          const signedAt = new Date().toISOString();
+          const { data: updated, error: updateError } = await supabase.from("incident_parties")
+            .update({ signature_storage_path: storagePath, signed_at: signedAt, version: currentParty.version + 1, updated_at: signedAt })
+            .eq("id", draftRef.partyId)
+            .eq("version", currentParty.version)
+            .select("version, signed_at")
+            .maybeSingle();
+          if (updateError) {
+            console.error("[complete] DB update error", { error: updateError.message, code: updateError.code });
+            throw new Error(`db:${updateError.message}`);
+          }
+          if (!updated) {
+            console.error("[complete] DB update affected 0 rows — RLS or version conflict");
+            throw new Error("zero_rows");
+          }
+          console.log("[complete] Signature saved successfully", { partyId: draftRef.partyId, version: updated.version });
+        }
+
+        // Reload server state
         const summary = await loadIncidentSummary(draftRef);
         setParties(summary.parties);
         const ownPartyAfter = summary.parties.find((p) => p.id === draftRef.partyId);
-        if (!ownPartyAfter?.signedAt) {
-          console.error("[complete] Signature was not persisted server-side", { partyId: draftRef.partyId });
-          toast.error(t("signature.uploadError"));
-          setSaving(false);
-          return;
-        }
-        setDraftRef((current) => current ? { ...current, incidentVersion: summary.incidentVersion, partyVersion: ownPartyAfter.version } : current);
+        setDraftRef((current) => current ? { ...current, incidentVersion: summary.incidentVersion, partyVersion: ownPartyAfter?.version ?? current.partyVersion } : current);
         const allSigned = summary.parties.length > 0 && summary.parties.every((p) => p.signedAt);
         toast.success(allSigned ? t("signature.allSigned") : t("signature.saved"));
       } else {
+        // Offline or local draft — queue for later sync
+        await markDraftComplete(user.id, localDraftId);
+        await processOutbox();
         toast.success(t("signature.savedOffline"));
       }
       setSignedJustNow(true);
@@ -681,6 +715,8 @@ export default function Index() {
             <p className="text-xs leading-relaxed text-slate-500">{t("summary.disclaimer")}</p>
           </div>}
 
+          {step === 5 && draftRef && !draftRef.incidentId.startsWith("local:") && <CaseDiagnostics incidentId={draftRef.incidentId} />}
+
         </div>
       </>}</main>
       <div className="fixed inset-x-0 bottom-0 z-20 border-t border-slate-200 bg-white/95 px-5 py-4 backdrop-blur"><div className="mx-auto flex max-w-3xl gap-3">
@@ -814,4 +850,62 @@ function CounterpartSummary({ party, loading }: { party?: IncidentPartySummary; 
   const { t } = useTranslation();
   const circumstances = t("circumstances.items", { returnObjects: true }) as string[];
   return <section className="rounded-2xl border-2 border-[#C9D9E5] bg-[#F7FAFC] p-5"><div className="mb-4 flex items-center justify-between gap-3"><div><p className="text-xs font-bold uppercase tracking-wider text-[#39719D]">{t("summary.counterpartEyebrow")}</p><h2 className="mt-1 text-lg font-bold text-[#153B66]">{t("summary.counterpartTitle", { label: party?.partyLabel ?? "–" })}</h2></div><span className="rounded-full bg-white px-3 py-1 text-xs font-semibold text-slate-500">{t("summary.readOnly")}</span></div>{loading ? <p className="text-sm text-slate-500">{t("auth.loading")}</p> : !party ? <p className="rounded-xl bg-white p-4 text-sm leading-relaxed text-slate-600">{t("summary.waitingForParty")}</p> : <div className="grid gap-3 sm:grid-cols-2"><Summary number="9" icon={<UserRound />} label={t("fields.driver")} value={party.driver.fullName || t("fields.notProvided")} /><Summary number="7" icon={<Car />} label={t("fields.vehicle")} value={`${party.vehicle.plate || t("fields.noPlate")}${party.vehicle.makeModel ? ` · ${party.vehicle.makeModel}` : ""}`} /><Summary number="8" icon={<ShieldCheck />} label={t("fields.insurer")} value={`${party.insurance.company || t("fields.notProvided")}${party.insurance.policyNumber ? ` · ${party.insurance.policyNumber}` : ""}`} /><Summary number="11" icon={<FileText />} label={t("fields.visibleDamage")} value={party.damageDescription || t("fields.notProvided")} /><div className="rounded-2xl bg-white p-4 sm:col-span-2"><p className="text-xs font-semibold uppercase tracking-wide text-slate-500">{t("summary.circumstances")}</p><p className="mt-2 text-sm leading-relaxed text-slate-700">{party.circumstancesChecked.length ? party.circumstancesChecked.map((index) => circumstances[index]).filter(Boolean).join(" · ") : t("summary.noneSelected")}</p></div></div>}</section>;
+}
+
+function CaseDiagnostics({ incidentId }: { incidentId: string }) {
+  const { t } = useTranslation();
+  const [open, setOpen] = useState(false);
+  const [data, setData] = useState<{ status: string; parties: { party_label: string; has_profile: boolean; signed_at: string | null; signature_storage_path: string | null; version: number }[] } | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const [incidentRes, partiesRes] = await Promise.all([
+        supabase.from("incidents").select("id, status").eq("id", incidentId).maybeSingle(),
+        supabase.from("incident_parties").select("party_label, profile_id, signed_at, signature_storage_path, version").eq("incident_id", incidentId).order("party_label"),
+      ]);
+      if (incidentRes.data && partiesRes.data) {
+        setData({
+          status: incidentRes.data.status,
+          parties: partiesRes.data.map((p) => ({
+            party_label: p.party_label,
+            has_profile: Boolean(p.profile_id),
+            signed_at: p.signed_at,
+            signature_storage_path: p.signature_storage_path,
+            version: p.version,
+          })),
+        });
+      }
+    } catch { /* ignore */ } finally { setLoading(false); }
+  };
+
+  return (
+    <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50">
+      <button onClick={() => { setOpen(!open); if (!open && !data) void load(); }} className="flex w-full items-center justify-between p-3 text-left">
+        <span className="text-xs font-semibold text-slate-600">{t("diagnostics.title")}</span>
+        <ChevronRight className={`h-4 w-4 text-slate-400 transition ${open ? "rotate-90" : ""}`} />
+      </button>
+      {open && (
+        <div className="border-t border-slate-200 p-3">
+          {loading && <p className="text-xs text-slate-500">{t("diagnostics.loading")}</p>}
+          {!loading && data && (
+            <div className="space-y-1 text-xs">
+              <p className="font-mono text-slate-600">incident_id: <span className="text-slate-900">{incidentId}</span></p>
+              <p className="font-mono text-slate-600">status: <span className={`font-bold ${data.status === "signed" ? "text-emerald-600" : data.status === "submitted" ? "text-blue-600" : "text-amber-600"}`}>{data.status}</span></p>
+              <div className="mt-2">
+                <p className="font-semibold text-slate-500 uppercase">Parties</p>
+                {data.parties.map((p, i) => (
+                  <div key={i} className="mt-1 rounded-lg bg-white p-2 font-mono">
+                    <p>Partei {p.party_label}: profile={p.has_profile ? "✓" : "✗"} signed={p.signed_at ? `✓ ${new Date(p.signed_at).toLocaleString()}` : "✗"} path={p.signature_storage_path ?? "null"} v={p.version}</p>
+                  </div>
+                ))}
+              </div>
+              <Button variant="ghost" size="sm" onClick={() => void load()} className="mt-2 h-7 text-xs text-[#39719D]">{t("diagnostics.refresh")}</Button>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
 }
