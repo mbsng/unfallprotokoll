@@ -134,6 +134,7 @@ export default function Index() {
   const [casesLoading, setCasesLoading] = useState(false);
   const [casesError, setCasesError] = useState(false);
   const [ensuringServerCase, setEnsuringServerCase] = useState(false);
+  const [caseLoading, setCaseLoading] = useState(false);
   const [locating, setLocating] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<CaseItem | null>(null);
   const [withdrawOpen, setWithdrawOpen] = useState(false);
@@ -393,12 +394,19 @@ export default function Index() {
     }
   };
 
-  const openCase = async (item: CaseItem, targetStep: number) => {
+  const openCase = async (item: CaseItem, requestedStep?: number) => {
     if (item.incidentId.startsWith("local:")) {
       const draft = localDrafts?.find((d) => d.id === item.id);
-      if (draft) { applyLocalDraft(draft); setStep(0); setSignedJustNow(false); setView("wizard"); window.scrollTo(0, 0); }
+      if (draft) {
+        applyLocalDraft(draft);
+        setStep(requestedStep ?? 0);
+        setSignedJustNow(false);
+        setView("wizard");
+        window.scrollTo(0, 0);
+      }
       return;
     }
+    setCaseLoading(true);
     try {
       const ref: IncidentDraftRef = {
         incidentId: item.incidentId, partyId: item.partyId, partyLabel: item.partyLabel,
@@ -419,12 +427,16 @@ export default function Index() {
       }
       applyLocalDraft(draft);
       setParties(summary.parties);
-      setStep(targetStep);
+      // Determine entry step: use requested step, or find first incomplete step
+      const entryStep = requestedStep ?? (ownParty.signedAt ? 5 : 0);
+      setStep(entryStep);
       setSignedJustNow(false);
       setView("wizard");
       window.scrollTo(0, 0);
     } catch {
       toast.error(t("incident.saveError"));
+    } finally {
+      setCaseLoading(false);
     }
   };
 
@@ -581,10 +593,9 @@ export default function Index() {
             <div className="mb-4 flex items-center justify-between"><h2 className="text-xl font-bold text-[#102F52]">{t("home.recent")}</h2></div>
             <div className="space-y-3">
               {allCases.map((item) => {
-                const targetStep = item.caseStatus === "draft" ? 0 : item.caseStatus === "action_needed" ? 5 : 5;
                 return (
                   <div key={item.id} className="flex items-center gap-2 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm transition hover:shadow-md">
-                    <button onClick={() => void openCase(item, targetStep)} className="flex min-w-0 flex-1 items-center gap-4 text-left active:scale-[0.99]">
+                    <button onClick={() => void openCase(item)} className="flex min-w-0 flex-1 items-center gap-4 text-left active:scale-[0.99]">
                       <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-[#EDF3F7] text-[#153B66]"><FileText className="h-6 w-6" /></div>
                       <div className="min-w-0 flex-1">
                         <div className="flex items-center gap-2"><h3 className="truncate font-bold text-[#153B66]">{item.location || t("fields.notProvided")}</h3>
@@ -632,7 +643,8 @@ export default function Index() {
   return (
     <div className="min-h-screen bg-[#F5F7FA] pb-28 text-slate-900">
       <header className="sticky top-0 z-20 border-b border-slate-200 bg-white/95 backdrop-blur"><div className="mx-auto max-w-3xl px-4 py-3"><div className="flex items-center justify-between gap-2"><Button variant="ghost" size="icon" onClick={back} className="h-11 w-11 shrink-0 rounded-xl" aria-label={t("app.back")}><ArrowLeft className="h-6 w-6 text-[#153B66]" /></Button><div className="min-w-0 text-center"><p className="text-xs font-semibold uppercase tracking-wider text-slate-500">{t("wizard.stepOf", { current: formatNumber(step + 1), total: formatNumber(6) })}</p><p className="truncate font-bold text-[#153B66]">{steps[step]}</p></div><div className="flex items-center gap-1"><Button variant="ghost" size="icon" onClick={() => void refreshFromServer()} disabled={summaryLoading} className="h-9 w-9 rounded-lg" aria-label={t("home.refresh")}><RefreshCw className={`h-4 w-4 text-[#153B66] ${summaryLoading ? "animate-spin" : ""}`} /></Button><LanguageSwitcher /></div></div><div className="mt-3 flex items-center gap-3"><Progress value={((step + 1) / 6) * 100} className="h-1.5 flex-1 bg-slate-200 [&>div]:bg-[#39719D]" /><ConnectionStatusBadge status={realtimeStatus} /></div><div className="mt-2 flex gap-1 overflow-x-auto pb-1">{steps.map((label, index) => <button key={index} onClick={() => setStep(index)} className={`shrink-0 rounded-full px-2.5 py-1 text-[10px] font-semibold transition ${index === step ? "bg-[#153B66] text-white" : index < step ? "bg-[#E7F0F6] text-[#153B66]" : "bg-slate-100 text-slate-400"}`}>{index + 1}</button>)}</div></div></header>
-      <main className="mx-auto max-w-3xl px-5 py-7"><div className="mb-7"><div className="mb-2 flex flex-wrap items-center gap-2"><p className="text-sm font-semibold text-[#39719D]">{formatNumber(step + 1).padStart(2, "0")} — {steps[step]}</p>{draftRef && <span className="rounded-full bg-[#E7F0F6] px-2.5 py-1 font-mono text-xs font-bold tracking-wider text-[#153B66]">{t("incident.shareCode")}: {draftRef.shareCode}</span>}</div><h1 className="text-2xl font-bold tracking-tight text-[#102F52]">{titles[step]}</h1><p className="mt-2 text-sm leading-relaxed text-slate-500">{descriptions[step]}</p></div>
+      <main className="mx-auto max-w-3xl px-5 py-7">{caseLoading ? <div className="flex min-h-64 items-center justify-center"><RefreshCw className="h-7 w-7 animate-spin text-[#39719D]" /></div> : <>
+      <div className="mb-7"><div className="mb-2 flex flex-wrap items-center gap-2"><p className="text-sm font-semibold text-[#39719D]">{formatNumber(step + 1).padStart(2, "0")} — {steps[step]}</p>{draftRef && <span className="rounded-full bg-[#E7F0F6] px-2.5 py-1 font-mono text-xs font-bold tracking-wider text-[#153B66]">{t("incident.shareCode")}: {draftRef.shareCode}</span>}</div><h1 className="text-2xl font-bold tracking-tight text-[#102F52]">{titles[step]}</h1><p className="mt-2 text-sm leading-relaxed text-slate-500">{descriptions[step]}</p></div>
 
         {(!user || isAnonymous) && <div className="mb-5 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-amber-950"><div className="flex gap-3"><AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-700" /><div><p className="font-semibold">{t("guest.notice")}</p><p className="mt-1 text-sm leading-relaxed text-amber-800">{t("guest.detail")}</p><Button asChild variant="link" className="mt-1 h-auto p-0 font-semibold text-amber-900"><Link to="/auth">{t("guest.createAccount")}</Link></Button></div></div></div>}
         <div className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm md:p-7">
@@ -670,7 +682,7 @@ export default function Index() {
           </div>}
 
         </div>
-      </main>
+      </>}</main>
       <div className="fixed inset-x-0 bottom-0 z-20 border-t border-slate-200 bg-white/95 px-5 py-4 backdrop-blur"><div className="mx-auto flex max-w-3xl gap-3">
         {step < 5
           ? <><Button variant="outline" onClick={back} disabled={saving} className="h-14 w-14 shrink-0 rounded-2xl border-slate-300" aria-label={t("app.back")}><ArrowLeft className="h-5 w-5" /></Button><Button onClick={() => void next()} disabled={saving} className="h-14 flex-1 rounded-2xl bg-[#153B66] text-base font-semibold hover:bg-[#102F52]">{saving ? t("incident.saving") : t("wizard.next", { step: steps[step + 1] })}<ArrowRight className="ml-2 h-5 w-5" /></Button></>
