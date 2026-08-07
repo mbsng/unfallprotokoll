@@ -3,7 +3,7 @@ import { useLiveQuery } from "dexie-react-hooks";
 import { useTranslation } from "react-i18next";
 
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import { AlertTriangle, ArrowLeft, ArrowRight, Camera, Car, Check, CheckCircle2, ChevronRight, Clock3, Download, FileText, LocateFixed, Mail, MapPin, PenLine, Plus, QrCode, Radio, RefreshCw, RotateCcw, Send, ShieldCheck, Trash2, UserRound } from "lucide-react";
+import { AlertTriangle, ArrowLeft, ArrowRight, Camera, Car, Check, CheckCircle2, ChevronRight, Clock3, Download, FileText, LocateFixed, Mail, MapPin, PenLine, Plus, QrCode, Radio, RefreshCw, RotateCcw, Send, ShieldCheck, Trash2, UserRound, WifiOff } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -511,67 +511,83 @@ export default function Index() {
     if (!ownRequiredFieldsComplete) return;
     if (!data.hasSignature || !data.signatureDataUrl) return toast.error(t("validation.signatureRequired"));
     if (!user || !draftRef || !localDraftId || saving) return;
+    if (!navigator.onLine || draftRef.incidentId.startsWith("local:")) {
+      toast.error(t("signature.onlineRequired"));
+      return;
+    }
     setSaving(true);
     try {
-      if (navigator.onLine && !draftRef.incidentId.startsWith("local:")) {
-        // Direct server upload — bypass outbox to avoid being blocked by other entries
-        const blob = await (await fetch(data.signatureDataUrl)).blob();
-        const storagePath = `${draftRef.incidentId}/${draftRef.partyId}/signature.png`;
-        const { error: uploadError } = await supabase.storage.from("incident-media").upload(storagePath, blob, { upsert: true, contentType: "image/png" });
-        if (uploadError) {
-          console.error("[complete] Signature storage upload failed", { error: uploadError.message });
-          throw new Error(`upload:${uploadError.message}`);
-        }
+      const partyId = draftRef.partyId;
+      const incidentId = draftRef.incidentId;
+      console.log("[complete] Starting direct signature save", { partyId, incidentId });
 
-        // Fetch current version to avoid stale version conflict
-        const { data: currentParty, error: fetchError } = await supabase.from("incident_parties")
-          .select("version, signed_at")
-          .eq("id", draftRef.partyId)
-          .maybeSingle();
-        if (fetchError || !currentParty) {
-          console.error("[complete] Failed to fetch party", { error: fetchError?.message });
-          throw new Error("fetch_failed");
-        }
-        if (currentParty.signed_at) {
-          console.log("[complete] Already signed, skipping");
-        } else {
-          const signedAt = new Date().toISOString();
-          const { data: updated, error: updateError } = await supabase.from("incident_parties")
-            .update({ signature_storage_path: storagePath, signed_at: signedAt, version: currentParty.version + 1, updated_at: signedAt })
-            .eq("id", draftRef.partyId)
-            .eq("version", currentParty.version)
-            .select("version, signed_at")
-            .maybeSingle();
-          if (updateError) {
-            console.error("[complete] DB update error", { error: updateError.message, code: updateError.code });
-            throw new Error(`db:${updateError.message}`);
-          }
-          if (!updated) {
-            console.error("[complete] DB update affected 0 rows — RLS or version conflict");
-            throw new Error("zero_rows");
-          }
-          console.log("[complete] Signature saved successfully", { partyId: draftRef.partyId, version: updated.version });
-        }
+      // Step a: Canvas as PNG-Blob
+      const blob = await (await fetch(data.signatureDataUrl)).blob();
+      console.log("[complete] Step a: Blob created", { size: blob.size, type: blob.type });
 
-        // Reload server state
-        const summary = await loadIncidentSummary(draftRef);
-        setParties(summary.parties);
-        const ownPartyAfter = summary.parties.find((p) => p.id === draftRef.partyId);
-        setDraftRef((current) => current ? { ...current, incidentVersion: summary.incidentVersion, partyVersion: ownPartyAfter?.version ?? current.partyVersion } : current);
-        const allSigned = summary.parties.length > 0 && summary.parties.every((p) => p.signedAt);
-        toast.success(allSigned ? t("signature.allSigned") : t("signature.saved"));
-      } else {
-        // Offline or local draft — queue for later sync
-        await markDraftComplete(user.id, localDraftId);
-        await processOutbox();
-        toast.success(t("signature.savedOffline"));
+      // Step b: Upload to Storage
+      const storagePath = `${incidentId}/${partyId}/signature.png`;
+      const { error: uploadError } = await supabase.storage.from("incident-media").upload(storagePath, blob, { upsert: true, contentType: "image/png" });
+      if (uploadError) {
+        console.error("[complete] Step b FAILED: Storage upload", { storagePath, error: uploadError.message });
+        throw new Error(`upload:${uploadError.message}`);
       }
+      console.log("[complete] Step b: Storage upload succeeded", { storagePath });
+
+      // Step c-d: Update incident_parties WITHOUT version check (RLS protects ownership)
+      const signedAt = new Date().toISOString();
+      console.log("[complete] Step c: Updating DB", { partyId, storagePath, signedAt });
+
+      const { data: updated, error: updateError } = await supabase.from("incident_parties")
+        .update({ signature_storage_path: storagePath, signed_at: signedAt, updated_at: signedAt })
+        .eq("id", partyId)
+        .select("id, version, signed_at, signature_storage_path");
+
+      if (updateError) {
+        console.error("[complete] Step c FAILED: DB update error", { partyId, error: updateError.message, code: updateError.code });
+        throw new Error(`db:${updateError.message}`);
+      }
+      console.log("[complete] Step c: DB update returned", { rowCount: updated?.length, data: updated });
+
+      // Step e: Verify exactly one row returned
+      if (!updated || updated.length === 0) {
+        console.error("[complete] Step e FAILED: 0 rows affected — RLS blocked the update", { partyId });
+        throw new Error("zero_rows_rls_blocked");
+      }
+
+      const updatedRow = updated[0];
+      console.log("[complete] Step e: Verified — signature saved", { partyId, version: updatedRow.version, signedAt: updatedRow.signed_at, path: updatedRow.signature_storage_path });
+
+      // Step f: Update local Dexie copy
+      if (localDraftId) {
+        const draft = await db.drafts.get(localDraftId);
+        if (draft) {
+          draft.ref = { ...draft.ref, partyVersion: updatedRow.version };
+          draft.data.hasSignature = true;
+          await db.drafts.put(draft);
+        }
+      }
+
+      // Step g: Reload from server
+      const summary = await loadIncidentSummary(draftRef);
+      setParties(summary.parties);
+      const ownPartyAfter = summary.parties.find((p) => p.id === partyId);
+      setDraftRef((current) => current ? { ...current, incidentVersion: summary.incidentVersion, partyVersion: ownPartyAfter?.version ?? current.partyVersion } : current);
+      const allSigned = summary.parties.length > 0 && summary.parties.every((p) => p.signedAt);
+      console.log("[complete] Step g: Server reload complete", { allSigned, status: summary.status, parties: summary.parties.map(p => ({ label: p.partyLabel, signedAt: p.signedAt })) });
+
+      toast.success(allSigned ? t("signature.allSigned") : t("signature.saved"));
       setSignedJustNow(true);
       setView("signed");
       window.scrollTo(0, 0);
     } catch (error) {
-      console.error("[complete] Signature save failed", { error: error instanceof Error ? error.message : String(error) });
-      toast.error(t("signature.uploadError"));
+      const msg = error instanceof Error ? error.message : String(error);
+      console.error("[complete] Signature save FAILED", { error: msg });
+      if (msg.includes("zero_rows")) {
+        toast.error(t("signature.rlsBlocked"));
+      } else {
+        toast.error(t("signature.uploadError"));
+      }
     } finally {
       setSaving(false);
     }
@@ -710,7 +726,9 @@ export default function Index() {
                 </div>
               : !ownRequiredFieldsComplete
                 ? <div className="rounded-2xl border-2 border-dashed border-amber-300 bg-amber-50 p-5"><p className="text-sm font-semibold text-amber-900">{t("signature.missingFieldsTitle")}</p><div className="mt-3 flex flex-wrap gap-2">{missingRequiredFields.map((field) => <button key={field.key} onClick={() => setStep(field.step)} className="rounded-lg bg-amber-100 px-3 py-1.5 text-xs font-semibold text-amber-900 transition hover:bg-amber-200">{t(field.key)}</button>)}</div></div>
-                : <DrawingCanvas label={t("fields.signature")} height={170} confirmable onChange={(value, dataUrl) => { update("hasSignature", value); update("signatureDataUrl", dataUrl ?? ""); }} />}
+                : !navigator.onLine || draftRef?.incidentId.startsWith("local:")
+                  ? <div className="rounded-2xl border-2 border-dashed border-slate-300 bg-slate-50 p-5 text-center"><WifiOff className="mx-auto h-8 w-8 text-slate-400" /><p className="mt-2 text-sm font-semibold text-slate-600">{t("signature.onlineRequired")}</p></div>
+                  : <DrawingCanvas label={t("fields.signature")} height={170} confirmable onChange={(value, dataUrl) => { update("hasSignature", value); update("signatureDataUrl", dataUrl ?? ""); }} />}
             {alreadySigned && draftRef && !draftRef.incidentId.startsWith("local:") && <SubmissionPanel incidentId={draftRef.incidentId} />}
             <p className="text-xs leading-relaxed text-slate-500">{t("summary.disclaimer")}</p>
           </div>}

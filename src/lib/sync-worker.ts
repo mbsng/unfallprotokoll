@@ -368,7 +368,12 @@ async function processEntry(entry: OutboxEntry) {
     if (entry.operation === "create") return await createRemoteDraft(draft, entry);
     if (entry.table === "incident_media") return await syncMedia(draft, entry);
     if (entry.table === "incident_witnesses") return await replaceWitness(draft, entry);
-    if (entry.operation === "complete") return await completeDraft(draft, entry);
+    // Signatures are now handled directly by the UI, not through the outbox
+    if (entry.operation === "complete") {
+      console.log("[sync-worker] Removing stale 'complete' outbox entry — signatures are now direct");
+      await db.outbox.delete(entry.id);
+      return;
+    }
     return await writeVersioned(draft, entry);
   } finally {
     processingEntries.delete(entry.id);
