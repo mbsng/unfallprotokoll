@@ -23,6 +23,7 @@ export interface IncidentPartySummary {
   damageDescription: string | null;
   circumstancesChecked: number[];
   signedAt: string | null;
+  sketchConfirmedAt: string | null;
 }
 
 export interface JoinedIncidentState {
@@ -35,6 +36,9 @@ export interface IncidentSummaryData {
   status: string;
   occurredAt: string | null;
   locationText: string | null;
+  sketchDataUrl: string | null;
+  sketchUpdatedBy: string | null;
+  sketchUpdatedAt: string | null;
   parties: IncidentPartySummary[];
 }
 

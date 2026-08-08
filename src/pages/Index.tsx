@@ -300,6 +300,40 @@ export default function Index() {
     }
   };
 
+  const saveSketch = async (dataUrl: string) => {
+    if (!draftRef || draftRef.incidentId.startsWith("local:") || !user) {
+      update("hasSketch", true);
+      update("sketchDataUrl", dataUrl);
+      return;
+    }
+    try {
+      const { error } = await supabase.from("incidents")
+        .update({ sketch_data_url: dataUrl, sketch_updated_by: user.id, sketch_updated_at: new Date().toISOString() })
+        .eq("id", draftRef.incidentId);
+      if (error) throw error;
+      update("hasSketch", true);
+      update("sketchDataUrl", dataUrl);
+      await refreshFromServer();
+    } catch {
+      update("hasSketch", true);
+      update("sketchDataUrl", dataUrl);
+    }
+  };
+
+  const confirmSketch = async () => {
+    if (!draftRef || !user || draftRef.incidentId.startsWith("local:")) return;
+    try {
+      const { error } = await supabase.from("incident_parties")
+        .update({ sketch_confirmed_at: new Date().toISOString() })
+        .eq("id", draftRef.partyId);
+      if (error) throw error;
+      await refreshFromServer();
+      toast.success(t("sketch.confirmed"));
+    } catch {
+      toast.error(t("incident.saveError"));
+    }
+  };
+
   const refreshFromServer = async () => {
     if (!draftRef || draftRef.incidentId.startsWith("local:")) return;
     setSummaryLoading(true);
@@ -705,7 +739,25 @@ export default function Index() {
           {step === 2 && <div className="space-y-3"><FieldBadge number="12" />{circumstances.map((circumstance, index) => { const selected = data.situations.includes(index); return <label key={index} className={`flex min-h-16 cursor-pointer items-center gap-4 rounded-2xl border-2 p-4 ${selected ? "border-[#39719D] bg-[#EDF4F8]" : "border-slate-200"}`}><Checkbox checked={selected} onCheckedChange={() => update("situations", selected ? data.situations.filter((value) => value !== index) : [...data.situations, index])} className="h-6 w-6 rounded-md data-[state=checked]:border-[#153B66] data-[state=checked]:bg-[#153B66]" /><span className="flex-1 text-sm font-medium leading-snug text-slate-700"><span className="mr-2 text-xs font-bold text-[#39719D]">{formatNumber(index + 1)}.</span>{circumstance}</span></label>; })}<p className="pt-3 text-center text-sm font-medium text-slate-500">{t("circumstances.selected", { count: data.situations.length, formattedCount: formatNumber(data.situations.length) })}</p></div>}
           {step === 3 && <div className="space-y-6"><Field number="11" label={t("fields.visibleDamage")}><Textarea value={data.damage} onChange={(event) => update("damage", event.target.value)} placeholder={t("fields.damagePlaceholder")} className="min-h-28 rounded-xl text-base" /></Field><Field number="14" label={t("fields.remarks")}><Textarea value={data.notes} onChange={(event) => update("notes", event.target.value)} placeholder={t("fields.remarksPlaceholder")} className="min-h-24 rounded-xl text-base" /></Field><Field number="11" label={t("fields.photos")}><button type="button" onClick={() => void takePhoto()} className="flex min-h-32 w-full cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed border-[#9FBACD] bg-[#F7FAFC] p-5 text-center"><Camera className="mb-2 h-8 w-8 text-[#39719D]" /><span className="font-semibold text-[#153B66]">{t("fields.photoAction")}</span><span className="mt-1 text-xs text-slate-500">{t("fields.photoHint")}</span></button><input ref={photoInputRef} type="file" accept="image/*" capture="environment" multiple className="sr-only" onChange={(event) => { addPhotos(event.target.files); event.target.value = ""; }} /></Field>{data.photos.length > 0 && <div className="grid grid-cols-3 gap-3">{data.photos.map((photo, index) => <div key={photo.id} className="relative aspect-square overflow-hidden rounded-xl bg-slate-100"><img src={photo.url} alt={t("fields.photoAlt", { number: formatNumber(index + 1) })} className="h-full w-full object-cover" /><button type="button" onClick={() => void removePhoto(photo)} className="absolute right-1 top-1 flex h-8 w-8 items-center justify-center rounded-full bg-slate-900/75 text-white" aria-label={t("fields.deletePhoto")}><Trash2 className="h-4 w-4" /></button></div>)}</div>}</div>}
 
-          {step === 4 && <div className="space-y-5"><div><FieldBadge number="10" /><p className="text-sm font-semibold text-slate-700">{t("fields.initialImpact")}</p></div><FieldBadge number="13" /><div className="rounded-xl bg-[#EDF4F8] p-4 text-sm leading-relaxed text-[#153B66]"><strong>{t("sketch.tipTitle")}</strong> {t("sketch.tip")}</div><DrawingCanvas label={t("fields.sketch")} height={320} initialDataUrl={data.sketchDataUrl} onChange={(value, dataUrl) => { update("hasSketch", value); update("sketchDataUrl", dataUrl ?? ""); }} /><div className="flex flex-wrap gap-3 text-xs text-slate-500"><span className="rounded-full bg-slate-100 px-3 py-1.5">{t("sketch.myVehicle")}</span><span className="rounded-full bg-slate-100 px-3 py-1.5">{t("sketch.otherVehicle")}</span><span className="rounded-full bg-slate-100 px-3 py-1.5">{t("sketch.impact")}</span></div></div>}
+          {step === 4 && <div className="space-y-5">
+            <div><FieldBadge number="10" /><p className="text-sm font-semibold text-slate-700">{t("fields.initialImpact")}</p></div>
+            <FieldBadge number="13" />
+            <div className="rounded-xl bg-[#EDF4F8] p-4 text-sm leading-relaxed text-[#153B66]"><strong>{t("sketch.tipTitle")}</strong> {t("sketch.tip")}</div>
+            {draftRef && !draftRef.incidentId.startsWith("local:") && ownParty?.sketchConfirmedAt && counterpart && !counterpart.sketchConfirmedAt && (
+              <div className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900"><AlertTriangle className="mr-1 inline h-4 w-4" />{t("sketch.counterpartMustConfirm")}</div>
+            )}
+            <DrawingCanvas label={t("fields.sketch")} height={320} initialDataUrl={data.sketchDataUrl} onChange={(value, dataUrl) => { if (value && dataUrl) void saveSketch(dataUrl); else { update("hasSketch", value); update("sketchDataUrl", dataUrl ?? ""); } }} />
+            <div className="flex flex-wrap gap-3 text-xs text-slate-500"><span className="rounded-full bg-slate-100 px-3 py-1.5">{t("sketch.myVehicle")}</span><span className="rounded-full bg-slate-100 px-3 py-1.5">{t("sketch.otherVehicle")}</span><span className="rounded-full bg-slate-100 px-3 py-1.5">{t("sketch.impact")}</span></div>
+            {draftRef && !draftRef.incidentId.startsWith("local:") && data.hasSketch && (
+              <div className="flex items-center justify-between rounded-xl border border-slate-200 p-3">
+                <div className="text-sm">
+                  <p className="font-semibold text-slate-700">{ownParty?.sketchConfirmedAt ? `✓ ${t("sketch.confirmedByYou")}` : t("sketch.confirmPrompt")}</p>
+                  {counterpart && <p className="text-xs text-slate-500">{counterpart.sketchConfirmedAt ? `✓ ${t("sketch.confirmedByCounterpart")}` : t("sketch.counterpartNotConfirmed")}</p>}
+                </div>
+                {!ownParty?.sketchConfirmedAt && <Button type="button" size="sm" onClick={() => void confirmSketch()} className="rounded-lg bg-[#153B66]"><Check className="mr-1 h-4 w-4" />{t("sketch.confirm")}</Button>}
+              </div>
+            )}
+          </div>}
           {step === 5 && <div className="space-y-6">
             {draftRef?.partyLabel === "A" && !alreadySigned && (draftRef.incidentId.startsWith("local:")
               ? (ensuringServerCase

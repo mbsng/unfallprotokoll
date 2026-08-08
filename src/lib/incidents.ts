@@ -74,8 +74,8 @@ export async function joinIncident(code: string): Promise<JoinedIncidentState> {
 
 export async function loadIncidentSummary(ref: IncidentDraftRef): Promise<IncidentSummaryData> {
   const [incidentResult, partiesResult] = await Promise.all([
-    supabase.from("incidents").select("version, status, occurred_at, location_text").eq("id", ref.incidentId).single(),
-    supabase.from("incident_parties").select("id, party_label, version, driver_json, vehicle_json, insurance_json, damage_description, circumstances_checked, signed_at").eq("incident_id", ref.incidentId).order("party_label"),
+    supabase.from("incidents").select("version, status, occurred_at, location_text, sketch_data_url, sketch_updated_by, sketch_updated_at").eq("id", ref.incidentId).single(),
+    supabase.from("incident_parties").select("id, party_label, version, driver_json, vehicle_json, insurance_json, damage_description, circumstances_checked, signed_at, sketch_confirmed_at").eq("incident_id", ref.incidentId).order("party_label"),
   ]);
   if (incidentResult.error || partiesResult.error) throw new IncidentSaveError("save");
   return {
@@ -83,6 +83,9 @@ export async function loadIncidentSummary(ref: IncidentDraftRef): Promise<Incide
     status: incidentResult.data.status,
     occurredAt: incidentResult.data.occurred_at,
     locationText: incidentResult.data.location_text,
+    sketchDataUrl: incidentResult.data.sketch_data_url,
+    sketchUpdatedBy: incidentResult.data.sketch_updated_by,
+    sketchUpdatedAt: incidentResult.data.sketch_updated_at,
     parties: partiesResult.data.map((party) => ({
       id: party.id,
       partyLabel: party.party_label as "A" | "B",
@@ -93,6 +96,7 @@ export async function loadIncidentSummary(ref: IncidentDraftRef): Promise<Incide
       damageDescription: party.damage_description,
       circumstancesChecked: party.circumstances_checked,
       signedAt: party.signed_at,
+      sketchConfirmedAt: party.sketch_confirmed_at,
     })),
   };
 }
