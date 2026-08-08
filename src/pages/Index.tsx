@@ -21,7 +21,7 @@ import { useAuth } from "@/contexts/AuthContext";
 import { localeForLanguage } from "@/i18n";
 import { supabase } from "@/integrations/supabase/client";
 import { getPlanEntitlement } from "@/lib/billing";
-import { computeCaseStatus, loadIncidentSummary, loadUserIncidents, subscribeToIncident, subscribeToUserIncidents, type RealtimeConnectionStatus } from "@/lib/incidents";
+import { computeCaseStatus, loadIncidentSummary, loadUserIncidents, subscribeToIncident, subscribeToUserIncidents } from "@/lib/incidents";
 import { createLocalDraft, db, deleteLocalDraft, deleteLocalPhoto, getLatestDraft, markDraftComplete, saveDraftField, saveLocalPhoto, type LocalDraft } from "@/lib/local-db";
 import { captureAccidentPhoto, getCurrentCoordinates, isNativeApp } from "@/lib/native-device";
 import { processOutbox } from "@/lib/sync-worker";
@@ -124,7 +124,8 @@ export default function Index() {
 
   const [parties, setParties] = useState<IncidentPartySummary[]>([]);
   const [summaryLoading, setSummaryLoading] = useState(false);
-  const [realtimeStatus, setRealtimeStatus] = useState<RealtimeConnectionStatus>(navigator.onLine ? "connecting" : "offline");
+  const [serverOnline, setServerOnline] = useState(navigator.onLine);
+  const [liveUpdatesActive, setLiveUpdatesActive] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [signedJustNow, setSignedJustNow] = useState(false);
   const [creating, setCreating] = useState(false);
@@ -195,6 +196,25 @@ export default function Index() {
   }, [user?.id, joinedIncident?.draftRef.partyId]);
 
   useEffect(() => {
+    // Independent connectivity check — NOT tied to Realtime channel status
+    let active = true;
+    const check = async () => {
+      if (!navigator.onLine) { if (active) setServerOnline(false); return; }
+      try {
+        const { error } = await supabase.from("profiles").select("id", { count: "exact", head: true }).limit(1);
+        if (active) setServerOnline(!error);
+      } catch { if (active) setServerOnline(false); }
+    };
+    void check();
+    const interval = window.setInterval(check, 30_000);
+    const handleOnline = () => void check();
+    const handleOffline = () => { if (active) setServerOnline(false); };
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+    return () => { active = false; window.clearInterval(interval); window.removeEventListener("online", handleOnline); window.removeEventListener("offline", handleOffline); };
+  }, []);
+
+  useEffect(() => {
     const showUpgrade = () => navigate("/upgrade?reason=limit");
     window.addEventListener("plan-limit-reached", showUpgrade);
     return () => window.removeEventListener("plan-limit-reached", showUpgrade);
@@ -231,7 +251,7 @@ export default function Index() {
 
     void refreshIncident();
     const unsubscribe = subscribeToIncident(draftRef.incidentId, () => void refreshIncident(), (status) => {
-      if (active) setRealtimeStatus(status);
+      if (active) setLiveUpdatesActive(status === "connected");
     });
     return () => { active = false; unsubscribe(); };
   }, [view, draftRef?.incidentId]);
@@ -276,16 +296,22 @@ export default function Index() {
 
   useEffect(() => {
     if (step !== 5 || !draftRef || !draftRef.incidentId.startsWith("local:") || !user || !localDraftId || ensuringServerCase) return;
-    if (!navigator.onLine) return;
+    if (!serverOnline) return;
     let active = true;
     setEnsuringServerCase(true);
+    const timeout = window.setTimeout(() => {
+      if (active && ensuringServerCase) {
+        console.warn("[step5] Server case sync timed out after 15s");
+        setEnsuringServerCase(false);
+      }
+    }, 15_000);
     void processOutbox().then(() => {
-      if (active) setEnsuringServerCase(false);
+      if (active) { window.clearTimeout(timeout); setEnsuringServerCase(false); }
     }).catch(() => {
-      if (active) setEnsuringServerCase(false);
+      if (active) { window.clearTimeout(timeout); setEnsuringServerCase(false); }
     });
-    return () => { active = false; };
-  }, [step, draftRef?.incidentId, user?.id, localDraftId, ensuringServerCase]);
+    return () => { active = false; window.clearTimeout(timeout); };
+  }, [step, draftRef?.incidentId, user?.id, localDraftId, ensuringServerCase, serverOnline]);
 
   const retrySync = async () => {
     if (!navigator.onLine || !user) return;
@@ -415,7 +441,7 @@ export default function Index() {
       const created = await createLocalDraft(ownerId, initial);
       applyLocalDraft(created);
       setParties([]);
-      setRealtimeStatus(navigator.onLine ? "connecting" : "offline");
+      setLiveUpdatesActive(false);
       setDirty(false);
       setSignedJustNow(false);
       setStep(0);
@@ -545,7 +571,7 @@ export default function Index() {
     if (!ownRequiredFieldsComplete) return;
     if (!data.hasSignature || !data.signatureDataUrl) return toast.error(t("validation.signatureRequired"));
     if (!user || !draftRef || !localDraftId || saving) return;
-    if (!navigator.onLine || draftRef.incidentId.startsWith("local:")) {
+    if (!serverOnline || draftRef.incidentId.startsWith("local:")) {
       toast.error(t("signature.onlineRequired"));
       return;
     }
@@ -726,7 +752,7 @@ export default function Index() {
 
   return (
     <div className="min-h-screen bg-[#F5F7FA] pb-28 text-slate-900">
-      <header className="sticky top-0 z-20 border-b border-slate-200 bg-white/95 backdrop-blur"><div className="mx-auto max-w-3xl px-4 py-3"><div className="flex items-center justify-between gap-2"><Button variant="ghost" size="icon" onClick={back} className="h-11 w-11 shrink-0 rounded-xl" aria-label={t("app.back")}><ArrowLeft className="h-6 w-6 text-[#153B66]" /></Button><div className="min-w-0 text-center"><p className="text-xs font-semibold uppercase tracking-wider text-slate-500">{t("wizard.stepOf", { current: formatNumber(step + 1), total: formatNumber(6) })}</p><p className="truncate font-bold text-[#153B66]">{steps[step]}</p></div><div className="flex items-center gap-1"><Button variant="ghost" size="icon" onClick={() => void refreshFromServer()} disabled={summaryLoading} className="h-9 w-9 rounded-lg" aria-label={t("home.refresh")}><RefreshCw className={`h-4 w-4 text-[#153B66] ${summaryLoading ? "animate-spin" : ""}`} /></Button><LanguageSwitcher /></div></div><div className="mt-3 flex items-center gap-3"><Progress value={((step + 1) / 6) * 100} className="h-1.5 flex-1 bg-slate-200 [&>div]:bg-[#39719D]" /><ConnectionStatusBadge status={realtimeStatus} /></div><div className="mt-2 flex gap-1 overflow-x-auto pb-1">{steps.map((label, index) => <button key={index} onClick={() => setStep(index)} className={`shrink-0 rounded-full px-2.5 py-1 text-[10px] font-semibold transition ${index === step ? "bg-[#153B66] text-white" : index < step ? "bg-[#E7F0F6] text-[#153B66]" : "bg-slate-100 text-slate-400"}`}>{index + 1}</button>)}</div></div></header>
+      <header className="sticky top-0 z-20 border-b border-slate-200 bg-white/95 backdrop-blur"><div className="mx-auto max-w-3xl px-4 py-3"><div className="flex items-center justify-between gap-2"><Button variant="ghost" size="icon" onClick={back} className="h-11 w-11 shrink-0 rounded-xl" aria-label={t("app.back")}><ArrowLeft className="h-6 w-6 text-[#153B66]" /></Button><div className="min-w-0 text-center"><p className="text-xs font-semibold uppercase tracking-wider text-slate-500">{t("wizard.stepOf", { current: formatNumber(step + 1), total: formatNumber(6) })}</p><p className="truncate font-bold text-[#153B66]">{steps[step]}</p></div><div className="flex items-center gap-1"><Button variant="ghost" size="icon" onClick={() => void refreshFromServer()} disabled={summaryLoading} className="h-9 w-9 rounded-lg" aria-label={t("home.refresh")}><RefreshCw className={`h-4 w-4 text-[#153B66] ${summaryLoading ? "animate-spin" : ""}`} /></Button><LanguageSwitcher /></div></div><div className="mt-3 flex items-center gap-3"><Progress value={((step + 1) / 6) * 100} className="h-1.5 flex-1 bg-slate-200 [&>div]:bg-[#39719D]" /><div className="flex items-center gap-2"><span className={`flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold ${serverOnline ? "bg-emerald-100 text-emerald-700" : "bg-slate-200 text-slate-600"}`}><span className={`h-1.5 w-1.5 rounded-full ${serverOnline ? "bg-emerald-500" : "bg-slate-400"}`} />{t(serverOnline ? "connection.online" : "connection.offline")}</span>{liveUpdatesActive && <span className="hidden items-center gap-0.5 rounded-full bg-blue-100 px-1.5 py-0.5 text-[10px] font-semibold text-blue-700 sm:flex"><Radio className="h-2.5 w-2.5 animate-pulse" />{t("connection.live")}</span>}</div></div><div className="mt-2 flex gap-1 overflow-x-auto pb-1">{steps.map((label, index) => <button key={index} onClick={() => setStep(index)} className={`shrink-0 rounded-full px-2.5 py-1 text-[10px] font-semibold transition ${index === step ? "bg-[#153B66] text-white" : index < step ? "bg-[#E7F0F6] text-[#153B66]" : "bg-slate-100 text-slate-400"}`}>{index + 1}</button>)}</div></div></header>
       <main className="mx-auto max-w-3xl px-5 py-7">{caseLoading ? <div className="flex min-h-64 items-center justify-center"><RefreshCw className="h-7 w-7 animate-spin text-[#39719D]" /></div> : <>
       <div className="mb-7"><div className="mb-2 flex flex-wrap items-center gap-2"><p className="text-sm font-semibold text-[#39719D]">{formatNumber(step + 1).padStart(2, "0")} — {steps[step]}</p>{draftRef && <span className="rounded-full bg-[#E7F0F6] px-2.5 py-1 font-mono text-xs font-bold tracking-wider text-[#153B66]">{t("incident.shareCode")}: {draftRef.shareCode}</span>}</div><h1 className="text-2xl font-bold tracking-tight text-[#102F52]">{titles[step]}</h1><p className="mt-2 text-sm leading-relaxed text-slate-500">{descriptions[step]}</p></div>
 
@@ -778,7 +804,7 @@ export default function Index() {
                 </div>
               : !ownRequiredFieldsComplete
                 ? <div className="rounded-2xl border-2 border-dashed border-amber-300 bg-amber-50 p-5"><p className="text-sm font-semibold text-amber-900">{t("signature.missingFieldsTitle")}</p><div className="mt-3 flex flex-wrap gap-2">{missingRequiredFields.map((field) => <button key={field.key} onClick={() => setStep(field.step)} className="rounded-lg bg-amber-100 px-3 py-1.5 text-xs font-semibold text-amber-900 transition hover:bg-amber-200">{t(field.key)}</button>)}</div></div>
-                : !navigator.onLine || draftRef?.incidentId.startsWith("local:")
+                : !serverOnline || draftRef?.incidentId.startsWith("local:")
                   ? <div className="rounded-2xl border-2 border-dashed border-slate-300 bg-slate-50 p-5 text-center"><WifiOff className="mx-auto h-8 w-8 text-slate-400" /><p className="mt-2 text-sm font-semibold text-slate-600">{t("signature.onlineRequired")}</p></div>
                   : <DrawingCanvas label={t("fields.signature")} height={170} confirmable onChange={(value, dataUrl) => { update("hasSignature", value); update("signatureDataUrl", dataUrl ?? ""); }} />}
             {alreadySigned && draftRef && !draftRef.incidentId.startsWith("local:") && <SubmissionPanel incidentId={draftRef.incidentId} />}
@@ -909,12 +935,6 @@ function SectionTitle({ number, icon, title }: { number: string; icon: React.Rea
 
 function Choice({ active, warning, onClick, children }: { active: boolean; warning?: boolean; onClick: () => void; children: React.ReactNode }) { return <button type="button" onClick={onClick} className={`h-14 rounded-xl border-2 text-base font-semibold ${active ? warning ? "border-amber-500 bg-amber-50 text-amber-900" : "border-[#153B66] bg-[#EDF3F7] text-[#153B66]" : "border-slate-200 text-slate-600"}`}>{children}</button>; }
 function Summary({ number, icon, label, value }: { number: string; icon: React.ReactNode; label: string; value: string }) { return <div className="flex gap-3 rounded-2xl bg-[#F6F8FA] p-4"><span className="mt-0.5 text-[#39719D] [&>svg]:h-5 [&>svg]:w-5">{icon}</span><div className="min-w-0"><FieldBadge number={number} /><p className="text-xs font-semibold uppercase tracking-wide text-slate-500">{label}</p><p className="mt-1 break-words text-sm font-semibold text-slate-800">{value}</p></div></div>; }
-
-function ConnectionStatusBadge({ status }: { status: RealtimeConnectionStatus }) {
-  const { t } = useTranslation();
-  const colors = status === "connected" ? "bg-emerald-100 text-emerald-800" : status === "connecting" ? "bg-blue-100 text-blue-800" : "bg-slate-200 text-slate-700";
-  return <div className={`flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-semibold ${colors}`}><Radio className={`h-3.5 w-3.5 ${status === "connected" ? "animate-pulse" : ""}`} /><span>{t(`realtime.${status}`)}</span></div>;
-}
 
 function CounterpartSummary({ party, loading }: { party?: IncidentPartySummary; loading: boolean }) {
   const { t } = useTranslation();
