@@ -8,8 +8,16 @@ let started = false;
 let activeOwnerId: string | null = null;
 const processingEntries = new Set<string>();
 const MAX_ATTEMPTS = 5;
+const CALL_TIMEOUT = 15_000;
 
 const sameValue = (left: unknown, right: unknown) => JSON.stringify(left) === JSON.stringify(right);
+
+function withTimeout<T>(promise: PromiseLike<T> | Promise<T>, ms = CALL_TIMEOUT): Promise<T> {
+  return Promise.race<T>([
+    Promise.resolve(promise),
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error("timeout")), ms)),
+  ]);
+}
 
 const extensionForPhoto = (mimeType: string) => {
   if (mimeType === "image/png") return "png";
@@ -70,19 +78,28 @@ function serverFields(table: "incidents" | "incident_parties", row: Record<strin
 }
 
 async function assertOwner(ownerId: string) {
-  const { data } = await supabase.auth.getSession();
+  const { data } = await withTimeout(supabase.auth.getSession());
   if (activeOwnerId !== ownerId || data.session?.user.id !== ownerId) throw new Error("sync_owner_changed");
 }
 
 async function createRemoteDraft(draft: LocalDraft, entry: OutboxEntry) {
   await assertOwner(draft.ownerId);
-  const { data, error } = await supabase.rpc("create_incident_with_party", {
+  console.log("[sync-worker] createRemoteDraft: calling RPC create_incident_with_party");
+  const { data, error } = await withTimeout(supabase.rpc("create_incident_with_party", {
     initial_driver: { fullName: draft.data.driverName, address: draft.data.driverAddress, phone: draft.data.phone },
     initial_vehicle: { plate: draft.data.plate, makeModel: draft.data.vehicle },
     initial_insurance: { company: draft.data.insurer, policyNumber: draft.data.policy },
-  });
+  }));
   const row = data?.[0];
-  if (error || !row || !row.share_code) throw error ?? new Error("create_failed");
+  if (error) {
+    console.error("[sync-worker] createRemoteDraft: RPC error", { error: error.message });
+    throw error;
+  }
+  if (!row || !row.share_code) {
+    console.error("[sync-worker] createRemoteDraft: RPC returned no data", { data });
+    throw new Error("create_returned_nothing");
+  }
+  console.log("[sync-worker] createRemoteDraft: success", { incidentId: row.incident_id, shareCode: row.share_code });
   draft.ref = {
     incidentId: row.incident_id,
     partyId: row.party_id,
@@ -117,21 +134,22 @@ async function createRemoteDraft(draft: LocalDraft, entry: OutboxEntry) {
 async function uploadCanvas(draft: LocalDraft, kind: "sketch" | "signature", dataUrl: string) {
   const blob = await (await fetch(dataUrl)).blob();
   const path = `${draft.ref.incidentId}/${draft.ref.partyId}/${kind}.png`;
-  console.log("[sync-worker] Uploading canvas", { kind, path, size: blob.size });
-  const { error } = await supabase.storage.from("incident-media").upload(path, blob, { upsert: true, contentType: "image/png" });
+  console.log("[sync-worker] uploadCanvas", { kind, path, size: blob.size });
+  const { error } = await withTimeout(supabase.storage.from("incident-media").upload(path, blob, { upsert: true, contentType: "image/png" }));
   if (error) {
-    console.error("[sync-worker] Storage upload failed", { kind, path, error: error.message });
+    console.error("[sync-worker] uploadCanvas: storage error", { kind, path, error: error.message });
     throw new Error(`storage_upload_failed:${error.message}`);
   }
-  const { error: mediaError } = await supabase.from("incident_media").upsert({
+  const { data: mediaRow, error: mediaError } = await withTimeout(supabase.from("incident_media").upsert({
     incident_id: draft.ref.incidentId, party_id: draft.ref.partyId, storage_path: path,
     kind: kind === "sketch" ? "sketch" : "document",
-  }, { onConflict: "storage_path" });
-  if (mediaError) {
-    console.error("[sync-worker] Media DB insert failed", { kind, path, error: mediaError.message });
-    throw new Error(`media_db_failed:${mediaError.message}`);
+  }, { onConflict: "storage_path" }).select("id").maybeSingle());
+  if (mediaError) throw new Error(`media_db_failed:${mediaError.message}`);
+  if (!mediaRow) {
+    console.error("[sync-worker] uploadCanvas: media upsert returned no row", { path });
+    throw new Error("media_upsert_zero_rows");
   }
-  console.log("[sync-worker] Canvas uploaded successfully", { kind, path });
+  console.log("[sync-worker] uploadCanvas: success", { path, mediaId: mediaRow.id });
   return path;
 }
 
@@ -143,7 +161,6 @@ async function writeVersioned(draft: LocalDraft, entry: OutboxEntry) {
   let patch = table === "incidents" ? incidentPatch(draft.data, field) : partyPatch(draft.data, field);
 
   if (table === "incidents" && (field === "sketchDataUrl" || field === "hasSketch") && draft.data.sketchDataUrl) {
-    // Only upload if not already uploaded for this entry (avoid re-upload on retry)
     const cachedPath = entry.payload.storagePath as string | undefined;
     const storagePath = cachedPath ?? await uploadCanvas(draft, "sketch", draft.data.sketchDataUrl);
     await db.outbox.update(entry.id, { payload: { ...entry.payload, storagePath } });
@@ -154,15 +171,23 @@ async function writeVersioned(draft: LocalDraft, entry: OutboxEntry) {
     return;
   }
 
-  const attemptUpdate = async (baseVersion: number, values: Record<string, unknown>) => supabase
-    .from(table).update({ ...values, version: baseVersion + 1, updated_at: new Date().toISOString() })
-    .eq("id", id).eq("version", baseVersion).select("version").maybeSingle();
+  const attemptUpdate = async (baseVersion: number, values: Record<string, unknown>) => {
+    const result = await withTimeout(supabase
+      .from(table).update({ ...values, version: baseVersion + 1, updated_at: new Date().toISOString() })
+      .eq("id", id).eq("version", baseVersion).select("version").maybeSingle());
+    return result;
+  };
 
   let result = await attemptUpdate(version, patch);
   if (result.error) throw result.error;
   if (!result.data) {
-    const { data: server, error } = await supabase.from(table).select("*").eq("id", id).single();
+    // Version mismatch — fetch current server version and retry
+    const { data: server, error } = await withTimeout(supabase.from(table).select("*").eq("id", id).maybeSingle());
     if (error) throw error;
+    if (!server) {
+      console.error("[sync-worker] writeVersioned: row not found", { table, id });
+      throw new Error("row_not_found");
+    }
     const serverValue = serverFields(table, server, field);
     const localValue = draft.data[field];
     if (sameValue(serverValue, localValue)) {
@@ -206,11 +231,12 @@ async function writeVersioned(draft: LocalDraft, entry: OutboxEntry) {
 }
 
 async function replaceWitness(draft: LocalDraft, entry: OutboxEntry) {
-  const { error: deleteError } = await supabase.from("incident_witnesses").delete().eq("incident_id", draft.ref.incidentId);
+  const { error: deleteError } = await withTimeout(supabase.from("incident_witnesses").delete().eq("incident_id", draft.ref.incidentId));
   if (deleteError) throw deleteError;
   if (draft.data.witnesses.trim()) {
-    const { error } = await supabase.from("incident_witnesses").insert({ incident_id: draft.ref.incidentId, name: draft.data.witnesses.trim(), contact: null });
+    const { data: witnessRow, error } = await withTimeout(supabase.from("incident_witnesses").insert({ incident_id: draft.ref.incidentId, name: draft.data.witnesses.trim(), contact: null }).select("id").maybeSingle());
     if (error) throw error;
+    if (!witnessRow) throw new Error("witness_insert_zero_rows");
   }
   await db.outbox.delete(entry.id);
 }
@@ -220,11 +246,11 @@ async function syncMedia(draft: LocalDraft, entry: OutboxEntry) {
     const path = entry.payload.storagePath as string | undefined;
     const mediaId = entry.payload.mediaId as string | undefined;
     if (path) {
-      const { error } = await supabase.storage.from("incident-media").remove([path]);
+      const { error } = await withTimeout(supabase.storage.from("incident-media").remove([path]));
       if (error) throw error;
     }
     if (mediaId) {
-      const { error } = await supabase.from("incident_media").delete().eq("id", mediaId);
+      const { error } = await withTimeout(supabase.from("incident_media").delete().eq("id", mediaId));
       if (error) throw error;
     }
     await db.outbox.delete(entry.id);
@@ -237,13 +263,14 @@ async function syncMedia(draft: LocalDraft, entry: OutboxEntry) {
     return;
   }
   const path = `${draft.ref.incidentId}/${draft.ref.partyId}/photo-${photo.id}.${extensionForPhoto(photo.mimeType)}`;
-  const { error } = await supabase.storage.from("incident-media").upload(path, photo.blob, { upsert: true, contentType: photo.mimeType });
+  const { error } = await withTimeout(supabase.storage.from("incident-media").upload(path, photo.blob, { upsert: true, contentType: photo.mimeType }));
   if (error) throw error;
-  const { data: media, error: mediaError } = await supabase.from("incident_media").upsert({
+  const { data: media, error: mediaError } = await withTimeout(supabase.from("incident_media").upsert({
     incident_id: draft.ref.incidentId, party_id: draft.ref.partyId, storage_path: path,
     kind: "photo", taken_at: new Date(photo.lastModified).toISOString(),
-  }, { onConflict: "storage_path" }).select("id").single();
+  }, { onConflict: "storage_path" }).select("id").maybeSingle());
   if (mediaError) throw mediaError;
+  if (!media) throw new Error("media_upsert_zero_rows");
   await db.transaction("rw", db.photos, db.outbox, async () => {
     await db.photos.update(photoId, { storagePath: path, mediaId: media.id });
     await db.outbox.delete(entry.id);
@@ -256,39 +283,30 @@ async function completeDraft(draft: LocalDraft, entry: OutboxEntry) {
   const partyId = draft.ref.partyId;
   console.log("[sync-worker] completeDraft starting", { partyId, incidentId: draft.ref.incidentId, draftId: draft.id });
 
-  // Step 1: Upload signature PNG to storage as a Blob
   const dataUrl = draft.data.signatureDataUrl;
   const blob = await (await fetch(dataUrl)).blob();
   const storagePath = `${draft.ref.incidentId}/${partyId}/signature.png`;
   console.log("[sync-worker] Uploading signature", { storagePath, blobSize: blob.size, blobType: blob.type });
 
-  const { error: uploadError } = await supabase.storage
+  const { error: uploadError } = await withTimeout(supabase.storage
     .from("incident-media")
-    .upload(storagePath, blob, { upsert: true, contentType: "image/png" });
+    .upload(storagePath, blob, { upsert: true, contentType: "image/png" }));
   if (uploadError) {
     console.error("[sync-worker] Signature storage upload FAILED", { storagePath, error: uploadError.message });
     throw new Error(`signature_upload_failed:${uploadError.message}`);
   }
   console.log("[sync-worker] Signature storage upload succeeded", { storagePath });
 
-  // Step 2: Fetch current version of the party row
-  const { data: currentParty, error: fetchError } = await supabase
+  const { data: currentParty, error: fetchError } = await withTimeout(supabase
     .from("incident_parties")
     .select("version, signed_at, signature_storage_path")
     .eq("id", partyId)
-    .maybeSingle();
+    .maybeSingle());
 
-  if (fetchError) {
-    console.error("[sync-worker] Failed to fetch party row for signing", { partyId, error: fetchError.message });
-    throw new Error(`party_fetch_failed:${fetchError.message}`);
-  }
-  if (!currentParty) {
-    console.error("[sync-worker] Party row not found", { partyId });
-    throw new Error("party_not_found");
-  }
+  if (fetchError) throw new Error(`party_fetch_failed:${fetchError.message}`);
+  if (!currentParty) throw new Error("party_not_found");
   console.log("[sync-worker] Current party state", { partyId, version: currentParty.version, signedAt: currentParty.signed_at });
 
-  // Already signed — idempotent success
   if (currentParty.signed_at && currentParty.signature_storage_path === storagePath) {
     console.log("[sync-worker] Party already signed with same path, treating as success", { partyId });
     draft.ref = { ...draft.ref, partyVersion: currentParty.version };
@@ -301,36 +319,17 @@ async function completeDraft(draft: LocalDraft, entry: OutboxEntry) {
     return;
   }
 
-  // Step 3: Update incident_parties with signed_at and signature_storage_path
   const signedAt = new Date().toISOString();
-  const updatePayload = {
-    signature_storage_path: storagePath,
-    signed_at: signedAt,
-    version: currentParty.version + 1,
-    updated_at: signedAt,
-  };
-  console.log("[sync-worker] Updating party row", { partyId, targetVersion: currentParty.version, newVersion: currentParty.version + 1, updatePayload });
-
-  const { data: updatedRow, error: updateError } = await supabase
+  const { data: updatedRow, error: updateError } = await withTimeout(supabase
     .from("incident_parties")
-    .update(updatePayload)
+    .update({ signature_storage_path: storagePath, signed_at: signedAt, updated_at: signedAt })
     .eq("id", partyId)
-    .eq("version", currentParty.version)
     .select("version, signed_at, signature_storage_path")
-    .maybeSingle();
+    .maybeSingle());
 
-  if (updateError) {
-    console.error("[sync-worker] Party UPDATE returned error", { partyId, error: updateError.message, code: updateError.code });
-    throw new Error(`party_update_failed:${updateError.message}`);
-  }
-  if (!updatedRow) {
-    console.error("[sync-worker] Party UPDATE affected 0 rows — version conflict or RLS blocked", {
-      partyId, attemptedVersion: currentParty.version,
-    });
-    throw new Error("party_update_zero_rows");
-  }
+  if (updateError) throw new Error(`party_update_failed:${updateError.message}`);
+  if (!updatedRow) throw new Error("party_update_zero_rows");
 
-  // Step 4: Success — persist to local DB and remove outbox entry
   console.log("[sync-worker] signature row updated SUCCESSFULLY", { partyId, version: updatedRow.version, signedAt: updatedRow.signed_at, storagePath: updatedRow.signature_storage_path });
   draft.ref = { ...draft.ref, partyVersion: updatedRow.version };
   await db.transaction("rw", db.drafts, db.outbox, async () => {
@@ -346,7 +345,7 @@ async function processEntry(entry: OutboxEntry) {
   if (entry.ownerId !== activeOwnerId) return;
   if (processingEntries.has(entry.id)) return;
   if (entry.attempts >= MAX_ATTEMPTS) {
-    console.error("[sync-worker] Entry exceeded max attempts, marking as failed", { id: entry.id, operation: entry.operation, attempts: entry.attempts });
+    console.error("[sync-worker] Entry exceeded max attempts", { id: entry.id, operation: entry.operation, attempts: entry.attempts });
     await db.outbox.update(entry.id, { nextAttemptAt: Date.now() + 86_400_000 });
     if (entry.operation === "complete") {
       window.dispatchEvent(new CustomEvent("incident-signature-error", { detail: { draftId: entry.draftId, message: "max_retries_exceeded" } }));
@@ -368,9 +367,8 @@ async function processEntry(entry: OutboxEntry) {
     if (entry.operation === "create") return await createRemoteDraft(draft, entry);
     if (entry.table === "incident_media") return await syncMedia(draft, entry);
     if (entry.table === "incident_witnesses") return await replaceWitness(draft, entry);
-    // Signatures are now handled directly by the UI, not through the outbox
     if (entry.operation === "complete") {
-      console.log("[sync-worker] Removing stale 'complete' outbox entry — signatures are now direct");
+      console.log("[sync-worker] Removing stale complete entry — signatures are now direct");
       await db.outbox.delete(entry.id);
       return;
     }
@@ -413,10 +411,8 @@ async function runOutbox() {
         }
         if (activeOwnerId === ownerId) await defer(entry);
         failed++;
-        // Continue to next entry instead of returning — one failed entry must not block others
       }
     }
-    // If every entry failed, stop to avoid a busy loop
     if (processed === 0 && failed > 0) break;
   }
 }
@@ -464,16 +460,14 @@ export async function resolveConflict(conflict: SyncConflict, choice: "local" | 
     });
     await applyDraftFromSync(draft);
   } else {
-    const now = new Date().toISOString();
-    const version = conflict.serverVersion;
-    await db.transaction("rw", db.outbox, db.conflicts, async () => {
-      await db.outbox.add({
-        id: crypto.randomUUID(), ownerId: draft.ownerId, draftId: draft.id, table: conflict.table, operation: "update",
-        payload: { field: conflict.field, value: conflict.localValue, modifiedAt: now }, version,
-        device_id: deviceId, attempts: 0, nextAttemptAt: Date.now(), createdAt: now,
-      });
-      await db.conflicts.delete(conflict.id);
+    await db.outbox.add({
+      id: crypto.randomUUID(), ownerId: draft.ownerId, draftId: draft.id,
+      table: conflict.table, operation: "update",
+      payload: { field: conflict.field, value: conflict.localValue, modifiedAt: new Date().toISOString() },
+      version: conflict.serverVersion, device_id: deviceId,
+      attempts: 0, nextAttemptAt: Date.now(), createdAt: new Date().toISOString(),
     });
+    await db.conflicts.delete(conflict.id);
     requestSync();
   }
 }

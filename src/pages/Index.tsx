@@ -136,6 +136,7 @@ export default function Index() {
   const [casesLoading, setCasesLoading] = useState(false);
   const [casesError, setCasesError] = useState(false);
   const [ensuringServerCase, setEnsuringServerCase] = useState(false);
+  const [syncError, setSyncError] = useState<string | null>(null);
   const [caseLoading, setCaseLoading] = useState(false);
   const [locating, setLocating] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<CaseItem | null>(null);
@@ -301,16 +302,34 @@ export default function Index() {
     if (!serverOnline) return;
     let active = true;
     setEnsuringServerCase(true);
+    setSyncError(null);
+    console.log("[step5] Starting server case sync", { draftId: localDraftId });
     const timeout = window.setTimeout(() => {
-      if (active && ensuringServerCase) {
+      if (active) {
         console.warn("[step5] Server case sync timed out after 15s");
         setEnsuringServerCase(false);
+        setSyncError("timeout");
       }
     }, 15_000);
     void processOutbox().then(() => {
-      if (active) { window.clearTimeout(timeout); setEnsuringServerCase(false); }
-    }).catch(() => {
-      if (active) { window.clearTimeout(timeout); setEnsuringServerCase(false); }
+      if (active) {
+        window.clearTimeout(timeout);
+        // Check if the draft's incidentId is still local (meaning creation failed)
+        const checkDraft = db.drafts.get(localDraftId).then((d) => {
+          if (d && d.ref.incidentId.startsWith("local:")) {
+            console.error("[step5] Draft still local after processOutbox — creation failed silently");
+            setSyncError("creation_failed");
+          }
+        });
+        setEnsuringServerCase(false);
+      }
+    }).catch((err) => {
+      if (active) {
+        window.clearTimeout(timeout);
+        console.error("[step5] processOutbox error", { error: err instanceof Error ? err.message : String(err) });
+        setSyncError(err instanceof Error ? err.message : "unknown");
+        setEnsuringServerCase(false);
+      }
     });
     return () => { active = false; window.clearTimeout(timeout); };
   }, [step, draftRef?.incidentId, user?.id, localDraftId, ensuringServerCase, serverOnline]);
@@ -799,11 +818,13 @@ export default function Index() {
           </div>}
           {step === 5 && <div className="space-y-6">
             {draftRef?.partyLabel === "A" && !alreadySigned && (draftRef.incidentId.startsWith("local:")
-              ? (ensuringServerCase
-                  ? <div className="flex items-center justify-center rounded-2xl border border-slate-200 bg-slate-50 p-8"><RefreshCw className="mr-2 h-5 w-5 animate-spin text-[#39719D]" /><span className="text-sm font-semibold text-slate-600">{t("invite.savingCase")}</span></div>
-                  : !navigator.onLine
-                    ? <div className="rounded-2xl border border-amber-200 bg-amber-50 p-5 text-center"><p className="text-sm font-semibold text-amber-900">{t("invite.offlineHint")}</p><p className="mt-1 text-xs text-amber-700">{t("invite.offlineDetail")}</p></div>
-                    : <div className="rounded-2xl border border-rose-200 bg-rose-50 p-5 text-center"><p className="text-sm font-semibold text-rose-900">{t("invite.saveFailed")}</p><Button variant="outline" onClick={() => void retrySync()} className="mt-3 rounded-xl border-rose-300 bg-white text-rose-900">{t("home.retry")}</Button></div>)
+              ? (syncError
+                  ? <div className="rounded-2xl border border-rose-200 bg-rose-50 p-5 text-center"><AlertTriangle className="mx-auto mb-2 h-8 w-8 text-rose-500" /><p className="text-sm font-semibold text-rose-900">{t(syncError === "timeout" ? "sync.timeout" : syncError === "creation_failed" ? "sync.creationFailed" : "sync.error")}</p><p className="mt-1 text-xs text-rose-700">{t("sync.dataPreserved")}</p><Button variant="outline" onClick={() => { setSyncError(null); void retrySync(); }} className="mt-3 rounded-xl border-rose-300 bg-white text-rose-900"><RefreshCw className="mr-2 h-4 w-4" />{t("home.retry")}</Button></div>
+                  : ensuringServerCase
+                    ? <div className="flex items-center justify-center rounded-2xl border border-slate-200 bg-slate-50 p-8"><RefreshCw className="mr-2 h-5 w-5 animate-spin text-[#39719D]" /><span className="text-sm font-semibold text-slate-600">{t("invite.savingCase")}</span></div>
+                    : !serverOnline
+                      ? <div className="rounded-2xl border border-amber-200 bg-amber-50 p-5 text-center"><p className="text-sm font-semibold text-amber-900">{t("invite.offlineHint")}</p><p className="mt-1 text-xs text-amber-700">{t("invite.offlineDetail")}</p></div>
+                      : <div className="rounded-2xl border border-rose-200 bg-rose-50 p-5 text-center"><p className="text-sm font-semibold text-rose-900">{t("invite.saveFailed")}</p><Button variant="outline" onClick={() => void retrySync()} className="mt-3 rounded-xl border-rose-300 bg-white text-rose-900">{t("home.retry")}</Button></div>)
               : <InviteParty shareCode={draftRef.shareCode} loading={false} />)}
             <div className="grid gap-3 sm:grid-cols-2"><Summary number="1" icon={<Clock3 />} label={t("fields.dateTime")} value={formatCaseDate(data)} /><Summary number="2" icon={<MapPin />} label={t("fields.place")} value={data.location || t("fields.notProvided")} /><Summary number="9" icon={<UserRound />} label={t("fields.driver")} value={data.driverName || t("fields.notProvided")} /><Summary number="7" icon={<Car />} label={t("fields.vehicle")} value={`${data.plate || t("fields.noPlate")}${data.vehicle ? ` · ${data.vehicle}` : ""}`} /><Summary number="8" icon={<ShieldCheck />} label={t("fields.insurer")} value={data.insurer || t("fields.notProvided")} /><Summary number="11–13" icon={<Camera />} label={t("fields.documentation")} value={`${t("fields.photosCount", { formattedCount: formatNumber(data.photos.length) })} · ${t(data.hasSketch ? "fields.sketchAvailable" : "fields.withoutSketch")}`} /></div>
             <div className="rounded-2xl border border-slate-200 p-4"><FieldBadge number="12" /><p className="mb-2 mt-2 text-xs font-bold uppercase tracking-wider text-slate-500">{t("summary.circumstances")}</p>{selectedSummary.length ? <ul className="space-y-1.5">{selectedSummary.map((item) => <li key={item} className="flex gap-2 text-sm text-slate-700"><Check className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />{item}</li>)}</ul> : <p className="text-sm text-slate-500">{t("summary.noneSelected")}</p>}</div>
