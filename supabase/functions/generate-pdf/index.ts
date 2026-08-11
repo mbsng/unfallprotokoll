@@ -237,15 +237,57 @@ serve(async (req) => {
     page.drawText("13 SKIZZE DES UNFALLS", { x: MARGIN + 6, y: sketchY + sketchH - 8, size: 7, font: bold, color: navy });
     page.drawText("Verlauf der Fahrspuren, Fahrtrichtung (Pfeile), Position beim Aufprall, Verkehrszeichen, Strassennamen", { x: MARGIN + 6, y: sketchY + sketchH - 18, size: 5, font: regular, color: rgb(0.4, 0.45, 0.5) });
 
-    // Shared sketch from incidents.sketch_data_url (base64) or incident_media sketch
+    // Shared sketch from incidents.sketch_data_url
     let sketchDrawn = false;
     if (incident.sketch_data_url) {
-      try {
-        const base64 = incident.sketch_data_url.split(",")[1] ?? incident.sketch_data_url;
-        const sketchBytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
-        const img = await embedImage(pdf, sketchBytes, "image/png");
-        if (img) { drawImageFit(page, img, MARGIN + 6, sketchY + 6, sketchW - 12, sketchH - 30); sketchDrawn = true; }
-      } catch { /* fall through to media */ }
+      const sketchVal = incident.sketch_data_url;
+      // Check if it's a structured JSON sketch
+      if (sketchVal.startsWith("{")) {
+        try {
+          const structured = JSON.parse(sketchVal);
+          // Render structured sketch as basic shapes in PDF
+          const sx = MARGIN + 6;
+          const sy = sketchY + 6;
+          const sw = sketchW - 12;
+          const sh = sketchH - 30;
+
+          // Road background
+          page.drawRectangle({ x: sx, y: sy + sh * 0.35, width: sw, height: sh * 0.3, color: rgb(0.8, 0.8, 0.8) });
+
+          // Elements
+          for (const el of (structured.elements ?? [])) {
+            const ex = sx + (el.x ?? 0.5) * sw;
+            const ey = sy + (1 - (el.y ?? 0.5)) * sh; // Flip Y for PDF coordinate system
+            if (el.kind === "vehicle") {
+              const isA = el.party === "A";
+              const col = isA ? rgb(0.11, 0.45, 0.72) : rgb(0.92, 0.72, 0.08);
+              page.drawRectangle({ x: ex - 5, y: ey - 3, width: 10, height: 6, color: col, borderColor: rgb(0.1, 0.1, 0.1), borderWidth: 0.5 });
+              page.drawText(el.party ?? "?", { x: ex - 1.5, y: ey - 1, size: 5, font: bold, color: rgb(1, 1, 1) });
+            } else if (el.kind === "impact") {
+              page.drawLine({ start: { x: ex - 3, y: ey + 3 }, end: { x: ex + 3, y: ey - 3 }, thickness: 1, color: rgb(0.8, 0, 0) });
+              page.drawLine({ start: { x: ex - 3, y: ey - 3 }, end: { x: ex + 3, y: ey + 3 }, thickness: 1, color: rgb(0.8, 0, 0) });
+            } else if (el.kind === "arrow") {
+              const fromX = sx + (el.from?.[0] ?? 0.5) * sw;
+              const fromY = sy + (1 - (el.from?.[1] ?? 0.5)) * sh;
+              const toX = sx + (el.to?.[0] ?? el.x ?? 0.5) * sw;
+              const toY = sy + (1 - (el.to?.[1] ?? el.y ?? 0.5)) * sh;
+              const col = el.party === "A" ? rgb(0.11, 0.45, 0.72) : rgb(0.92, 0.72, 0.08);
+              page.drawLine({ start: { x: fromX, y: fromY }, end: { x: toX, y: toY }, thickness: 0.8, color: col });
+            }
+          }
+          // Street names
+          if (structured.streets?.main) page.drawText(clean(structured.streets.main), { x: sx + sw / 2, y: sy + 2, size: 4, font: regular, color: rgb(0.2, 0.2, 0.2) });
+          sketchDrawn = true;
+        } catch { /* fall through to image rendering */ }
+      }
+      if (!sketchDrawn) {
+        try {
+          const base64 = sketchVal.split(",")[1] ?? sketchVal;
+          const sketchBytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+          const img = await embedImage(pdf, sketchBytes, "image/png");
+          if (img) { drawImageFit(page, img, MARGIN + 6, sketchY + 6, sketchW - 12, sketchH - 30); sketchDrawn = true; }
+        } catch { /* fall through to media */ }
+      }
     }
     if (!sketchDrawn) {
       const sketchItem = (media ?? []).find((item) => item.kind === "sketch" || item.storage_path.endsWith("/sketch.png"));

@@ -16,6 +16,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { DrawingCanvas } from "@/components/DrawingCanvas";
 import { InviteParty } from "@/components/InviteParty";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
+import { ScenarioBuilder } from "@/components/ScenarioBuilder";
 import { UserMenu } from "@/components/UserMenu";
 import { useAuth } from "@/contexts/AuthContext";
 import { localeForLanguage } from "@/i18n";
@@ -139,6 +140,7 @@ export default function Index() {
   const [locating, setLocating] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<CaseItem | null>(null);
   const [withdrawOpen, setWithdrawOpen] = useState(false);
+  const [sketchMode, setSketchMode] = useState<"builder" | "freehand">("builder");
   const photoInputRef = useRef<HTMLInputElement>(null);
 
   const localDrafts = useLiveQuery(
@@ -769,10 +771,21 @@ export default function Index() {
             <div><FieldBadge number="10" /><p className="text-sm font-semibold text-slate-700">{t("fields.initialImpact")}</p></div>
             <FieldBadge number="13" />
             <div className="rounded-xl bg-[#EDF4F8] p-4 text-sm leading-relaxed text-[#153B66]"><strong>{t("sketch.tipTitle")}</strong> {t("sketch.tip")}</div>
+
+            {/* Mode switcher */}
+            <div className="flex gap-2 rounded-xl border border-slate-200 p-1">
+              <button onClick={() => { if (sketchMode !== "builder" && data.hasSketch) { if (!confirm(t("sketch.switchWarning"))) return; } setSketchMode("builder"); }} className={`flex-1 rounded-lg py-2 text-sm font-semibold transition ${sketchMode === "builder" ? "bg-[#153B66] text-white" : "text-slate-600"}`}>{t("sketch.modeBuilder")}</button>
+              <button onClick={() => { if (sketchMode !== "freehand" && data.hasSketch) { if (!confirm(t("sketch.switchWarning"))) return; } setSketchMode("freehand"); }} className={`flex-1 rounded-lg py-2 text-sm font-semibold transition ${sketchMode === "freehand" ? "bg-[#153B66] text-white" : "text-slate-600"}`}>{t("sketch.modeFreehand")}</button>
+            </div>
+
             {draftRef && !draftRef.incidentId.startsWith("local:") && ownParty?.sketchConfirmedAt && counterpart && !counterpart.sketchConfirmedAt && (
               <div className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900"><AlertTriangle className="mr-1 inline h-4 w-4" />{t("sketch.counterpartMustConfirm")}</div>
             )}
-            <DrawingCanvas label={t("fields.sketch")} height={320} initialDataUrl={data.sketchDataUrl} onChange={(value, dataUrl) => { if (value && dataUrl) void saveSketch(dataUrl); else { update("hasSketch", value); update("sketchDataUrl", dataUrl ?? ""); } }} />
+
+            {sketchMode === "builder"
+              ? <ScenarioBuilder checkedCircumstances={data.situations} onSave={(s) => { update("hasSketch", true); update("sketchDataUrl", ""); if (draftRef && !draftRef.incidentId.startsWith("local:") && user) void saveSketch(JSON.stringify(s)); }} />
+              : <DrawingCanvas label={t("fields.sketch")} height={320} initialDataUrl={data.sketchDataUrl} onChange={(value, dataUrl) => { if (value && dataUrl) void saveSketch(dataUrl); else { update("hasSketch", value); update("sketchDataUrl", dataUrl ?? ""); } }} />}
+
             <div className="flex flex-wrap gap-3 text-xs text-slate-500"><span className="rounded-full bg-slate-100 px-3 py-1.5">{t("sketch.myVehicle")}</span><span className="rounded-full bg-slate-100 px-3 py-1.5">{t("sketch.otherVehicle")}</span><span className="rounded-full bg-slate-100 px-3 py-1.5">{t("sketch.impact")}</span></div>
             {draftRef && !draftRef.incidentId.startsWith("local:") && data.hasSketch && (
               <div className="flex items-center justify-between rounded-xl border border-slate-200 p-3">
