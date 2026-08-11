@@ -9,15 +9,14 @@ const corsHeaders = {
 };
 const json = (body: Record<string, unknown>, status = 200) => new Response(JSON.stringify(body), { status, headers: { ...corsHeaders, "Content-Type": "application/json" } });
 
-const PW = 841.89; // A4 landscape width
-const PH = 595.28; // A4 landscape height
-const MARGIN = 18;
-const COL_W = (PW - 2 * MARGIN - 6) / 3; // 3 columns with 3px gaps
+const PW = 595.28;
+const PH = 841.89;
+const MARGIN = 28;
+const CONTENT_W = PW - 2 * MARGIN;
 
-// WinAnsi-safe clean
 const clean = (value: unknown) => {
   if (value === null || value === undefined) return "";
-  return String(value).replace(/[–—]/g, "-").replace(/[""]/g, '"').replace(/['']/g, "'").replace(/…/g, "...").replace(/€/g, "EUR").replace(/[^\x20-\xFF\n]/g, "?");
+  return String(value).replace(/[\u2013\u2014]/g, "-").replace(/[\u201c\u201d]/g, '"').replace(/[\u2018\u2019]/g, "'").replace(/\u2026/g, "...").replace(/\u20ac/g, "EUR").replace(/[^\x20-\xFF\n]/g, "?");
 };
 
 const lines = (font: PDFFont, text: string, size: number, maxWidth: number) => {
@@ -37,7 +36,6 @@ const lines = (font: PDFFont, text: string, size: number, maxWidth: number) => {
 function drawWrapped(page: PDFPage, font: PDFFont, text: unknown, x: number, y: number, maxWidth: number, size: number, maxLines: number, color = rgb(0.1, 0.1, 0.15)) {
   const wrapped = lines(font, clean(text), size, maxWidth).slice(0, maxLines);
   wrapped.forEach((line, index) => page.drawText(line, { x, y: y - index * (size + 1.5), size, font, color }));
-  return y - wrapped.length * (size + 1.5);
 }
 
 function box(page: PDFPage, x: number, y: number, w: number, h: number, fill = rgb(1, 1, 1), border = rgb(0.6, 0.65, 0.7)) {
@@ -46,8 +44,8 @@ function box(page: PDFPage, x: number, y: number, w: number, h: number, fill = r
 
 function labeledField(page: PDFPage, regular: PDFFont, bold: PDFFont, num: string, label: string, value: unknown, x: number, y: number, w: number, h: number) {
   box(page, x, y, w, h);
-  page.drawText(clean(`${num} ${label}`).toUpperCase(), { x: x + 4, y: y + h - 7, size: 5, font: bold, color: rgb(0.15, 0.3, 0.45) });
-  drawWrapped(page, regular, value, x + 4, y + h - 16, w - 8, 7, Math.floor((h - 18) / 8.5));
+  page.drawText(clean(`${num} ${label}`).toUpperCase(), { x: x + 3, y: y + h - 6, size: 4.5, font: bold, color: rgb(0.15, 0.3, 0.45) });
+  drawWrapped(page, regular, value, x + 3, y + h - 13, w - 6, 6, Math.floor((h - 15) / 7.5));
 }
 
 async function embedImage(pdf: PDFDocument, bytes: Uint8Array, contentType?: string): Promise<PDFImage | null> {
@@ -66,22 +64,14 @@ function drawImageFit(page: PDFPage, image: PDFImage, x: number, y: number, w: n
 }
 
 const CIRCUMSTANCES = [
-  "parkte / hielt", "verliess einen Parkplatz / oeffnete eine Tuere", "parkte ein",
-  "verliess einen Parkplatz / Grundstueck / Weg", "fuhr in Parkplatz / Grundstueck / Weg ein",
-  "fuhr in einen Kreisverkehr ein", "fuhr in einem Kreisverkehr",
-  "prallte in gleicher Kolonne auf das Heck auf", "fuhr in gleicher Richtung, anderer Kolonne",
-  "wechselte die Kolonne", "ueberholte", "bog rechts ab", "bog links ab",
-  "setzte zurueck", "wechselte auf Gegenfahrbahn", "kam von rechts (Kreuzung)",
-  "missachtete Vorfahrt / rote Ampel",
+  "parkte / hielt", "verliess Parkplatz / Tuere", "parkte ein",
+  "verliess Parkplatz / Grundstueck", "fuhr in Parkplatz / Grundstueck",
+  "Kreisverkehr: fuhr ein", "Kreisverkehr: fuhr darin",
+  "Auffahrunfall gleiche Kolonne", "gleiche Richtung, andere Kolonne",
+  "wechselte Kolonne", "ueberholte", "bog rechts ab", "bog links ab",
+  "setzte zurueck", "Gegenfahrbahn", "kam von rechts (Kreuzung)",
+  "Vorfahrt / rote Ampel",
 ];
-
-const lang = (req: Request): string => {
-  const accept = req.headers.get("Accept-Language") ?? "de";
-  if (accept.startsWith("fr")) return "fr";
-  if (accept.startsWith("it")) return "it";
-  if (accept.startsWith("en")) return "en";
-  return "de";
-};
 
 serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
@@ -92,7 +82,6 @@ serve(async (req) => {
     const token = authHeader.slice(7);
     const body = await req.json();
     const incidentId = body.incidentId as string;
-    const locale = body.locale as string || lang(req);
     if (!incidentId || !/^[0-9a-f-]{36}$/i.test(incidentId)) return json({ error: "invalid_incident" }, 400);
 
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
@@ -107,10 +96,7 @@ serve(async (req) => {
       service.from("incident_witnesses").select("name, contact").eq("incident_id", incidentId),
       service.from("incident_media").select("storage_path, kind, taken_at, party_id").eq("incident_id", incidentId).order("uploaded_at"),
     ]);
-    if (incidentError || partiesError || !incident || !parties) {
-      console.error("[generate-pdf] Data fetch failed", { incidentError: incidentError?.message, partiesError: partiesError?.message });
-      return json({ error: "not_found" }, 404);
-    }
+    if (incidentError || partiesError || !incident || !parties) return json({ error: "not_found" }, 404);
 
     let submissionParty = parties.find((p) => p.profile_id === authData.user.id);
     if (!submissionParty) {
@@ -134,7 +120,6 @@ serve(async (req) => {
       }
     }
 
-    // Download all media
     const downloaded = new Map<string, { bytes: Uint8Array; contentType?: string }>();
     for (const item of media ?? []) {
       const { data, error } = await service.storage.from("incident-media").download(item.storage_path);
@@ -148,145 +133,128 @@ serve(async (req) => {
     const bold = await pdf.embedFont(StandardFonts.HelveticaBold);
     const page = pdf.addPage([PW, PH]);
     const navy = rgb(0.08, 0.23, 0.4);
-    const blue = rgb(0.12, 0.45, 0.72);
-    const yellow = rgb(0.92, 0.75, 0.1);
+    const blueA = rgb(0.05, 0.27, 0.49);
+    const blueA_light = rgb(0.71, 0.83, 0.96);
+    const yellowB = rgb(0.39, 0.22, 0.02);
+    const yellowB_light = rgb(0.98, 0.78, 0.46);
 
-    // --- HEADER ---
-    page.drawRectangle({ x: 0, y: PH - 38, width: PW, height: 38, color: navy });
-    page.drawText("VERKEHRSUNFALL-BERICHT", { x: MARGIN + 2, y: PH - 25, size: 16, font: bold, color: rgb(1, 1, 1) });
-    page.drawText(`Fall ${clean(incident.share_code)}`, { x: PW - 160, y: PH - 18, size: 7, font: regular, color: rgb(0.85, 0.9, 1) });
+    page.drawRectangle({ x: 0, y: PH - 30, width: PW, height: 30, color: navy });
+    page.drawText("VERKEHRSUNFALL-BERICHT", { x: MARGIN, y: PH - 20, size: 13, font: bold, color: rgb(1, 1, 1) });
+    page.drawText(`Fall ${clean(incident.share_code)}`, { x: PW - 110, y: PH - 14, size: 6, font: regular, color: rgb(0.85, 0.9, 1) });
 
-    const hy = PH - 40;
-    const headH = 32;
-    const fieldW = (PW - 2 * MARGIN - 8) / 5;
-    labeledField(page, regular, bold, "1", "Datum / Zeit", incident.occurred_at ? new Date(incident.occurred_at).toLocaleString(locale === "de" ? "de-CH" : locale) : "", MARGIN, hy - headH, fieldW, headH);
-    labeledField(page, regular, bold, "2", "Ort", incident.location_text, MARGIN + fieldW + 2, hy - headH, fieldW, headH);
-    labeledField(page, regular, bold, "3", "Verletzte", incident.circumstances_json?.injured ? "Ja" : "Nein", MARGIN + 2 * (fieldW + 2), hy - headH, fieldW * 0.6, headH);
-    labeledField(page, regular, bold, "4", "Sachschaden", incident.circumstances_json?.otherDamage ? "Ja" : "Nein", MARGIN + 2 * (fieldW + 2) + fieldW * 0.6 + 2, hy - headH, fieldW * 0.6, headH);
-    labeledField(page, regular, bold, "5", "Zeugen", (witnesses ?? []).map((w) => [w.name, w.contact].filter(Boolean).join(" ")).join("; "), MARGIN + 3 * (fieldW + 2) + fieldW * 0.2 + 2, hy - headH, fieldW * 1.2, headH);
+    let y = PH - 34;
+    const headH = 28;
+    const fieldGap = 2;
+    const fw = (CONTENT_W - 4 * fieldGap) / 5;
+    labeledField(page, regular, bold, "1", "Datum / Zeit", incident.occurred_at ? new Date(incident.occurred_at).toLocaleString("de-CH") : "", MARGIN, y - headH, fw, headH);
+    labeledField(page, regular, bold, "2", "Ort", incident.location_text, MARGIN + fw + fieldGap, y - headH, fw, headH);
+    labeledField(page, regular, bold, "3", "Verletzte", incident.circumstances_json?.injured ? "Ja" : "Nein", MARGIN + 2 * (fw + fieldGap), y - headH, fw * 0.7, headH);
+    labeledField(page, regular, bold, "4", "Sachschaden", incident.circumstances_json?.otherDamage ? "Ja" : "Nein", MARGIN + 2 * (fw + fieldGap) + fw * 0.7 + fieldGap, y - headH, fw * 0.7, headH);
+    labeledField(page, regular, bold, "5", "Zeugen", (witnesses ?? []).map((w) => [w.name, w.contact].filter(Boolean).join(" ")).join("; "), MARGIN + 2 * (fw + fieldGap) + 2 * (fw * 0.7 + fieldGap), y - headH, fw * 1.1, headH);
+    y -= headH + 3;
 
-    // --- COLUMNS ---
-    const colTop = hy - headH - 4;
+    const colGap = 3;
+    const colW = (CONTENT_W - 2 * colGap) / 3;
+    const colLeft = MARGIN;
+    const colMid = MARGIN + colW + colGap;
+    const colRight = MARGIN + 2 * (colW + colGap);
     const partyA = parties.find((p) => p.party_label === "A") ?? parties[0];
     const partyB = parties.find((p) => p.party_label === "B");
-    const colLeft = MARGIN;
-    const colMid = MARGIN + COL_W + 3;
-    const colRight = MARGIN + 2 * (COL_W + 3);
 
-    const drawPartyColumn = (party: Record<string, unknown> | undefined, x: number, headColor: typeof blue) => {
+    const drawPartyColumn = (party: Record<string, unknown> | undefined, x: number, headColor: typeof blueA) => {
       if (!party) return;
-      const w = COL_W;
-      let y = colTop;
-      const hBar = 14;
-      page.drawRectangle({ x, y: y - hBar, width: w, height: hBar, color: headColor });
-      page.drawText(`FAHRZEUG ${clean(party.party_label)}`, { x: x + 4, y: y - 10, size: 8, font: bold, color: rgb(1, 1, 1) });
-      y -= hBar;
-
+      let cy = y;
+      const hBar = 12;
+      page.drawRectangle({ x, y: cy - hBar, width: colW, height: hBar, color: headColor });
+      page.drawText(`FAHRZEUG ${clean(party.party_label)}`, { x: x + 3, y: cy - 9, size: 6.5, font: bold, color: rgb(1, 1, 1) });
+      cy -= hBar;
       const d = party.driver_json as Record<string, unknown> ?? {};
       const v = party.vehicle_json as Record<string, unknown> ?? {};
       const ins = party.insurance_json as Record<string, unknown> ?? {};
-
-      labeledField(page, regular, bold, "6", "Versicherungsnehmer", [d.fullName, d.address, d.phone].filter(Boolean).join("\n"), x, y - 44, w, 44); y -= 46;
-      labeledField(page, regular, bold, "7", "Fahrzeug / Kennzeichen", [v.makeModel, v.plate].filter(Boolean).join(" · "), x, y - 30, w, 30); y -= 32;
-      labeledField(page, regular, bold, "8", "Versicherung", [ins.company, ins.policyNumber].filter(Boolean).join(" · "), x, y - 30, w, 30); y -= 32;
-      labeledField(page, regular, bold, "9", "Fahrer", [d.fullName, d.address, d.phone].filter(Boolean).join("\n"), x, y - 40, w, 40); y -= 42;
-      // field 10 = point of impact (arrow) - small
-      labeledField(page, regular, bold, "10", "Aufprallpunkt", "(siehe Skizze)", x, y - 18, w, 18); y -= 20;
-      labeledField(page, regular, bold, "11", "Sichtbare Schaeden", party.damage_description, x, y - 50, w, 50); y -= 52;
-      labeledField(page, regular, bold, "14", "Bemerkungen", "", x, y - 30, w, 30); y -= 32;
+      labeledField(page, regular, bold, "6", "Versicherungsnehmer", [d.fullName, d.address, d.phone].filter(Boolean).join("\n"), x, cy - 40, colW, 40); cy -= 42;
+      labeledField(page, regular, bold, "7", "Fahrzeug / Kennzeichen", [v.makeModel, v.plate].filter(Boolean).join(" - "), x, cy - 26, colW, 26); cy -= 28;
+      labeledField(page, regular, bold, "8", "Versicherung", [ins.company, ins.policyNumber].filter(Boolean).join(" - "), x, cy - 26, colW, 26); cy -= 28;
+      labeledField(page, regular, bold, "9", "Fahrer", [d.fullName, d.address, d.phone].filter(Boolean).join("\n"), x, cy - 36, colW, 36); cy -= 38;
+      labeledField(page, regular, bold, "10", "Aufprallpunkt", "(siehe Skizze)", x, cy - 14, colW, 14); cy -= 16;
+      labeledField(page, regular, bold, "11", "Sichtbare Schaeden", party.damage_description, x, cy - 42, colW, 42); cy -= 44;
+      labeledField(page, regular, bold, "14", "Bemerkungen", "", x, cy - 24, colW, 24);
     };
 
-    drawPartyColumn(partyA, colLeft, blue);
-    drawPartyColumn(partyB, colRight, yellow);
+    drawPartyColumn(partyA, colLeft, blueA);
+    drawPartyColumn(partyB, colRight, yellowB);
 
-    // --- MIDDLE COLUMN: circumstances ---
     const mx = colMid;
-    const mw = COL_W;
-    let my = colTop;
-    page.drawRectangle({ x: mx, y: my - 14, width: mw, height: 14, color: rgb(0.9, 0.92, 0.95) });
-    page.drawText("12 UNFALLUMSTAENDE", { x: mx + 4, y: my - 10, size: 8, font: bold, color: navy });
-    my -= 16;
-
+    let my = y;
+    page.drawRectangle({ x: mx, y: my - 12, width: colW, height: 12, color: rgb(0.9, 0.92, 0.95) });
+    page.drawText("12 UNFALLUMSTAENDE", { x: mx + 3, y: my - 9, size: 6.5, font: bold, color: navy });
+    my -= 14;
+    const rowH = 10.5;
     CIRCUMSTANCES.forEach((label, index) => {
       const checkedA = (partyA?.circumstances_checked ?? []).includes(index);
       const checkedB = partyB ? (partyB.circumstances_checked ?? []).includes(index) : false;
-      const rowY = my - index * 14;
-      // A checkbox
-      page.drawRectangle({ x: mx + 2, y: rowY - 3, width: 7, height: 7, borderWidth: 0.4, borderColor: navy, color: checkedA ? blue : rgb(1, 1, 1) });
-      // B checkbox
-      page.drawRectangle({ x: mx + mw - 10, y: rowY - 3, width: 7, height: 7, borderWidth: 0.4, borderColor: navy, color: checkedB ? yellow : rgb(1, 1, 1) });
-      page.drawText(`${index + 1}. ${clean(label)}`, { x: mx + 13, y: rowY, size: 5, font: regular, color: rgb(0.15, 0.18, 0.22) });
+      const rowY = my - index * rowH;
+      page.drawRectangle({ x: mx + 2, y: rowY - 2.5, width: 5, height: 5, borderWidth: 0.3, borderColor: navy, color: checkedA ? blueA : rgb(1, 1, 1) });
+      page.drawRectangle({ x: mx + colW - 7, y: rowY - 2.5, width: 5, height: 5, borderWidth: 0.3, borderColor: navy, color: checkedB ? yellowB : rgb(1, 1, 1) });
+      page.drawText(`${index + 1}. ${clean(label)}`, { x: mx + 10, y: rowY, size: 4, font: regular, color: rgb(0.12, 0.14, 0.18) });
     });
-    my -= CIRCUMSTANCES.length * 14 + 4;
-
-    // Count of checked boxes
+    my -= CIRCUMSTANCES.length * rowH + 3;
     const countA = (partyA?.circumstances_checked ?? []).length;
     const countB = partyB ? (partyB?.circumstances_checked ?? []).length : 0;
-    page.drawText("Anzahl:", { x: mx + 2, y: my, size: 5.5, font: bold, color: rgb(0.2, 0.25, 0.3) });
-    page.drawRectangle({ x: mx + 30, y: my - 3, width: 14, height: 10, borderWidth: 0.4, borderColor: navy });
-    page.drawText(String(countA), { x: mx + 34, y: my, size: 6, font: bold, color: blue });
-    page.drawRectangle({ x: mx + mw - 44, y: my - 3, width: 14, height: 10, borderWidth: 0.4, borderColor: navy });
-    page.drawText(String(countB), { x: mx + mw - 40, y: my, size: 6, font: bold, color: yellow });
-    my -= 16;
+    page.drawText("Anzahl:", { x: mx + 2, y: my, size: 4.5, font: bold, color: rgb(0.15, 0.18, 0.22) });
+    page.drawRectangle({ x: mx + 24, y: my - 2.5, width: 10, height: 7, borderWidth: 0.3, borderColor: navy });
+    page.drawText(String(countA), { x: mx + 27, y: my, size: 5, font: bold, color: blueA });
+    page.drawRectangle({ x: mx + colW - 34, y: my - 2.5, width: 10, height: 7, borderWidth: 0.3, borderColor: navy });
+    page.drawText(String(countB), { x: mx + colW - 31, y: my, size: 5, font: bold, color: yellowB });
 
-    // --- SKETCH AREA (13) — bottom area, full width of columns ---
-    const sketchY = MARGIN + 140;
-    const sketchH = 125;
-    const sketchW = PW - 2 * MARGIN;
-    box(page, MARGIN, sketchY, sketchW, sketchH);
-    page.drawText("13 SKIZZE DES UNFALLS", { x: MARGIN + 6, y: sketchY + sketchH - 8, size: 7, font: bold, color: navy });
-    page.drawText("Verlauf der Fahrspuren, Fahrtrichtung (Pfeile), Position beim Aufprall, Verkehrszeichen, Strassennamen", { x: MARGIN + 6, y: sketchY + sketchH - 18, size: 5, font: regular, color: rgb(0.4, 0.45, 0.5) });
+    y = MARGIN + 230;
+    const sketchH = 140;
+    box(page, MARGIN, y, CONTENT_W, sketchH);
+    page.drawText("13 SKIZZE DES UNFALLS", { x: MARGIN + 4, y: y + sketchH - 7, size: 6, font: bold, color: navy });
+    page.drawText("Fahrspuren, Fahrtrichtung, Aufprallposition, Strassennamen", { x: MARGIN + 4, y: y + sketchH - 15, size: 4, font: regular, color: rgb(0.4, 0.45, 0.5) });
 
-    // Shared sketch from incidents.sketch_data_url
     let sketchDrawn = false;
     if (incident.sketch_data_url) {
       const sketchVal = incident.sketch_data_url;
-      // Check if it's a structured JSON sketch
       if (sketchVal.startsWith("{")) {
         try {
           const structured = JSON.parse(sketchVal);
-          // Render structured sketch as basic shapes in PDF
-          const sx = MARGIN + 6;
-          const sy = sketchY + 6;
-          const sw = sketchW - 12;
-          const sh = sketchH - 30;
-
-          // Road background
-          page.drawRectangle({ x: sx, y: sy + sh * 0.35, width: sw, height: sh * 0.3, color: rgb(0.8, 0.8, 0.8) });
-
-          // Elements
+          const sx = MARGIN + 4;
+          const sy = y + 4;
+          const sw = CONTENT_W - 8;
+          const sh = sketchH - 24;
+          page.drawRectangle({ x: sx, y: sy + sh * 0.3, width: sw, height: sh * 0.4, color: rgb(0.82, 0.82, 0.82) });
           for (const el of (structured.elements ?? [])) {
             const ex = sx + (el.x ?? 0.5) * sw;
-            const ey = sy + (1 - (el.y ?? 0.5)) * sh; // Flip Y for PDF coordinate system
+            const ey = sy + (1 - (el.y ?? 0.5)) * sh;
             if (el.kind === "vehicle") {
               const isA = el.party === "A";
-              const col = isA ? rgb(0.11, 0.45, 0.72) : rgb(0.92, 0.72, 0.08);
-              page.drawRectangle({ x: ex - 5, y: ey - 3, width: 10, height: 6, color: col, borderColor: rgb(0.1, 0.1, 0.1), borderWidth: 0.5 });
-              page.drawText(el.party ?? "?", { x: ex - 1.5, y: ey - 1, size: 5, font: bold, color: rgb(1, 1, 1) });
+              const dark = isA ? blueA : yellowB;
+              const light = isA ? blueA_light : yellowB_light;
+              page.drawRectangle({ x: ex - 4, y: ey - 2.5, width: 8, height: 5, color: light, borderColor: dark, borderWidth: 0.4 });
+              page.drawRectangle({ x: ex - 4, y: ey - 2.5, width: 8, height: 1.5, color: dark });
+              page.drawText(el.party ?? "?", { x: ex - 1.2, y: ey - 0.8, size: 3.5, font: bold, color: dark });
             } else if (el.kind === "impact") {
-              page.drawLine({ start: { x: ex - 3, y: ey + 3 }, end: { x: ex + 3, y: ey - 3 }, thickness: 1, color: rgb(0.8, 0, 0) });
-              page.drawLine({ start: { x: ex - 3, y: ey - 3 }, end: { x: ex + 3, y: ey + 3 }, thickness: 1, color: rgb(0.8, 0, 0) });
+              page.drawLine({ start: { x: ex - 2, y: ey + 2 }, end: { x: ex + 2, y: ey - 2 }, thickness: 0.8, color: rgb(0.8, 0, 0) });
+              page.drawLine({ start: { x: ex - 2, y: ey - 2 }, end: { x: ex + 2, y: ey + 2 }, thickness: 0.8, color: rgb(0.8, 0, 0) });
             } else if (el.kind === "arrow") {
-              const fromX = sx + (el.from?.[0] ?? 0.5) * sw;
-              const fromY = sy + (1 - (el.from?.[1] ?? 0.5)) * sh;
-              const toX = sx + (el.to?.[0] ?? el.x ?? 0.5) * sw;
-              const toY = sy + (1 - (el.to?.[1] ?? el.y ?? 0.5)) * sh;
-              const col = el.party === "A" ? rgb(0.11, 0.45, 0.72) : rgb(0.92, 0.72, 0.08);
-              page.drawLine({ start: { x: fromX, y: fromY }, end: { x: toX, y: toY }, thickness: 0.8, color: col });
+              const fx = sx + (el.from?.[0] ?? 0.5) * sw;
+              const fy = sy + (1 - (el.from?.[1] ?? 0.5)) * sh;
+              const tx = sx + (el.to?.[0] ?? el.x ?? 0.5) * sw;
+              const ty = sy + (1 - (el.to?.[1] ?? el.y ?? 0.5)) * sh;
+              page.drawLine({ start: { x: fx, y: fy }, end: { x: tx, y: ty }, thickness: 0.6, color: el.party === "A" ? blueA : yellowB });
             }
           }
-          // Street names
-          if (structured.streets?.main) page.drawText(clean(structured.streets.main), { x: sx + sw / 2, y: sy + 2, size: 4, font: regular, color: rgb(0.2, 0.2, 0.2) });
+          if (structured.streets?.main) page.drawText(clean(structured.streets.main), { x: sx + sw / 2, y: sy + 2, size: 3.5, font: regular, color: rgb(0.2, 0.2, 0.2) });
           sketchDrawn = true;
-        } catch { /* fall through to image rendering */ }
+        } catch { /* fall through */ }
       }
       if (!sketchDrawn) {
         try {
           const base64 = sketchVal.split(",")[1] ?? sketchVal;
           const sketchBytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
           const img = await embedImage(pdf, sketchBytes, "image/png");
-          if (img) { drawImageFit(page, img, MARGIN + 6, sketchY + 6, sketchW - 12, sketchH - 30); sketchDrawn = true; }
-        } catch { /* fall through to media */ }
+          if (img) { drawImageFit(page, img, MARGIN + 4, y + 4, CONTENT_W - 8, sketchH - 24); sketchDrawn = true; }
+        } catch { /* fall through */ }
       }
     }
     if (!sketchDrawn) {
@@ -294,59 +262,58 @@ serve(async (req) => {
       if (sketchItem && downloaded.has(sketchItem.storage_path)) {
         const stored = downloaded.get(sketchItem.storage_path)!;
         const img = await embedImage(pdf, stored.bytes, stored.contentType);
-        if (img) drawImageFit(page, img, MARGIN + 6, sketchY + 6, sketchW - 12, sketchH - 30);
+        if (img) drawImageFit(page, img, MARGIN + 4, y + 4, CONTENT_W - 8, sketchH - 24);
       }
     }
 
-    // --- SIGNATURES (15) — below sketch, two fields side by side ---
-    const sigY = MARGIN + 8;
-    const sigH = 120;
-    const sigW = (sketchW - 6) / 2;
-    const drawSignature = async (party: Record<string, unknown> | undefined, x: number) => {
-      box(page, x, sigY, sigW, sigH);
-      page.drawText(`15 UNTERSCHRIFT ${clean(party?.party_label)}`, { x: x + 6, y: sigY + sigH - 8, size: 6, font: bold, color: navy });
-      page.drawText("Unbedingt von BEIDEN Fahrern zu unterzeichnen", { x: x + 6, y: sigY + sigH - 16, size: 4.5, font: regular, color: rgb(0.4, 0.45, 0.5) });
+    y = MARGIN + 5;
+    const sigH = 85;
+    const sigW = (CONTENT_W - 4) / 2;
+    const drawSig = async (party: Record<string, unknown> | undefined, x: number) => {
+      box(page, x, y, sigW, sigH);
+      page.drawText(`15 UNTERSCHRIFT ${clean(party?.party_label)}`, { x: x + 4, y: y + sigH - 6, size: 5, font: bold, color: navy });
+      page.drawText("Von BEIDEN Fahrern zu unterzeichnen", { x: x + 4, y: y + sigH - 13, size: 3.5, font: regular, color: rgb(0.4, 0.45, 0.5) });
       if (party) {
         const sigItem = (media ?? []).find((item) => item.storage_path.includes(`/${party.id}/signature.`));
         if (sigItem && downloaded.has(sigItem.storage_path)) {
           const stored = downloaded.get(sigItem.storage_path)!;
           const img = await embedImage(pdf, stored.bytes, stored.contentType);
-          if (img) drawImageFit(page, img, x + 8, sigY + 12, sigW - 16, sigH - 32);
+          if (img) drawImageFit(page, img, x + 6, y + 8, sigW - 12, sigH - 24);
         }
-        page.drawText(`Signiert: ${clean(party.signed_at ? new Date(party.signed_at as string).toLocaleString("de-CH") : "")}`, { x: x + 6, y: sigY + 4, size: 5, font: regular, color: rgb(0.35, 0.4, 0.45) });
+        page.drawText(`Signiert: ${clean(party.signed_at ? new Date(party.signed_at as string).toLocaleString("de-CH") : "")}`, { x: x + 4, y: y + 3, size: 4, font: regular, color: rgb(0.35, 0.4, 0.45) });
       }
     };
-    await drawSignature(partyA, MARGIN);
-    await drawSignature(partyB, MARGIN + sigW + 6);
+    await drawSig(partyA, MARGIN);
+    await drawSig(partyB, MARGIN + sigW + 4);
 
-    // --- FOOTER ---
-    page.drawText(`Fall ${clean(incident.share_code)} · Erstellt ${new Date().toLocaleDateString("de-CH")} · Die Unterschrift stellt kein Schuldanerkenntnis dar.`, { x: MARGIN, y: 4, size: 5, font: regular, color: rgb(0.4, 0.45, 0.5) });
+    page.drawText(`Fall ${clean(incident.share_code)} - Erstellt ${new Date().toLocaleDateString("de-CH")} - Unterschrift kein Schuldanerkenntnis.`, { x: MARGIN, y: 4, size: 4, font: regular, color: rgb(0.4, 0.45, 0.5) });
 
-    // --- PHOTO APPENDIX ---
     const photos = (media ?? []).filter((item) => item.kind === "photo");
     for (let index = 0; index < photos.length; index += 4) {
-      const pPage = pdf.addPage([595.28, 841.89]);
-      pPage.drawText(`FOTOANHANG · FALL ${clean(incident.share_code)}`, { x: 28, y: 810, size: 14, font: bold, color: navy });
+      const pPage = pdf.addPage([PW, PH]);
+      pPage.drawText(`FOTOANHANG - FALL ${clean(incident.share_code)}`, { x: MARGIN, y: PH - 28, size: 12, font: bold, color: navy });
       for (let slot = 0; slot < 4; slot++) {
         const item = photos[index + slot];
         if (!item) break;
-        const px = slot % 2 === 0 ? 28 : 304;
-        const py = slot < 2 ? 432 : 48;
+        const px = slot % 2 === 0 ? MARGIN : MARGIN + (CONTENT_W / 2) + 2;
+        const py = slot < 2 ? PH - MARGIN - 320 : PH - MARGIN - 640;
+        const photoW = CONTENT_W / 2 - 2;
+        const photoH = 310;
         const ownerParty = parties.find((p) => p.id === item.party_id);
-        box(pPage, px, py, 263, 342);
+        box(pPage, px, py, photoW, photoH);
         const stored = downloaded.get(item.storage_path);
         if (stored) {
           const img = await embedImage(pdf, stored.bytes, stored.contentType);
-          if (img) drawImageFit(pPage, img, px + 8, py + 28, 247, 304);
+          if (img) drawImageFit(pPage, img, px + 6, py + 22, photoW - 12, photoH - 36);
         }
-        pPage.drawText(`Foto ${index + slot + 1} · Partei ${clean(ownerParty?.party_label)}`, { x: px + 8, y: py + 11, size: 7, font: regular, color: rgb(0.3, 0.35, 0.4) });
+        pPage.drawText(`Foto ${index + slot + 1} - Partei ${clean(ownerParty?.party_label)}`, { x: px + 6, y: py + 8, size: 5.5, font: regular, color: rgb(0.3, 0.35, 0.4) });
       }
     }
 
     const pdfBytes = await pdf.save();
     const storagePath = `${incidentId}/unfallprotokoll-${incident.share_code}.pdf`;
     const { error: uploadError } = await service.storage.from("incident-pdfs").upload(storagePath, pdfBytes, { upsert: true, contentType: "application/pdf" });
-    if (uploadError) { console.error("[generate-pdf] Upload failed", { error: uploadError.message }); throw uploadError; }
+    if (uploadError) throw uploadError;
 
     const { data: existing } = await service.from("submissions").select("id, status").eq("incident_id", incidentId).eq("party_id", submissionParty.id).maybeSingle();
     let submissionId: string;
@@ -361,7 +328,7 @@ serve(async (req) => {
 
     const { data: signed, error: signError } = await service.storage.from("incident-pdfs").createSignedUrl(storagePath, 3600, { download: `Verkehrsunfall-Bericht-${incident.share_code}.pdf` });
     if (signError) throw signError;
-    console.log("[generate-pdf] PDF generated", { incidentId, submissionId, photoCount: photos.length });
+    console.log("[generate-pdf] PDF generated", { incidentId, submissionId, photoCount: photos.length, format: "A4-portrait" });
     return json({ submissionId, storagePath, downloadUrl: signed.signedUrl });
   } catch (error) {
     console.error("[generate-pdf] generation failed", { error: error instanceof Error ? error.message : String(error) });

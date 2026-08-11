@@ -154,6 +154,9 @@ export function ScenarioBuilder({ checkedCircumstances, initialSketch, onSave }:
 
           {/* Canvas */}
           <div className="relative overflow-hidden rounded-xl border border-slate-300 bg-white" style={{ aspectRatio: "3 / 2" }}>
+            {builderStep === 1 && sketch.elements.some((e) => e.kind === "vehicle") && (
+              <div className="absolute left-2 top-2 z-10 rounded-lg bg-blue-50 px-2 py-1 text-[10px] font-medium text-blue-700">{t("sketch.frontHint")}</div>
+            )}
             <div className="pointer-events-none absolute inset-0" dangerouslySetInnerHTML={{ __html: renderSketchSVG(sketch, { width: 100, height: 65 }) }} />
             {/* Draggable elements overlay */}
             {sketch.elements.map((el, i) => (
