@@ -38,7 +38,7 @@ serve(async (req) => {
 
     const [{ data: incident, error: incidentError }, { data: ownParty, error: partyError }] = await Promise.all([
       service.from("incidents").select("id, share_code, status, version").eq("id", incidentId).single(),
-      service.from("incident_parties").select("id").eq("incident_id", incidentId).eq("profile_id", authData.user.id).maybeSingle(),
+      service.from("incident_parties").select("id, signed_at").eq("incident_id", incidentId).eq("profile_id", authData.user.id).maybeSingle(),
     ]);
     if (incidentError || partyError || !incident) {
       console.error("[submit-incident] Data fetch failed", { incidentError: incidentError?.message, partyError: partyError?.message });
@@ -46,15 +46,17 @@ serve(async (req) => {
     }
     if (!ownParty) return json({ error: "forbidden" }, 403);
 
-    // Defensive status check: auto-fix if all parties signed but status not updated
+    // NEW RULE: Only my own signature is required. No counterpart check.
+    if (!ownParty.signed_at) {
+      return json({ error: "own_signature_required" }, 409);
+    }
+
+    // Auto-fix status if all parties signed but status not yet updated
     if (!["signed", "submitted"].includes(incident.status)) {
       const { data: allParties } = await service.from("incident_parties").select("signed_at").eq("incident_id", incidentId);
       const allSigned = allParties && allParties.length > 0 && allParties.every((p) => p.signed_at);
       if (allSigned) {
-        console.log("[submit-incident] Auto-fixing incident status to signed", { incidentId, currentStatus: incident.status });
         await service.from("incidents").update({ status: "signed", version: incident.version + 1, updated_at: new Date().toISOString() }).eq("id", incidentId).eq("version", incident.version);
-      } else {
-        return json({ error: "incident_not_completed" }, 409);
       }
     }
 

@@ -109,15 +109,22 @@ serve(async (req) => {
     }
     if (!submissionParty) return json({ error: "forbidden" }, 403);
 
+    // NEW RULE: PDF is allowed as soon as MY OWN party has signed.
+    // No dependency on counterpart signature. Document carries its own status.
+    const requesterSigned = Boolean(submissionParty.signed_at);
+    if (!requesterSigned) {
+      return json({ error: "own_signature_required" }, 409);
+    }
+
+    // Determine completeness
     const realParties = parties.filter((p) => p.profile_id);
     const unsignedParties = realParties.filter((p) => !p.signed_at);
     const allSigned = realParties.length > 0 && unsignedParties.length === 0;
-    if (!["signed", "submitted"].includes(incident.status)) {
-      if (allSigned) {
-        await service.from("incidents").update({ status: "signed", version: incident.version + 1, updated_at: new Date().toISOString() }).eq("id", incidentId).eq("version", incident.version);
-      } else {
-        return json({ error: "incident_not_completed", detail: `Unsigned: ${unsignedParties.map((p) => p.party_label).join(", ")}` }, 409);
-      }
+    const completeness = allSigned ? "vollstaendig" : "einseitig";
+
+    // If all signed but status not yet "signed", fix it (trigger should do this, but belt-and-braces)
+    if (allSigned && !["signed", "submitted"].includes(incident.status)) {
+      await service.from("incidents").update({ status: "signed", version: incident.version + 1, updated_at: new Date().toISOString() }).eq("id", incidentId).eq("version", incident.version);
     }
 
     const downloaded = new Map<string, { bytes: Uint8Array; contentType?: string }>();
@@ -140,6 +147,12 @@ serve(async (req) => {
 
     page.drawRectangle({ x: 0, y: PH - 30, width: PW, height: 30, color: navy });
     page.drawText("VERKEHRSUNFALL-BERICHT", { x: MARGIN, y: PH - 20, size: 13, font: bold, color: rgb(1, 1, 1) });
+    // Unilateral notice banner
+    if (completeness === "einseitig") {
+      const unsignedLabels = unsignedParties.map((p) => p.party_label).join(", ");
+      page.drawRectangle({ x: MARGIN, y: PH - 38, width: CONTENT_W, height: 10, color: rgb(0.95, 0.85, 0.3) });
+      page.drawText(`EINSEITIG ERFASST - Partei ${unsignedLabels} hat dieses Protokoll nicht bestaetigt`, { x: MARGIN + 4, y: PH - 35, size: 6, font: bold, color: rgb(0.4, 0.3, 0) });
+    }
     page.drawText(`Fall ${clean(incident.share_code)}`, { x: PW - 110, y: PH - 14, size: 6, font: regular, color: rgb(0.85, 0.9, 1) });
 
     let y = PH - 34;
@@ -163,11 +176,16 @@ serve(async (req) => {
 
     const drawPartyColumn = (party: Record<string, unknown> | undefined, x: number, headColor: typeof blueA) => {
       if (!party) return;
+      const isUnsigned = !party.signed_at;
       let cy = y;
       const hBar = 12;
       page.drawRectangle({ x, y: cy - hBar, width: colW, height: hBar, color: headColor });
-      page.drawText(`FAHRZEUG ${clean(party.party_label)}`, { x: x + 3, y: cy - 9, size: 6.5, font: bold, color: rgb(1, 1, 1) });
+      page.drawText(`FAHRZEUG ${clean(party.party_label)}${isUnsigned ? " (NICHT BESTAETIGT)" : ""}`, { x: x + 3, y: cy - 9, size: isUnsigned ? 5 : 6.5, font: bold, color: rgb(1, 1, 1) });
       cy -= hBar;
+      if (isUnsigned) {
+        page.drawText(`Angaben erfasst von Partei ${clean(party.party_label)} - nicht bestaetigt`, { x: x + 2, y: cy - 3, size: 3.5, font: regular, color: rgb(0.6, 0.5, 0) });
+        cy -= 6;
+      }
       const d = party.driver_json as Record<string, unknown> ?? {};
       const v = party.vehicle_json as Record<string, unknown> ?? {};
       const ins = party.insurance_json as Record<string, unknown> ?? {};
@@ -274,13 +292,18 @@ serve(async (req) => {
       page.drawText(`15 UNTERSCHRIFT ${clean(party?.party_label)}`, { x: x + 4, y: y + sigH - 6, size: 5, font: bold, color: navy });
       page.drawText("Von BEIDEN Fahrern zu unterzeichnen", { x: x + 4, y: y + sigH - 13, size: 3.5, font: regular, color: rgb(0.4, 0.45, 0.5) });
       if (party) {
-        const sigItem = (media ?? []).find((item) => item.storage_path.includes(`/${party.id}/signature.`));
-        if (sigItem && downloaded.has(sigItem.storage_path)) {
-          const stored = downloaded.get(sigItem.storage_path)!;
-          const img = await embedImage(pdf, stored.bytes, stored.contentType);
-          if (img) drawImageFit(page, img, x + 6, y + 8, sigW - 12, sigH - 24);
+        if (party.signed_at) {
+          const sigItem = (media ?? []).find((item) => item.storage_path.includes(`/${party.id}/signature.`));
+          if (sigItem && downloaded.has(sigItem.storage_path)) {
+            const stored = downloaded.get(sigItem.storage_path)!;
+            const img = await embedImage(pdf, stored.bytes, stored.contentType);
+            if (img) drawImageFit(page, img, x + 6, y + 8, sigW - 12, sigH - 24);
+          }
+          page.drawText(`Signiert: ${clean(party.signed_at ? new Date(party.signed_at as string).toLocaleString("de-CH") : "")}`, { x: x + 4, y: y + 3, size: 4, font: regular, color: rgb(0.35, 0.4, 0.45) });
+        } else {
+          page.drawText("KEINE UNTERSCHRIFT", { x: x + sigW / 2 - 20, y: y + sigH / 2, size: 7, font: bold, color: rgb(0.7, 0.3, 0.3) });
+          page.drawText(`Partei ${clean(party.party_label)} hat nicht unterschrieben`, { x: x + 4, y: y + 3, size: 3.5, font: regular, color: rgb(0.7, 0.3, 0.3) });
         }
-        page.drawText(`Signiert: ${clean(party.signed_at ? new Date(party.signed_at as string).toLocaleString("de-CH") : "")}`, { x: x + 4, y: y + 3, size: 4, font: regular, color: rgb(0.35, 0.4, 0.45) });
       }
     };
     await drawSig(partyA, MARGIN);
@@ -311,7 +334,7 @@ serve(async (req) => {
     }
 
     const pdfBytes = await pdf.save();
-    const storagePath = `${incidentId}/unfallprotokoll-${incident.share_code}.pdf`;
+    const storagePath = `${incidentId}/unfallprotokoll-${incident.share_code}-${completeness}.pdf`;
     const { error: uploadError } = await service.storage.from("incident-pdfs").upload(storagePath, pdfBytes, { upsert: true, contentType: "application/pdf" });
     if (uploadError) throw uploadError;
 
@@ -329,7 +352,7 @@ serve(async (req) => {
     const { data: signed, error: signError } = await service.storage.from("incident-pdfs").createSignedUrl(storagePath, 3600, { download: `Verkehrsunfall-Bericht-${incident.share_code}.pdf` });
     if (signError) throw signError;
     console.log("[generate-pdf] PDF generated", { incidentId, submissionId, photoCount: photos.length, format: "A4-portrait" });
-    return json({ submissionId, storagePath, downloadUrl: signed.signedUrl });
+    return json({ submissionId, storagePath, downloadUrl: signed.signedUrl, completeness });
   } catch (error) {
     console.error("[generate-pdf] generation failed", { error: error instanceof Error ? error.message : String(error) });
     return json({ error: "pdf_generation_failed" }, 500);

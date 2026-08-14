@@ -841,7 +841,12 @@ export default function Index() {
                 : !serverOnline || draftRef?.incidentId.startsWith("local:")
                   ? <div className="rounded-2xl border-2 border-dashed border-slate-300 bg-slate-50 p-5 text-center"><WifiOff className="mx-auto h-8 w-8 text-slate-400" /><p className="mt-2 text-sm font-semibold text-slate-600">{t("signature.onlineRequired")}</p></div>
                   : <DrawingCanvas label={t("fields.signature")} height={170} confirmable onChange={(value, dataUrl) => { update("hasSignature", value); update("signatureDataUrl", dataUrl ?? ""); }} />}
-            {alreadySigned && draftRef && !draftRef.incidentId.startsWith("local:") && <SubmissionPanel incidentId={draftRef.incidentId} />}
+            {alreadySigned && draftRef && !draftRef.incidentId.startsWith("local:") && counterpart && !counterpart.signedAt && (
+              <div className="rounded-xl border border-blue-200 bg-blue-50 p-4">
+                <p className="text-sm leading-relaxed text-blue-900">{t("submission.unilateralNotice", { party: counterpart.partyLabel })}</p>
+              </div>
+            )}
+            {alreadySigned && draftRef && !draftRef.incidentId.startsWith("local:") && <SubmissionPanel incidentId={draftRef.incidentId} unilateral={Boolean(counterpart && !counterpart.signedAt)} counterpartLabel={counterpart?.partyLabel ?? ""} />}
             <p className="text-xs leading-relaxed text-slate-500">{t("summary.disclaimer")}</p>
           </div>}
 
@@ -869,7 +874,7 @@ export default function Index() {
   );
 }
 
-function SubmissionPanel({ incidentId }: { incidentId: string }) {
+function SubmissionPanel({ incidentId, unilateral, counterpartLabel }: { incidentId: string; unilateral?: boolean; counterpartLabel?: string }) {
   const { t } = useTranslation();
   const [targetEmail, setTargetEmail] = useState("");
   const [generating, setGenerating] = useState(false);
@@ -945,6 +950,7 @@ function SubmissionPanel({ incidentId }: { incidentId: string }) {
             <DialogDescription>{t("submission.confirmText", { email: targetEmail })}</DialogDescription>
           </DialogHeader>
           <div className="mt-2 rounded-lg bg-amber-50 p-3 text-xs text-amber-800">{t("submission.confirmIrreversible")}</div>
+          {unilateral && <div className="mt-2 rounded-lg bg-amber-100 border border-amber-300 p-3 text-xs text-amber-900 font-medium">{t("submission.confirmUnilateral", { party: counterpartLabel ?? "B" })}</div>}
           <div className="mt-4 flex gap-3">
             <Button variant="outline" onClick={() => setConfirmOpen(false)} className="h-11 flex-1 rounded-xl">{t("app.close")}</Button>
             <Button onClick={() => void submit()} className="h-11 flex-1 rounded-xl bg-[#153B66]"><Send className="mr-2 h-4 w-4" />{t("submission.submit")}</Button>

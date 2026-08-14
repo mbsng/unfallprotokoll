@@ -21,11 +21,11 @@ async function extractErrorCode(error: unknown, fallback: string) {
 export async function generateIncidentPdf(incidentId: string) {
   const { data, error } = await supabase.functions.invoke("generate-pdf", { body: { incidentId } });
   if (error || !data?.downloadUrl) throw new SubmissionError(await extractErrorCode(error, data?.error ?? "pdf_generation_failed"));
-  return data as { submissionId: string; storagePath: string; downloadUrl: string };
+  return data as { submissionId: string; storagePath: string; downloadUrl: string; completeness?: string };
 }
 
 export async function submitIncident(incidentId: string, targetEmail: string) {
   const { data, error } = await supabase.functions.invoke("submit-incident", { body: { incidentId, targetEmail } });
   if (error || !data?.downloadUrl) throw new SubmissionError(await extractErrorCode(error, data?.error ?? "submission_failed"));
-  return data as { submissionId: string; status: "submitted"; submittedAt?: string; downloadUrl: string };
+  return data as { submissionId: string; status: "submitted"; submittedAt?: string; downloadUrl: string; completeness?: string };
 }
