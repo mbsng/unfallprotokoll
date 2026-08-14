@@ -137,6 +137,7 @@ export default function Index() {
   const [casesError, setCasesError] = useState(false);
   const [ensuringServerCase, setEnsuringServerCase] = useState(false);
   const [syncError, setSyncError] = useState<string | null>(null);
+  const [saveStatus, setSaveStatus] = useState<"saved" | "saving" | "error">("saved");
   const [caseLoading, setCaseLoading] = useState(false);
   const [locating, setLocating] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<CaseItem | null>(null);
@@ -158,8 +159,13 @@ export default function Index() {
 
   const update = <K extends keyof AccidentData>(key: K, value: AccidentData[K]) => {
     setDirty(true);
+    setSaveStatus("saving");
     setData((previous) => ({ ...previous, [key]: value }));
-    if (user && localDraftId) void saveDraftField(user.id, localDraftId, key, value);
+    if (user && localDraftId) {
+      void saveDraftField(user.id, localDraftId, key, value)
+        .then(() => setSaveStatus("saved"))
+        .catch(() => setSaveStatus("error"));
+    }
   };
 
   const formatNumber = (value: number) => new Intl.NumberFormat(locale).format(value);
@@ -452,15 +458,50 @@ export default function Index() {
         ownerId = (await supabase.auth.getUser()).data.user?.id;
       }
       if (!ownerId) throw new Error("authentication_required");
-      if (navigator.onLine) {
+
+      if (serverOnline) {
         const entitlement = await getPlanEntitlement();
         if (!entitlement.canCreate) {
           navigate("/upgrade?reason=limit");
           return;
         }
+        // Create incident + party atomically on the server FIRST
+        console.log("[startAccident] Creating incident on server via RPC");
+        const { data: rpcResult, error: rpcError } = await Promise.race([
+          supabase.rpc("create_incident_with_party", {
+            initial_driver: { fullName: initial.driverName, address: initial.driverAddress, phone: initial.phone },
+            initial_vehicle: { plate: initial.plate, makeModel: initial.vehicle },
+            initial_insurance: { company: initial.insurer, policyNumber: initial.policy },
+          }),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timeout")), 10_000)),
+        ]);
+        const row = rpcResult?.[0];
+        if (rpcError) {
+          console.error("[startAccident] RPC error", { error: rpcError.message });
+          throw new Error(`rpc:${rpcError.message}`);
+        }
+        if (!row || !row.share_code) {
+          console.error("[startAccident] RPC returned no data — likely RLS blocking");
+          throw new Error("rpc_zero_rows");
+        }
+        console.log("[startAccident] Server creation successful", { incidentId: row.incident_id, shareCode: row.share_code });
+
+        const draftRef: IncidentDraftRef = {
+          incidentId: row.incident_id,
+          partyId: row.party_id,
+          partyLabel: "A",
+          shareCode: row.share_code,
+          incidentVersion: row.incident_version,
+          partyVersion: row.party_version,
+        };
+        const created = await createLocalDraft(ownerId, initial, draftRef);
+        applyLocalDraft(created);
+      } else {
+        // True offline — work locally, will sync later
+        console.log("[startAccident] Offline — creating local draft only");
+        const created = await createLocalDraft(ownerId, initial);
+        applyLocalDraft(created);
       }
-      const created = await createLocalDraft(ownerId, initial);
-      applyLocalDraft(created);
       setParties([]);
       setLiveUpdatesActive(false);
       setDirty(false);
@@ -468,7 +509,8 @@ export default function Index() {
       setStep(0);
       setView("wizard");
       window.scrollTo(0, 0);
-    } catch {
+    } catch (error) {
+      console.error("[startAccident] Failed", { error: error instanceof Error ? error.message : String(error) });
       toast.error(t("incident.createError"));
     } finally {
       setCreating(false);
@@ -773,7 +815,7 @@ export default function Index() {
 
   return (
     <div className="min-h-screen bg-[#F5F7FA] pb-28 text-slate-900">
-      <header className="sticky top-0 z-20 border-b border-slate-200 bg-white/95 backdrop-blur"><div className="mx-auto max-w-3xl px-4 py-3"><div className="flex items-center justify-between gap-2"><Button variant="ghost" size="icon" onClick={back} className="h-11 w-11 shrink-0 rounded-xl" aria-label={t("app.back")}><ArrowLeft className="h-6 w-6 text-[#153B66]" /></Button><div className="min-w-0 text-center"><p className="text-xs font-semibold uppercase tracking-wider text-slate-500">{t("wizard.stepOf", { current: formatNumber(step + 1), total: formatNumber(6) })}</p><p className="truncate font-bold text-[#153B66]">{steps[step]}</p></div><div className="flex items-center gap-1"><Button variant="ghost" size="icon" onClick={() => void refreshFromServer()} disabled={summaryLoading} className="h-9 w-9 rounded-lg" aria-label={t("home.refresh")}><RefreshCw className={`h-4 w-4 text-[#153B66] ${summaryLoading ? "animate-spin" : ""}`} /></Button><LanguageSwitcher /></div></div><div className="mt-3 flex items-center gap-3"><Progress value={((step + 1) / 6) * 100} className="h-1.5 flex-1 bg-slate-200 [&>div]:bg-[#39719D]" /><div className="flex items-center gap-2"><span className={`flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold ${serverOnline ? "bg-emerald-100 text-emerald-700" : "bg-slate-200 text-slate-600"}`}><span className={`h-1.5 w-1.5 rounded-full ${serverOnline ? "bg-emerald-500" : "bg-slate-400"}`} />{t(serverOnline ? "connection.online" : "connection.offline")}</span>{liveUpdatesActive && <span className="hidden items-center gap-0.5 rounded-full bg-blue-100 px-1.5 py-0.5 text-[10px] font-semibold text-blue-700 sm:flex"><Radio className="h-2.5 w-2.5 animate-pulse" />{t("connection.live")}</span>}</div></div><div className="mt-2 flex gap-1 overflow-x-auto pb-1">{steps.map((label, index) => <button key={index} onClick={() => setStep(index)} className={`shrink-0 rounded-full px-2.5 py-1 text-[10px] font-semibold transition ${index === step ? "bg-[#153B66] text-white" : index < step ? "bg-[#E7F0F6] text-[#153B66]" : "bg-slate-100 text-slate-400"}`}>{index + 1}</button>)}</div></div></header>
+      <header className="sticky top-0 z-20 border-b border-slate-200 bg-white/95 backdrop-blur"><div className="mx-auto max-w-3xl px-4 py-3"><div className="flex items-center justify-between gap-2"><Button variant="ghost" size="icon" onClick={back} className="h-11 w-11 shrink-0 rounded-xl" aria-label={t("app.back")}><ArrowLeft className="h-6 w-6 text-[#153B66]" /></Button><div className="min-w-0 text-center"><p className="text-xs font-semibold uppercase tracking-wider text-slate-500">{t("wizard.stepOf", { current: formatNumber(step + 1), total: formatNumber(6) })}</p><p className="truncate font-bold text-[#153B66]">{steps[step]}</p></div><div className="flex items-center gap-1"><Button variant="ghost" size="icon" onClick={() => void refreshFromServer()} disabled={summaryLoading} className="h-9 w-9 rounded-lg" aria-label={t("home.refresh")}><RefreshCw className={`h-4 w-4 text-[#153B66] ${summaryLoading ? "animate-spin" : ""}`} /></Button><LanguageSwitcher /></div></div><div className="mt-3 flex items-center gap-3"><Progress value={((step + 1) / 6) * 100} className="h-1.5 flex-1 bg-slate-200 [&>div]:bg-[#39719D]" /><div className="flex items-center gap-2"><span className={`flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold ${serverOnline ? "bg-emerald-100 text-emerald-700" : "bg-slate-200 text-slate-600"}`}><span className={`h-1.5 w-1.5 rounded-full ${serverOnline ? "bg-emerald-500" : "bg-slate-400"}`} />{t(serverOnline ? "connection.online" : "connection.offline")}</span>{saveStatus === "saving" && <span className="flex items-center gap-1 rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-semibold text-blue-700"><RefreshCw className="h-2.5 w-2.5 animate-spin" />{t("save.saving")}</span>}{saveStatus === "saved" && <span className="flex items-center gap-1 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-semibold text-emerald-700"><Check className="h-2.5 w-2.5" />{t("save.saved")}</span>}{saveStatus === "error" && <button onClick={() => void retrySync()} className="flex items-center gap-1 rounded-full bg-rose-100 px-2 py-0.5 text-[10px] font-semibold text-rose-700"><AlertTriangle className="h-2.5 w-2.5" />{t("save.error")}</button>}{liveUpdatesActive && <span className="hidden items-center gap-0.5 rounded-full bg-blue-100 px-1.5 py-0.5 text-[10px] font-semibold text-blue-700 sm:flex"><Radio className="h-2.5 w-2.5 animate-pulse" />{t("connection.live")}</span>}</div></div><div className="mt-2 flex gap-1 overflow-x-auto pb-1">{steps.map((label, index) => <button key={index} onClick={() => setStep(index)} className={`shrink-0 rounded-full px-2.5 py-1 text-[10px] font-semibold transition ${index === step ? "bg-[#153B66] text-white" : index < step ? "bg-[#E7F0F6] text-[#153B66]" : "bg-slate-100 text-slate-400"}`}>{index + 1}</button>)}</div></div></header>
       <main className="mx-auto max-w-3xl px-5 py-7">{caseLoading ? <div className="flex min-h-64 items-center justify-center"><RefreshCw className="h-7 w-7 animate-spin text-[#39719D]" /></div> : <>
       <div className="mb-7"><div className="mb-2 flex flex-wrap items-center gap-2"><p className="text-sm font-semibold text-[#39719D]">{formatNumber(step + 1).padStart(2, "0")} — {steps[step]}</p>{draftRef && <span className="rounded-full bg-[#E7F0F6] px-2.5 py-1 font-mono text-xs font-bold tracking-wider text-[#153B66]">{t("incident.shareCode")}: {draftRef.shareCode}</span>}</div><h1 className="text-2xl font-bold tracking-tight text-[#102F52]">{titles[step]}</h1><p className="mt-2 text-sm leading-relaxed text-slate-500">{descriptions[step]}</p></div>
 
@@ -818,13 +860,7 @@ export default function Index() {
           </div>}
           {step === 5 && <div className="space-y-6">
             {draftRef?.partyLabel === "A" && !alreadySigned && (draftRef.incidentId.startsWith("local:")
-              ? (syncError
-                  ? <div className="rounded-2xl border border-rose-200 bg-rose-50 p-5 text-center"><AlertTriangle className="mx-auto mb-2 h-8 w-8 text-rose-500" /><p className="text-sm font-semibold text-rose-900">{t(syncError === "timeout" ? "sync.timeout" : syncError === "creation_failed" ? "sync.creationFailed" : "sync.error")}</p><p className="mt-1 text-xs text-rose-700">{t("sync.dataPreserved")}</p><Button variant="outline" onClick={() => { setSyncError(null); void retrySync(); }} className="mt-3 rounded-xl border-rose-300 bg-white text-rose-900"><RefreshCw className="mr-2 h-4 w-4" />{t("home.retry")}</Button></div>
-                  : ensuringServerCase
-                    ? <div className="flex items-center justify-center rounded-2xl border border-slate-200 bg-slate-50 p-8"><RefreshCw className="mr-2 h-5 w-5 animate-spin text-[#39719D]" /><span className="text-sm font-semibold text-slate-600">{t("invite.savingCase")}</span></div>
-                    : !serverOnline
-                      ? <div className="rounded-2xl border border-amber-200 bg-amber-50 p-5 text-center"><p className="text-sm font-semibold text-amber-900">{t("invite.offlineHint")}</p><p className="mt-1 text-xs text-amber-700">{t("invite.offlineDetail")}</p></div>
-                      : <div className="rounded-2xl border border-rose-200 bg-rose-50 p-5 text-center"><p className="text-sm font-semibold text-rose-900">{t("invite.saveFailed")}</p><Button variant="outline" onClick={() => void retrySync()} className="mt-3 rounded-xl border-rose-300 bg-white text-rose-900">{t("home.retry")}</Button></div>)
+              ? <div className="rounded-2xl border border-amber-200 bg-amber-50 p-5 text-center"><WifiOff className="mx-auto mb-2 h-8 w-8 text-amber-500" /><p className="text-sm font-semibold text-amber-900">{t("invite.offlineHint")}</p><p className="mt-1 text-xs text-amber-700">{t("invite.offlineDetail")}</p>{serverOnline && <Button variant="outline" onClick={() => void retrySync()} className="mt-3 rounded-xl border-amber-300 bg-white text-amber-900"><RefreshCw className="mr-2 h-4 w-4" />{t("home.retry")}</Button>}</div>
               : <InviteParty shareCode={draftRef.shareCode} loading={false} />)}
             <div className="grid gap-3 sm:grid-cols-2"><Summary number="1" icon={<Clock3 />} label={t("fields.dateTime")} value={formatCaseDate(data)} /><Summary number="2" icon={<MapPin />} label={t("fields.place")} value={data.location || t("fields.notProvided")} /><Summary number="9" icon={<UserRound />} label={t("fields.driver")} value={data.driverName || t("fields.notProvided")} /><Summary number="7" icon={<Car />} label={t("fields.vehicle")} value={`${data.plate || t("fields.noPlate")}${data.vehicle ? ` · ${data.vehicle}` : ""}`} /><Summary number="8" icon={<ShieldCheck />} label={t("fields.insurer")} value={data.insurer || t("fields.notProvided")} /><Summary number="11–13" icon={<Camera />} label={t("fields.documentation")} value={`${t("fields.photosCount", { formattedCount: formatNumber(data.photos.length) })} · ${t(data.hasSketch ? "fields.sketchAvailable" : "fields.withoutSketch")}`} /></div>
             <div className="rounded-2xl border border-slate-200 p-4"><FieldBadge number="12" /><p className="mb-2 mt-2 text-xs font-bold uppercase tracking-wider text-slate-500">{t("summary.circumstances")}</p>{selectedSummary.length ? <ul className="space-y-1.5">{selectedSummary.map((item) => <li key={item} className="flex gap-2 text-sm text-slate-700"><Check className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />{item}</li>)}</ul> : <p className="text-sm text-slate-500">{t("summary.noneSelected")}</p>}</div>
