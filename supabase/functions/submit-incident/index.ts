@@ -9,6 +9,11 @@ const corsHeaders = {
 const json = (body: Record<string, unknown>, status = 200) => new Response(JSON.stringify(body), { status, headers: { ...corsHeaders, "Content-Type": "application/json" } });
 const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+async function sha256(value: string) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest)).map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 function toBase64(bytes: Uint8Array) {
   let binary = "";
   const chunkSize = 0x8000;
@@ -49,6 +54,24 @@ serve(async (req) => {
     // NEW RULE: Only my own signature is required. No counterpart check.
     if (!ownParty.signed_at) {
       return json({ error: "own_signature_required" }, 409);
+    }
+
+    // Rate limit: the report contains full PII, so cap submissions per account
+    // and per incident to prevent email bombing of arbitrary addresses.
+    for (const limitInput of [
+      { key: `submit-account:${authData.user.id}`, limit: 5 },
+      { key: `submit-incident:${incidentId}`, limit: 5 },
+    ]) {
+      const { data: allowed, error: rateError } = await service.rpc("consume_rate_limit", {
+        target_key_hash: await sha256(limitInput.key),
+        request_limit: limitInput.limit,
+        window_seconds: 3600,
+      });
+      if (rateError) {
+        console.error("[submit-incident] rate limit failed", { error: rateError.message });
+        return json({ error: "rate_limit_failed" }, 500);
+      }
+      if (!allowed) return json({ error: "too_many_submissions" }, 429);
     }
 
     // Auto-fix status if all parties signed but status not yet updated

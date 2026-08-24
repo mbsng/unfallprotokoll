@@ -13,8 +13,15 @@ const PARTY_COLORS: Record<PartyId, PartyColors> = {
   neutral: { fill: "#D5D4D0", stroke: "#5F5E5A", front: "#5F5E5A" },
 };
 
-function esc(s: string): string {
-  return s.replace(/[<>&"']/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", '"': "&quot;", "'": "&apos;" }[c] ?? c));
+function esc(value: unknown): string {
+  return String(value ?? "").replace(/[<>&"']/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", '"': "&quot;", "'": "&apos;" }[c] ?? c));
+}
+
+// Inputs may come from untrusted persisted JSON — coerce numerics and
+// whitelist enum-like values before they are interpolated into SVG markup.
+function num(value: unknown, fallback: number): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
 }
 
 // All shapes are drawn pointing UP (front at top). Rotation applied by caller.
@@ -106,13 +113,15 @@ const BODY_FN: Record<VehicleType, (c: PartyColors, d: boolean, l: string) => st
 };
 
 export function vehicleSVG(opts: { type: VehicleType; party?: PartyId; state?: VehicleState; rotation?: number; label?: string; x?: number; y?: number }): string {
-  const colors = PARTY_COLORS[opts.party ?? "neutral"];
+  const party: PartyId = opts.party === "A" || opts.party === "B" ? opts.party : "neutral";
+  const colors = PARTY_COLORS[party];
   const dashed = opts.state === "parkiert" || opts.state === "haltend";
-  const label = opts.label ?? (opts.party && opts.party !== "neutral" ? opts.party : "");
-  const body = BODY_FN[opts.type ?? "car"](colors, dashed, label);
-  const rot = opts.rotation ?? 0;
-  const cx = (opts.x ?? 0.5) * 100;
-  const cy = (opts.y ?? 0.5) * 100;
+  const label = opts.label ?? (party !== "neutral" ? party : "");
+  const bodyFn = (BODY_FN as Record<string, (c: PartyColors, d: boolean, l: string) => string>)[opts.type ?? "car"] ?? BODY_FN.car;
+  const body = bodyFn(colors, dashed, label);
+  const rot = num(opts.rotation, 0);
+  const cx = num(opts.x, 0.5) * 100;
+  const cy = num(opts.y, 0.5) * 100;
   // Counter-rotate the label text to keep it readable
   const counterRot = -rot;
   // The body is drawn with front pointing up; rotate the whole group
@@ -122,8 +131,8 @@ export function vehicleSVG(opts: { type: VehicleType; party?: PartyId; state?: V
 }
 
 export function pedestrianSVG(x: number, y: number): string {
-  const cx = x * 100;
-  const cy = y * 100;
+  const cx = num(x, 0.5) * 100;
+  const cy = num(y, 0.5) * 100;
   return `<g transform="translate(${cx},${cy})">
     <circle cx="0" cy="-3" r="2" fill="none" stroke="#5F5E5A" stroke-width="0.8" />
     <rect x="-1.5" y="-4.5" width="3" height="1" fill="#5F5E5A" />
@@ -132,8 +141,8 @@ export function pedestrianSVG(x: number, y: number): string {
 }
 
 export function animalSVG(x: number, y: number): string {
-  const cx = x * 100;
-  const cy = y * 100;
+  const cx = num(x, 0.5) * 100;
+  const cy = num(y, 0.5) * 100;
   return `<g transform="translate(${cx},${cy})">
     <ellipse cx="0" cy="0" rx="3.5" ry="2" fill="none" stroke="#5F5E5A" stroke-width="0.8" />
     <circle cx="3" cy="0" r="1.5" fill="#5F5E5A" />

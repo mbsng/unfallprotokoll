@@ -121,8 +121,9 @@ serve(async (req) => {
     if (action === "invite_driver") {
       const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
       if (!emailPattern.test(email) || email.length > 254) return json({ error: "invalid_email" }, 400);
-      const requestOrigin = req.headers.get("Origin");
-      const siteUrl = requestOrigin && /^https?:\/\//i.test(requestOrigin) ? requestOrigin : Deno.env.get("SITE_URL");
+      // Only the configured SITE_URL is trusted for invite redirect links;
+      // the request Origin is attacker-controlled.
+      const siteUrl = Deno.env.get("SITE_URL");
       const { data: invited, error: inviteError } = await service.auth.admin.inviteUserByEmail(email, {
         ...(siteUrl ? { redirectTo: `${siteUrl.replace(/\/$/, "")}/auth` } : {}),
         data: { org_id: manager.org_id, role: "driver" },

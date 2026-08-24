@@ -68,9 +68,11 @@ serve(async (req) => {
       if (error) throw error;
     }
 
-    const requestOrigin = req.headers.get("Origin");
-    const siteUrl = requestOrigin && /^https?:\/\//i.test(requestOrigin) ? requestOrigin : Deno.env.get("SITE_URL");
-    if (!siteUrl) return json({ error: "site_url_not_configured" }, 503);
+    // Never trust the request Origin for redirect URLs — a phisher could
+    // point the post-payment redirect at a look-alike domain. Only the
+    // configured SITE_URL is allowed.
+    const siteUrl = Deno.env.get("SITE_URL");
+    if (!siteUrl || !/^https?:\/\//i.test(siteUrl)) return json({ error: "site_url_not_configured" }, 503);
     const checkoutBody = new URLSearchParams();
     checkoutBody.set("mode", "subscription");
     checkoutBody.set("customer", customerId!);

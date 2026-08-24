@@ -1,14 +1,25 @@
 import type { StructuredSketch, SketchElement } from "@/lib/sketch-types";
 import { vehicleSVG, pedestrianSVG, animalSVG, PARTY_COLORS, type VehicleType, type PartyId } from "@/lib/vehicle-symbols";
 
-function escapeXml(s: string): string {
-  return s.replace(/[<>&"']/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", '"': "&quot;", "'": "&apos;" }[c] ?? c));
+// Sketch data can originate from untrusted JSON (shared incident column), so
+// every value interpolated into the SVG must be coerced or whitelisted here.
+function num(value: unknown, fallback: number): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function sanitizeParty(value: unknown): PartyId {
+  return value === "A" || value === "B" ? value : "neutral";
+}
+
+function escapeXml(value: unknown): string {
+  return String(value ?? "").replace(/[<>&"']/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", '"': "&quot;", "'": "&apos;" }[c] ?? c));
 }
 
 function obstacleIcon(el: SketchElement): string {
-  const cx = (el.x ?? 0.5) * 100;
-  const cy = (el.y ?? 0.5) * 100;
-  const type = el.type ?? "hindernis";
+  const cx = num(el.x, 0.5) * 100;
+  const cy = num(el.y, 0.5) * 100;
+  const type = typeof el.type === "string" ? el.type : "hindernis";
   const icons: Record<string, string> = {
     poller: `<circle cx="${cx}" cy="${cy}" r="2" fill="#5F5E5A" />`,
     pfosten: `<rect x="${cx - 0.8}" y="${cy - 3}" width="1.6" height="6" fill="#5F5E5A" />`,
@@ -23,14 +34,14 @@ function obstacleIcon(el: SketchElement): string {
     container: `<rect x="${cx - 3}" y="${cy - 1.5}" width="6" height="3" fill="#8a6a3a" />`,
     baustelle: `<polygon points="${cx - 3},${cy} ${cx},${cy - 3} ${cx + 3},${cy}" fill="#da0" />`,
   };
-  return icons[type] ?? icons.wand;
+  return Object.prototype.hasOwnProperty.call(icons, type) ? icons[type] : icons.wand;
 }
 
 export function renderSketchSVG(sketch: StructuredSketch, opts?: { width?: number; height?: number }): string {
-  const w = opts?.width ?? 100;
-  const h = opts?.height ?? 65;
+  const w = num(opts?.width, 100);
+  const h = num(opts?.height, 65);
   const layout = sketch.layout ?? { type: "strasse_gerade", lanes_per_direction: 1 };
-  const lanes = layout.lanes_per_direction ?? 1;
+  const lanes = Math.min(4, Math.max(1, num(layout.lanes_per_direction, 1)));
 
   let bg = "";
   const roadY1 = 42;
@@ -67,42 +78,42 @@ export function renderSketchSVG(sketch: StructuredSketch, opts?: { width?: numbe
   if (sketch.streets?.cross) labels += `<text x="${w - 4}" y="50" font-size="3.5" fill="#333" font-family="sans-serif" transform="rotate(90, ${w - 4}, 50)">${escapeXml(sketch.streets.cross)}</text>`;
 
   let elements = "";
-  for (const el of sketch.elements) {
-    const cx = (el.x ?? 0.5) * 100;
-    const cy = (el.y ?? 0.5) * 100;
+  for (const el of sketch.elements ?? []) {
+    const cx = num(el.x, 0.5) * 100;
+    const cy = num(el.y, 0.5) * 100;
     if (el.kind === "vehicle") {
       // Use the new vehicle symbol library
       const vType: VehicleType = "car"; // Default to car; could be extended with vehicle type data
-      const party: PartyId = (el.party as PartyId) ?? "neutral";
+      const party = sanitizeParty(el.party);
       elements += vehicleSVG({
         type: vType,
         party,
-        state: el.state as "fahrend" | "haltend" | "parkiert" | undefined,
-        rotation: el.rotation,
-        label: el.party,
-        x: el.x,
-        y: el.y,
+        state: el.state === "fahrend" || el.state === "haltend" || el.state === "parkiert" ? el.state : undefined,
+        rotation: num(el.rotation, 0),
+        label: party === "neutral" ? undefined : party,
+        x: num(el.x, 0.5),
+        y: num(el.y, 0.5),
       });
     } else if (el.kind === "obstacle") {
       elements += obstacleIcon(el);
     } else if (el.kind === "arrow") {
-      const fromX = (el.from?.[0] ?? cx / 100) * 100;
-      const fromY = (el.from?.[1] ?? cy / 100) * 100;
-      const toX = (el.to?.[0] ?? el.x ?? 0.5) * 100;
-      const toY = (el.to?.[1] ?? el.y ?? 0.5) * 100;
-      const party = el.party ?? "A";
+      const fromX = num(el.from?.[0], num(el.x, 0.5)) * 100;
+      const fromY = num(el.from?.[1], num(el.y, 0.5)) * 100;
+      const toX = num(el.to?.[0], num(el.x, 0.5)) * 100;
+      const toY = num(el.to?.[1], num(el.y, 0.5)) * 100;
+      const party = el.party === "B" ? "B" : "A";
       const color = party === "A" ? PARTY_COLORS.A.front : PARTY_COLORS.B.front;
       elements += `<line x1="${fromX}" y1="${fromY}" x2="${toX}" y2="${toY}" stroke="${color}" stroke-width="1" marker-end="url(#arrow-${party})" />`;
     } else if (el.kind === "impact") {
       elements += `<g transform="translate(${cx},${cy})"><line x1="-3" y1="-3" x2="3" y2="3" stroke="#cc0000" stroke-width="1.5" /><line x1="-3" y1="3" x2="3" y2="-3" stroke="#cc0000" stroke-width="1.5" /></g>`;
     } else if (el.kind === "pedestrian") {
-      elements += pedestrianSVG(el.x ?? 0.5, el.y ?? 0.5);
+      elements += pedestrianSVG(num(el.x, 0.5), num(el.y, 0.5));
     } else if (el.kind === "animal") {
-      elements += animalSVG(el.x ?? 0.5, el.y ?? 0.5);
+      elements += animalSVG(num(el.x, 0.5), num(el.y, 0.5));
     } else if (el.kind === "cyclist") {
-      elements += vehicleSVG({ type: "bicycle", party: "neutral", x: el.x, y: el.y });
+      elements += vehicleSVG({ type: "bicycle", party: "neutral", x: num(el.x, 0.5), y: num(el.y, 0.5) });
     } else if (el.kind === "motorcycle") {
-      elements += vehicleSVG({ type: "motorcycle", party: "neutral", x: el.x, y: el.y });
+      elements += vehicleSVG({ type: "motorcycle", party: "neutral", x: num(el.x, 0.5), y: num(el.y, 0.5) });
     } else if (el.kind === "label") {
       elements += `<text x="${cx}" y="${cy}" font-size="4" fill="#333" font-family="sans-serif">${escapeXml(el.text ?? "")}</text>`;
     }
