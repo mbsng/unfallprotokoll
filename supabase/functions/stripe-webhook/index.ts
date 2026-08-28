@@ -1,26 +1,24 @@
 import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
 import { stripeRequest, verifyStripeSignature } from "../_shared/stripe.ts";
+import { corsHeaders } from "../_shared/cors.ts";
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "stripe-signature, content-type",
-};
-const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+const ALLOW_HEADERS = "stripe-signature, content-type";
+const json = (req: Request, body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { ...corsHeaders(req, ALLOW_HEADERS), "Content-Type": "application/json" } });
 
 serve(async (req) => {
-  if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
-  if (req.method !== "POST") return json({ error: "method_not_allowed" }, 405);
+  if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders(req, ALLOW_HEADERS) });
+  if (req.method !== "POST") return json(req, { error: "method_not_allowed" }, 405);
 
   try {
     const stripeSecret = Deno.env.get("STRIPE_SECRET_KEY");
     const webhookSecret = Deno.env.get("STRIPE_WEBHOOK_SECRET");
-    if (!stripeSecret || !webhookSecret) return json({ error: "billing_not_configured" }, 503);
+    if (!stripeSecret || !webhookSecret) return json(req, { error: "billing_not_configured" }, 503);
     const signature = req.headers.get("Stripe-Signature");
     const payload = await req.text();
     if (!signature || !(await verifyStripeSignature(payload, signature, webhookSecret))) {
       console.warn("[stripe-webhook] invalid signature");
-      return json({ error: "invalid_signature" }, 400);
+      return json(req, { error: "invalid_signature" }, 400);
     }
 
     const event = JSON.parse(payload);
@@ -54,9 +52,9 @@ serve(async (req) => {
       console.warn("[stripe-webhook] payment failed", { eventId: event.id, customerId });
     }
 
-    return json({ received: true });
+    return json(req, { received: true });
   } catch (error) {
     console.error("[stripe-webhook] synchronization failed", { error: error instanceof Error ? error.message : String(error) });
-    return json({ error: "webhook_failed" }, 500);
+    return json(req, { error: "webhook_failed" }, 500);
   }
 });

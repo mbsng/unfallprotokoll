@@ -1,20 +1,23 @@
 import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
+import { corsHeaders } from "../_shared/cors.ts";
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
-};
-const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+const ALLOW_HEADERS = "authorization, x-client-info, apikey, content-type";
+const json = (req: Request, body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { ...corsHeaders(req, ALLOW_HEADERS), "Content-Type": "application/json" } });
 const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+async function sha256(value: string) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest)).map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 serve(async (req) => {
-  if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
-  if (req.method !== "POST") return json({ error: "method_not_allowed" }, 405);
+  if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders(req, ALLOW_HEADERS) });
+  if (req.method !== "POST") return json(req, { error: "method_not_allowed" }, 405);
 
   try {
     const authHeader = req.headers.get("Authorization");
-    if (!authHeader?.startsWith("Bearer ")) return json({ error: "unauthorized" }, 401);
+    if (!authHeader?.startsWith("Bearer ")) return json(req, { error: "unauthorized" }, 401);
 
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
     const authClient = createClient(supabaseUrl, Deno.env.get("SUPABASE_ANON_KEY")!, {
@@ -23,10 +26,10 @@ serve(async (req) => {
     });
     const service = createClient(supabaseUrl, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!, { auth: { persistSession: false } });
     const { data: authData, error: authError } = await authClient.auth.getUser(authHeader.slice(7));
-    if (authError || !authData.user) return json({ error: "unauthorized" }, 401);
+    if (authError || !authData.user) return json(req, { error: "unauthorized" }, 401);
 
     const { data: manager } = await service.from("profiles").select("org_id, role").eq("id", authData.user.id).single();
-    if (!manager?.org_id || !["fleet_manager", "admin"].includes(manager.role)) return json({ error: "forbidden" }, 403);
+    if (!manager?.org_id || !["fleet_manager", "admin"].includes(manager.role)) return json(req, { error: "forbidden" }, 403);
 
     const body = await req.json();
     const action = body.action;
@@ -64,7 +67,7 @@ serve(async (req) => {
         if (data.user?.email) emails.set(profile.id, data.user.email);
       }
 
-      return json({
+      return json(req, {
         incidents: (incidents ?? []).map((incident: any) => {
           const membership = membershipByIncident.get(incident.id);
           const driver = driverById.get(membership?.profile_id) as any;
@@ -87,11 +90,11 @@ serve(async (req) => {
 
     if (action === "detail") {
       const incidentId = typeof body.incidentId === "string" ? body.incidentId : "";
-      if (!/^[0-9a-f-]{36}$/i.test(incidentId)) return json({ error: "invalid_incident" }, 400);
+      if (!/^[0-9a-f-]{36}$/i.test(incidentId)) return json(req, { error: "invalid_incident" }, 400);
       const { data: orgParty } = profileIds.length
         ? await service.from("incident_parties").select("id, profile_id, driver_json, vehicle_json").eq("incident_id", incidentId).in("profile_id", profileIds).limit(1).maybeSingle()
         : { data: null };
-      if (!orgParty) return json({ error: "not_found" }, 404);
+      if (!orgParty) return json(req, { error: "not_found" }, 404);
 
       const [{ data: incident, error: incidentError }, { data: parties }, { data: witnesses }, { count: photoCount }] = await Promise.all([
         service.from("incidents").select("id, share_code, status, occurred_at, created_at, location_text, circumstances_json").eq("id", incidentId).single(),
@@ -99,9 +102,9 @@ serve(async (req) => {
         service.from("incident_witnesses").select("id, name, contact").eq("incident_id", incidentId),
         service.from("incident_media").select("id", { count: "exact", head: true }).eq("incident_id", incidentId).eq("kind", "photo"),
       ]);
-      if (incidentError || !incident) return json({ error: "not_found" }, 404);
+      if (incidentError || !incident) return json(req, { error: "not_found" }, 404);
       const driver = (orgProfiles ?? []).find((profile: any) => profile.id === orgParty.profile_id);
-      return json({ incident: {
+      return json(req, { incident: {
         id: incident.id,
         shareCode: incident.share_code,
         status: incident.status,
@@ -120,7 +123,27 @@ serve(async (req) => {
 
     if (action === "invite_driver") {
       const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
-      if (!emailPattern.test(email) || email.length > 254) return json({ error: "invalid_email" }, 400);
+      if (!emailPattern.test(email) || email.length > 254) return json(req, { error: "invalid_email" }, 400);
+
+      // Invitations send transactional email from the app's sender address,
+      // so cap the volume per organization and per manager to prevent the
+      // portal from being used as a mail relay / list-probing oracle.
+      for (const limitInput of [
+        { key: `invite-org:${manager.org_id}`, limit: 20 },
+        { key: `invite-account:${authData.user.id}`, limit: 10 },
+      ]) {
+        const { data: allowed, error: rateError } = await service.rpc("consume_rate_limit", {
+          target_key_hash: await sha256(limitInput.key),
+          request_limit: limitInput.limit,
+          window_seconds: 3600,
+        });
+        if (rateError) {
+          console.error("[fleet-portal] invite rate limit failed", { error: rateError.message });
+          return json(req, { error: "rate_limit_failed" }, 500);
+        }
+        if (!allowed) return json(req, { error: "too_many_invites" }, 429);
+      }
+
       // Only the configured SITE_URL is trusted for invite redirect links;
       // the request Origin is attacker-controlled.
       const siteUrl = Deno.env.get("SITE_URL");
@@ -130,12 +153,12 @@ serve(async (req) => {
       });
 
       if (inviteError || !invited.user) {
-        if (inviteError?.message.toLowerCase().includes("already")) return json({ error: "already_registered" }, 409);
+        if (inviteError?.message.toLowerCase().includes("already")) return json(req, { error: "already_registered" }, 409);
         throw inviteError ?? new Error("invite_failed");
       }
 
       const { data: existingProfile } = await service.from("profiles").select("org_id").eq("id", invited.user.id).maybeSingle();
-      if (existingProfile?.org_id && existingProfile.org_id !== manager.org_id) return json({ error: "different_organization" }, 409);
+      if (existingProfile?.org_id && existingProfile.org_id !== manager.org_id) return json(req, { error: "different_organization" }, 409);
       const profileResult = existingProfile
         ? await service.from("profiles").update({ org_id: manager.org_id, role: "driver" }).eq("id", invited.user.id)
         : await service.from("profiles").insert({ id: invited.user.id, org_id: manager.org_id, role: "driver", locale: "de-CH", default_vehicle_json: {}, insurance_json: {}, onboarding_completed: false });
@@ -149,12 +172,12 @@ serve(async (req) => {
         status: "pending",
       }, { onConflict: "org_id,email" }).select("id, email, status, created_at").single();
       if (recordError) throw recordError;
-      return json({ invitation: { id: invitation.id, email: invitation.email, status: invitation.status, createdAt: invitation.created_at } }, 201);
+      return json(req, { invitation: { id: invitation.id, email: invitation.email, status: invitation.status, createdAt: invitation.created_at } }, 201);
     }
 
-    return json({ error: "invalid_action" }, 400);
+    return json(req, { error: "invalid_action" }, 400);
   } catch (error) {
     console.error("[fleet-portal] request failed", { error: error instanceof Error ? error.message : String(error) });
-    return json({ error: "fleet_portal_failed" }, 500);
+    return json(req, { error: "fleet_portal_failed" }, 500);
   }
 });

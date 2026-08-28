@@ -2,12 +2,10 @@ import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
 import { PDFDocument, StandardFonts, rgb, type PDFImage, type PDFPage, type PDFFont } from "https://esm.sh/pdf-lib@1.17.1";
 import { incidentBelongsToOrg } from "../_shared/incident-export.ts";
+import { corsHeaders } from "../_shared/cors.ts";
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
-};
-const json = (body: Record<string, unknown>, status = 200) => new Response(JSON.stringify(body), { status, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+const ALLOW_HEADERS = "authorization, x-client-info, apikey, content-type";
+const json = (req: Request, body: Record<string, unknown>, status = 200) => new Response(JSON.stringify(body), { status, headers: { ...corsHeaders(req, ALLOW_HEADERS), "Content-Type": "application/json" } });
 
 const PW = 595.28;
 const PH = 841.89;
@@ -74,21 +72,21 @@ const CIRCUMSTANCES = [
 ];
 
 serve(async (req) => {
-  if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
-  if (req.method !== "POST") return json({ error: "method_not_allowed" }, 405);
+  if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders(req, ALLOW_HEADERS) });
+  if (req.method !== "POST") return json(req, { error: "method_not_allowed" }, 405);
   try {
     const authHeader = req.headers.get("Authorization");
-    if (!authHeader?.startsWith("Bearer ")) return json({ error: "unauthorized" }, 401);
+    if (!authHeader?.startsWith("Bearer ")) return json(req, { error: "unauthorized" }, 401);
     const token = authHeader.slice(7);
     const body = await req.json();
     const incidentId = body.incidentId as string;
-    if (!incidentId || !/^[0-9a-f-]{36}$/i.test(incidentId)) return json({ error: "invalid_incident" }, 400);
+    if (!incidentId || !/^[0-9a-f-]{36}$/i.test(incidentId)) return json(req, { error: "invalid_incident" }, 400);
 
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
     const authClient = createClient(supabaseUrl, Deno.env.get("SUPABASE_ANON_KEY")!, { global: { headers: { Authorization: authHeader } }, auth: { persistSession: false } });
     const service = createClient(supabaseUrl, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!, { auth: { persistSession: false } });
     const { data: authData, error: authError } = await authClient.auth.getUser(token);
-    if (authError || !authData.user) return json({ error: "unauthorized" }, 401);
+    if (authError || !authData.user) return json(req, { error: "unauthorized" }, 401);
 
     const [{ data: incident, error: incidentError }, { data: parties, error: partiesError }, { data: witnesses }, { data: media }] = await Promise.all([
       service.from("incidents").select("*").eq("id", incidentId).single(),
@@ -96,7 +94,7 @@ serve(async (req) => {
       service.from("incident_witnesses").select("name, contact").eq("incident_id", incidentId),
       service.from("incident_media").select("storage_path, kind, taken_at, party_id").eq("incident_id", incidentId).order("uploaded_at"),
     ]);
-    if (incidentError || partiesError || !incident || !parties) return json({ error: "not_found" }, 404);
+    if (incidentError || partiesError || !incident || !parties) return json(req, { error: "not_found" }, 404);
 
     let submissionParty = parties.find((p) => p.profile_id === authData.user.id);
     if (!submissionParty) {
@@ -107,13 +105,13 @@ serve(async (req) => {
         submissionParty = parties.find((p) => p.profile_id === orgProfile?.id);
       }
     }
-    if (!submissionParty) return json({ error: "forbidden" }, 403);
+    if (!submissionParty) return json(req, { error: "forbidden" }, 403);
 
     // NEW RULE: PDF is allowed as soon as MY OWN party has signed.
     // No dependency on counterpart signature. Document carries its own status.
     const requesterSigned = Boolean(submissionParty.signed_at);
     if (!requesterSigned) {
-      return json({ error: "own_signature_required" }, 409);
+      return json(req, { error: "own_signature_required" }, 409);
     }
 
     // Determine completeness
@@ -352,9 +350,9 @@ serve(async (req) => {
     const { data: signed, error: signError } = await service.storage.from("incident-pdfs").createSignedUrl(storagePath, 3600, { download: `Verkehrsunfall-Bericht-${incident.share_code}.pdf` });
     if (signError) throw signError;
     console.log("[generate-pdf] PDF generated", { incidentId, submissionId, photoCount: photos.length, format: "A4-portrait" });
-    return json({ submissionId, storagePath, downloadUrl: signed.signedUrl, completeness });
+    return json(req, { submissionId, storagePath, downloadUrl: signed.signedUrl, completeness });
   } catch (error) {
     console.error("[generate-pdf] generation failed", { error: error instanceof Error ? error.message : String(error) });
-    return json({ error: "pdf_generation_failed" }, 500);
+    return json(req, { error: "pdf_generation_failed" }, 500);
   }
 });

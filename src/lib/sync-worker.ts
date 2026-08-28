@@ -319,19 +319,13 @@ async function completeDraft(draft: LocalDraft, entry: OutboxEntry) {
     return;
   }
 
-  const signedAt = new Date().toISOString();
-  const { data: updatedRow, error: updateError } = await withTimeout(supabase
-    .from("incident_parties")
-    .update({ signature_storage_path: storagePath, signed_at: signedAt, updated_at: signedAt })
-    .eq("id", partyId)
-    .select("version, signed_at, signature_storage_path")
-    .maybeSingle());
+  // Server-attested signing: the edge function verifies the uploaded
+  // signature exists in storage; clients can no longer write signed_at directly.
+  const { data: signedResult, error: signError } = await withTimeout(supabase.functions.invoke("sign-incident", { body: { partyId } }));
+  if (signError || !signedResult?.signedAt) throw new Error(`sign_failed:${signError?.message ?? "no_result"}`);
 
-  if (updateError) throw new Error(`party_update_failed:${updateError.message}`);
-  if (!updatedRow) throw new Error("party_update_zero_rows");
-
-  console.log("[sync-worker] signature row updated SUCCESSFULLY", { partyId, version: updatedRow.version, signedAt: updatedRow.signed_at, storagePath: updatedRow.signature_storage_path });
-  draft.ref = { ...draft.ref, partyVersion: updatedRow.version };
+  console.log("[sync-worker] signature attested by server", { partyId, version: signedResult.version, signedAt: signedResult.signedAt });
+  draft.ref = { ...draft.ref, partyVersion: signedResult.version };
   await db.transaction("rw", db.drafts, db.outbox, async () => {
     await db.drafts.put(draft);
     await db.outbox.delete(entry.id);

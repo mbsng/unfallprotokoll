@@ -1,12 +1,10 @@
 import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
 import { sendEmail } from "../_shared/email.ts";
+import { corsHeaders } from "../_shared/cors.ts";
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
-};
-const json = (body: Record<string, unknown>, status = 200) => new Response(JSON.stringify(body), { status, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+const ALLOW_HEADERS = "authorization, x-client-info, apikey, content-type";
+const json = (req: Request, body: Record<string, unknown>, status = 200) => new Response(JSON.stringify(body), { status, headers: { ...corsHeaders(req, ALLOW_HEADERS), "Content-Type": "application/json" } });
 const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 async function sha256(value: string) {
@@ -24,22 +22,33 @@ function toBase64(bytes: Uint8Array) {
 }
 
 serve(async (req) => {
-  if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
-  if (req.method !== "POST") return json({ error: "method_not_allowed" }, 405);
+  if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders(req, ALLOW_HEADERS) });
+  if (req.method !== "POST") return json(req, { error: "method_not_allowed" }, 405);
   try {
     const authHeader = req.headers.get("Authorization");
-    if (!authHeader?.startsWith("Bearer ")) return json({ error: "unauthorized" }, 401);
+    if (!authHeader?.startsWith("Bearer ")) return json(req, { error: "unauthorized" }, 401);
     const token = authHeader.slice(7);
     const body = await req.json();
     const incidentId = typeof body.incidentId === "string" ? body.incidentId : "";
     const targetEmail = typeof body.targetEmail === "string" ? body.targetEmail.trim().toLowerCase() : "";
-    if (!/^[0-9a-f-]{36}$/i.test(incidentId) || !emailPattern.test(targetEmail) || targetEmail.length > 254) return json({ error: "invalid_request" }, 400);
+    if (!/^[0-9a-f-]{36}$/i.test(incidentId) || !emailPattern.test(targetEmail) || targetEmail.length > 254) return json(req, { error: "invalid_request" }, 400);
 
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
     const authClient = createClient(supabaseUrl, Deno.env.get("SUPABASE_ANON_KEY")!, { global: { headers: { Authorization: authHeader } }, auth: { persistSession: false } });
     const service = createClient(supabaseUrl, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!, { auth: { persistSession: false } });
     const { data: authData, error: authError } = await authClient.auth.getUser(token);
-    if (authError || !authData.user) return json({ error: "unauthorized" }, 401);
+    if (authError || !authData.user) return json(req, { error: "unauthorized" }, 401);
+
+    // Destination restriction: the report contains BOTH parties' PII, so it
+    // may only be delivered to the requesting party's own verified address.
+    // This prevents using the app's mail sender as a relay to arbitrary
+    // third-party inboxes. Recipients can forward it to their insurer.
+    const ownEmail = (authData.user.email ?? "").trim().toLowerCase();
+    if (!ownEmail || !authData.user.email_confirmed_at) return json(req, { error: "verified_email_required" }, 403);
+    if (targetEmail !== ownEmail) {
+      console.warn("[submit-incident] rejected destination that is not the requester's own address", { incidentId, userId: authData.user.id });
+      return json(req, { error: "invalid_destination" }, 403);
+    }
 
     const [{ data: incident, error: incidentError }, { data: ownParty, error: partyError }] = await Promise.all([
       service.from("incidents").select("id, share_code, status, version").eq("id", incidentId).single(),
@@ -47,13 +56,13 @@ serve(async (req) => {
     ]);
     if (incidentError || partyError || !incident) {
       console.error("[submit-incident] Data fetch failed", { incidentError: incidentError?.message, partyError: partyError?.message });
-      return json({ error: "not_found" }, 404);
+      return json(req, { error: "not_found" }, 404);
     }
-    if (!ownParty) return json({ error: "forbidden" }, 403);
+    if (!ownParty) return json(req, { error: "forbidden" }, 403);
 
     // NEW RULE: Only my own signature is required. No counterpart check.
     if (!ownParty.signed_at) {
-      return json({ error: "own_signature_required" }, 409);
+      return json(req, { error: "own_signature_required" }, 409);
     }
 
     // Rate limit: the report contains full PII, so cap submissions per account
@@ -69,9 +78,9 @@ serve(async (req) => {
       });
       if (rateError) {
         console.error("[submit-incident] rate limit failed", { error: rateError.message });
-        return json({ error: "rate_limit_failed" }, 500);
+        return json(req, { error: "rate_limit_failed" }, 500);
       }
-      if (!allowed) return json({ error: "too_many_submissions" }, 429);
+      if (!allowed) return json(req, { error: "too_many_submissions" }, 429);
     }
 
     // Auto-fix status if all parties signed but status not yet updated
@@ -103,7 +112,7 @@ serve(async (req) => {
     // Already submitted — return the existing result
     if (submission.status === "submitted") {
       const { data: signed } = await service.storage.from("incident-pdfs").createSignedUrl(submission.pdf_storage_path, 3600, { download: `Unfallprotokoll-${incident.share_code}.pdf` });
-      return json({ submissionId: submission.id, status: "submitted", downloadUrl: signed?.signedUrl });
+      return json(req, { submissionId: submission.id, status: "submitted", downloadUrl: signed?.signedUrl });
     }
 
     const { data: pdfBlob, error: downloadError } = await service.storage.from("incident-pdfs").download(submission.pdf_storage_path);
@@ -126,7 +135,7 @@ serve(async (req) => {
       console.error("[submit-incident] Email sending failed", { error: message });
       // Record the failed attempt so it can be retried
       await service.from("submissions").update({ target: targetEmail, status: "failed" }).eq("id", submission.id);
-      if (message === "email_provider_not_configured") return json({ error: "email_provider_not_configured" }, 503);
+      if (message === "email_provider_not_configured") return json(req, { error: "email_provider_not_configured" }, 503);
       throw new Error(`email_send_failed:${message}`);
     }
 
@@ -167,12 +176,12 @@ serve(async (req) => {
       console.warn("[submit-incident] Webhook failed", { incidentId, error: webhookError instanceof Error ? webhookError.message : String(webhookError) });
     }
     console.log("[submit-incident] Incident submitted successfully", { incidentId, submissionId: submission.id, emailId: email.id, targetEmail });
-    return json({ submissionId: submission.id, status: "submitted", submittedAt, downloadUrl: signed.signedUrl });
+    return json(req, { submissionId: submission.id, status: "submitted", submittedAt, downloadUrl: signed.signedUrl });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error("[submit-incident] Submission failed", { error: message, stack: error instanceof Error ? error.stack : undefined });
-    if (message === "email_provider_not_configured") return json({ error: "email_provider_not_configured" }, 503);
-    if (message.startsWith("email_send_failed:")) return json({ error: "email_send_failed" }, 502);
-    return json({ error: "submission_failed" }, 500);
+    if (message === "email_provider_not_configured") return json(req, { error: "email_provider_not_configured" }, 503);
+    if (message.startsWith("email_send_failed:")) return json(req, { error: "email_send_failed" }, 502);
+    return json(req, { error: "submission_failed" }, 500);
   }
 });

@@ -26,7 +26,7 @@ import { computeCaseStatus, loadIncidentSummary, loadUserIncidents, subscribeToI
 import { createLocalDraft, db, deleteLocalDraft, deleteLocalPhoto, getLatestDraft, markDraftComplete, saveDraftField, saveLocalPhoto, type LocalDraft } from "@/lib/local-db";
 import { captureAccidentPhoto, getCurrentCoordinates, isNativeApp } from "@/lib/native-device";
 import { processOutbox } from "@/lib/sync-worker";
-import { generateIncidentPdf, SubmissionError, submitIncident } from "@/lib/submissions";
+import { generateIncidentPdf, signIncident, SubmissionError, submitIncident } from "@/lib/submissions";
 
 import type { AccidentData, IncidentDraftRef, IncidentPartySummary, IncidentSummaryData, JoinedIncidentState, PendingPhoto } from "@/types/incident";
 import type { CaseStatus, UserIncidentItem } from "@/types/incident";
@@ -657,35 +657,18 @@ export default function Index() {
       }
       console.log("[complete] Step b: Storage upload succeeded", { storagePath });
 
-      // Step c-d: Update incident_parties WITHOUT version check (RLS protects ownership)
-      const signedAt = new Date().toISOString();
-      console.log("[complete] Step c: Updating DB", { partyId, storagePath, signedAt });
-
-      const { data: updated, error: updateError } = await supabase.from("incident_parties")
-        .update({ signature_storage_path: storagePath, signed_at: signedAt, updated_at: signedAt })
-        .eq("id", partyId)
-        .select("id, version, signed_at, signature_storage_path");
-
-      if (updateError) {
-        console.error("[complete] Step c FAILED: DB update error", { partyId, error: updateError.message, code: updateError.code });
-        throw new Error(`db:${updateError.message}`);
-      }
-      console.log("[complete] Step c: DB update returned", { rowCount: updated?.length, data: updated });
-
-      // Step e: Verify exactly one row returned
-      if (!updated || updated.length === 0) {
-        console.error("[complete] Step e FAILED: 0 rows affected — RLS blocked the update", { partyId });
-        throw new Error("zero_rows_rls_blocked");
-      }
-
-      const updatedRow = updated[0];
-      console.log("[complete] Step e: Verified — signature saved", { partyId, version: updatedRow.version, signedAt: updatedRow.signed_at, path: updatedRow.signature_storage_path });
+      // Step c: Server-attested signing — the edge function verifies the
+      // uploaded signature image exists in storage before writing signed_at.
+      // Clients can no longer set signed_at directly (blocked by DB trigger).
+      console.log("[complete] Step c: Calling sign-incident", { partyId, storagePath });
+      const result = await signIncident(partyId);
+      console.log("[complete] Step c: sign-incident succeeded", { partyId, version: result.version, signedAt: result.signedAt, alreadySigned: result.alreadySigned });
 
       // Step f: Update local Dexie copy
       if (localDraftId) {
         const draft = await db.drafts.get(localDraftId);
         if (draft) {
-          draft.ref = { ...draft.ref, partyVersion: updatedRow.version };
+          draft.ref = { ...draft.ref, partyVersion: result.version };
           draft.data.hasSignature = true;
           await db.drafts.put(draft);
         }
@@ -882,7 +865,7 @@ export default function Index() {
                 <p className="text-sm leading-relaxed text-blue-900">{t("submission.unilateralNotice", { party: counterpart.partyLabel })}</p>
               </div>
             )}
-            {alreadySigned && draftRef && !draftRef.incidentId.startsWith("local:") && <SubmissionPanel incidentId={draftRef.incidentId} unilateral={Boolean(counterpart && !counterpart.signedAt)} counterpartLabel={counterpart?.partyLabel ?? ""} />}
+            {alreadySigned && draftRef && !draftRef.incidentId.startsWith("local:") && <SubmissionPanel incidentId={draftRef.incidentId} unilateral={Boolean(counterpart && !counterpart.signedAt)} counterpartLabel={counterpart?.partyLabel ?? ""} email={user?.email ?? null} />}
             <p className="text-xs leading-relaxed text-slate-500">{t("summary.disclaimer")}</p>
           </div>}
 
@@ -910,9 +893,9 @@ export default function Index() {
   );
 }
 
-function SubmissionPanel({ incidentId, unilateral, counterpartLabel }: { incidentId: string; unilateral?: boolean; counterpartLabel?: string }) {
+function SubmissionPanel({ incidentId, unilateral, counterpartLabel, email }: { incidentId: string; unilateral?: boolean; counterpartLabel?: string; email?: string | null }) {
   const { t } = useTranslation();
-  const [targetEmail, setTargetEmail] = useState("");
+  const [targetEmail, setTargetEmail] = useState(email ?? "");
   const [generating, setGenerating] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [submitted, setSubmitted] = useState(false);
@@ -940,12 +923,13 @@ function SubmissionPanel({ incidentId, unilateral, counterpartLabel }: { inciden
   };
 
   const submit = async () => {
-    if (!/^\S+@\S+\.\S+$/.test(targetEmail)) return toast.error(t("submission.invalidEmail"));
+    if (!email) return toast.error(t("submission.errors.verified_email_required"));
+    if (targetEmail.trim().toLowerCase() !== email.toLowerCase()) return toast.error(t("submission.errors.invalid_destination"));
     setConfirmOpen(false);
     setBusy(true);
     setSubmitting(true);
     try {
-      await submitIncident(incidentId, targetEmail);
+      await submitIncident(incidentId, targetEmail.trim().toLowerCase());
       setSubmitted(true);
       toast.success(t("submission.success"));
     } catch (error) {
@@ -968,12 +952,13 @@ function SubmissionPanel({ incidentId, unilateral, counterpartLabel }: { inciden
         </div>
       </div>
       <div className="mt-4 space-y-3">
-        <Input type="email" value={targetEmail} onChange={(event) => setTargetEmail(event.target.value)} placeholder={t("submission.emailPlaceholder")} className={fieldClass} disabled={submitted} />
+        <Input type="email" value={targetEmail} onChange={(event) => setTargetEmail(event.target.value)} placeholder={t("submission.emailPlaceholder")} className={fieldClass} disabled={submitted || !email} readOnly={Boolean(email)} />
+        <p className="text-xs leading-relaxed text-slate-500">{t("submission.ownEmailNote")}</p>
         <div className="grid gap-2 sm:grid-cols-2">
           <Button type="button" variant="outline" onClick={() => void download()} disabled={busy} className="h-12 rounded-xl border-[#9FBACD] text-[#153B66]">
             {generating ? <><RefreshCw className="mr-2 h-4 w-4 animate-spin" />{t("submission.generating")}</> : <><Download className="mr-2 h-4 w-4" />{t(submitted ? "submission.downloadAgain" : "submission.download")}</>}
           </Button>
-          <Button type="button" onClick={() => submitted ? void download() : setConfirmOpen(true)} disabled={busy || submitted} className="h-12 rounded-xl bg-[#153B66]">
+          <Button type="button" onClick={() => submitted ? void download() : setConfirmOpen(true)} disabled={busy || submitted || !email} className="h-12 rounded-xl bg-[#153B66]">
             {submitting ? <><RefreshCw className="mr-2 h-4 w-4 animate-spin" />{t("submission.submitting")}</> : submitted ? <><Check className="mr-2 h-4 w-4" />{t("submission.submitted")}</> : <><Send className="mr-2 h-4 w-4" />{t("submission.submit")}</>}
           </Button>
         </div>

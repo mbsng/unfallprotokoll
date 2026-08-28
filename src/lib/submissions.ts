@@ -24,6 +24,14 @@ export async function generateIncidentPdf(incidentId: string) {
   return data as { submissionId: string; storagePath: string; downloadUrl: string; completeness?: string };
 }
 
+// Server-attested signing: the signature image must exist in storage before
+// the server writes signed_at — the client can no longer set it directly.
+export async function signIncident(partyId: string) {
+  const { data, error } = await supabase.functions.invoke("sign-incident", { body: { partyId } });
+  if (error || !data?.signedAt) throw new SubmissionError(await extractErrorCode(error, data?.error ?? "sign_failed"));
+  return data as { partyId: string; signedAt: string; storagePath: string; version: number; alreadySigned?: boolean };
+}
+
 export async function submitIncident(incidentId: string, targetEmail: string) {
   const { data, error } = await supabase.functions.invoke("submit-incident", { body: { incidentId, targetEmail } });
   if (error || !data?.downloadUrl) throw new SubmissionError(await extractErrorCode(error, data?.error ?? "submission_failed"));

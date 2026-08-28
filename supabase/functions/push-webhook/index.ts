@@ -2,13 +2,11 @@ import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
 import { buildIncidentExport, incidentBelongsToOrg } from "../_shared/incident-export.ts";
 import { validateWebhookEndpoint } from "../_shared/safe-webhook.ts";
+import { corsHeaders } from "../_shared/cors.ts";
 
 declare const EdgeRuntime: { waitUntil(promise: Promise<unknown>): void };
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
-};
-const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+const ALLOW_HEADERS = "authorization, x-client-info, apikey, content-type";
+const json = (req: Request, body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { ...corsHeaders(req, ALLOW_HEADERS), "Content-Type": "application/json" } });
 const sleep = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 async function hmacHex(secret: string, payload: string) {
@@ -68,35 +66,35 @@ async function deliver(service: any, integration: any, submissionId: string, doc
 }
 
 serve(async (req) => {
-  if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
-  if (req.method !== "POST") return json({ error: "method_not_allowed" }, 405);
+  if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders(req, ALLOW_HEADERS) });
+  if (req.method !== "POST") return json(req, { error: "method_not_allowed" }, 405);
   try {
     const authHeader = req.headers.get("Authorization");
-    if (!authHeader?.startsWith("Bearer ")) return json({ error: "unauthorized" }, 401);
+    if (!authHeader?.startsWith("Bearer ")) return json(req, { error: "unauthorized" }, 401);
     const token = authHeader.slice(7);
     const body = await req.json();
     const submissionId = typeof body.submissionId === "string" ? body.submissionId : "";
     const incidentId = typeof body.incidentId === "string" ? body.incidentId : "";
     const integrationId = typeof body.integrationId === "string" ? body.integrationId : null;
     const test = body.test === true;
-    if (!/^[0-9a-f-]{36}$/i.test(submissionId) || !/^[0-9a-f-]{36}$/i.test(incidentId)) return json({ error: "invalid_request" }, 400);
+    if (!/^[0-9a-f-]{36}$/i.test(submissionId) || !/^[0-9a-f-]{36}$/i.test(incidentId)) return json(req, { error: "invalid_request" }, 400);
 
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
     const authClient = createClient(supabaseUrl, Deno.env.get("SUPABASE_ANON_KEY")!, { global: { headers: { Authorization: authHeader } }, auth: { persistSession: false } });
     const service = createClient(supabaseUrl, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!, { auth: { persistSession: false } });
     const { data: authData, error: authError } = await authClient.auth.getUser(token);
-    if (authError || !authData.user) return json({ error: "unauthorized" }, 401);
+    if (authError || !authData.user) return json(req, { error: "unauthorized" }, 401);
     const { data: profile } = await service.from("profiles").select("org_id, role").eq("id", authData.user.id).maybeSingle();
     const { data: ownParty } = await service.from("incident_parties").select("id").eq("incident_id", incidentId).eq("profile_id", authData.user.id).maybeSingle();
 
     let integrations: any[] = [];
     if (test) {
-      if (!integrationId || !profile?.org_id || !["insurer_agent", "admin"].includes(profile.role) || !(await incidentBelongsToOrg(service, incidentId, profile.org_id))) return json({ error: "forbidden" }, 403);
+      if (!integrationId || !profile?.org_id || !["insurer_agent", "admin"].includes(profile.role) || !(await incidentBelongsToOrg(service, incidentId, profile.org_id))) return json(req, { error: "forbidden" }, 403);
       const { data } = await service.from("integrations").select("*").eq("id", integrationId).eq("org_id", profile.org_id).eq("channel", "webhook").single();
-      if (!data) return json({ error: "integration_not_found" }, 404);
+      if (!data) return json(req, { error: "integration_not_found" }, 404);
       integrations = [data];
     } else {
-      if (!ownParty) return json({ error: "forbidden" }, 403);
+      if (!ownParty) return json(req, { error: "forbidden" }, 403);
       const { data: partyProfiles } = await service.from("incident_parties").select("profile_id").eq("incident_id", incidentId);
       const profileIds = (partyProfiles ?? []).map((party: any) => party.profile_id).filter(Boolean);
       const { data: orgProfiles } = profileIds.length ? await service.from("profiles").select("org_id").in("id", profileIds).not("org_id", "is", null) : { data: [] };
@@ -107,15 +105,15 @@ serve(async (req) => {
       }
     }
 
-    if (!integrations.length) return json({ status: "no_active_webhooks" });
+    if (!integrations.length) return json(req, { status: "no_active_webhooks" });
     const document = await buildIncidentExport(service, incidentId);
     const task = Promise.all(integrations.map((integration) => deliver(service, integration, submissionId, document, test)));
-    if (test) return json({ results: await task });
+    if (test) return json(req, { results: await task });
     EdgeRuntime.waitUntil(task);
-    return json({ status: "accepted", integrations: integrations.length }, 202);
+    return json(req, { status: "accepted", integrations: integrations.length }, 202);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error("[push-webhook] request failed", { error: message });
-    return json({ error: message === "webhook_secret_not_configured" ? message : "webhook_push_failed" }, 500);
+    return json(req, { error: message === "webhook_secret_not_configured" ? message : "webhook_push_failed" }, 500);
   }
 });
