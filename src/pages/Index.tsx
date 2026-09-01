@@ -3,7 +3,7 @@ import { useLiveQuery } from "dexie-react-hooks";
 import { useTranslation } from "react-i18next";
 
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import { AlertTriangle, ArrowLeft, ArrowRight, Camera, Car, Check, CheckCircle2, ChevronRight, Clock3, Download, FileText, LocateFixed, Mail, MapPin, PenLine, Plus, QrCode, Radio, RefreshCw, RotateCcw, Send, ShieldCheck, Trash2, UserRound, WifiOff } from "lucide-react";
+import { AlertTriangle, ArrowLeft, ArrowRight, Camera, Car, Check, CheckCircle2, ChevronRight, Clock3, Download, FileText, LocateFixed, Mail, MapPin, Plus, QrCode, Radio, RefreshCw, RotateCcw, Send, ShieldCheck, Trash2, UserRound } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -83,8 +83,8 @@ const fieldClass = "h-12 rounded-xl border-slate-200 bg-white text-base focus-vi
 
 const statusColors: Record<CaseStatus, string> = {
   draft: "bg-slate-100 text-slate-700",
-  waiting: "bg-amber-100 text-amber-800",
-  action_needed: "bg-orange-100 text-orange-900 ring-2 ring-orange-300",
+  joined: "bg-sky-100 text-sky-800",
+  partially_signed: "bg-indigo-100 text-indigo-700",
   signed: "bg-emerald-100 text-emerald-700",
   submitted: "bg-blue-100 text-blue-700",
 };
@@ -296,11 +296,7 @@ export default function Index() {
         });
       }
     }
-    return items.sort((a, b) => {
-      if (a.caseStatus === "action_needed" && b.caseStatus !== "action_needed") return -1;
-      if (b.caseStatus === "action_needed" && a.caseStatus !== "action_needed") return 1;
-      return new Date(`${b.date}T${b.time}`).getTime() - new Date(`${a.date}T${a.time}`).getTime();
-    });
+    return items.sort((a, b) => new Date(`${b.date}T${b.time}`).getTime() - new Date(`${a.date}T${a.time}`).getTime());
   }, [serverCases, localDrafts]);
 
   useEffect(() => {
@@ -615,7 +611,6 @@ export default function Index() {
   const ownParty = parties.find((party) => party.id === draftRef?.partyId);
   const counterpart = parties.find((party) => party.id !== draftRef?.partyId);
   const alreadySigned = Boolean(ownParty?.signedAt || data.hasSignature);
-  const hasMultiParty = parties.length > 1;
 
   const missingRequiredFields = useMemo(() => {
     const fields: { key: string; step: number }[] = [];
@@ -634,14 +629,21 @@ export default function Index() {
     if (!ownRequiredFieldsComplete) return;
     if (!data.hasSignature || !data.signatureDataUrl) return toast.error(t("validation.signatureRequired"));
     if (!user || !draftRef || !localDraftId || saving) return;
-    if (!serverOnline || draftRef.incidentId.startsWith("local:")) {
-      toast.error(t("signature.onlineRequired"));
-      return;
-    }
     setSaving(true);
     try {
-      const partyId = draftRef.partyId;
-      const incidentId = draftRef.incidentId;
+      let ref = draftRef;
+      // A purely local case is pushed to the server first; signing itself is
+      // server-attested. Nothing is blocked up front — a failure surfaces as
+      // a regular error.
+      if (ref.incidentId.startsWith("local:")) {
+        await processOutbox();
+        const synced = await db.drafts.get(localDraftId);
+        if (!synced || synced.ref.incidentId.startsWith("local:")) throw new Error("case_not_on_server_yet");
+        ref = synced.ref;
+        setDraftRef(ref);
+      }
+      const partyId = ref.partyId;
+      const incidentId = ref.incidentId;
       console.log("[complete] Starting direct signature save", { partyId, incidentId });
 
       // Step a: Canvas as PNG-Blob
@@ -675,7 +677,7 @@ export default function Index() {
       }
 
       // Step g: Reload from server
-      const summary = await loadIncidentSummary(draftRef);
+      const summary = await loadIncidentSummary(ref);
       setParties(summary.parties);
       const ownPartyAfter = summary.parties.find((p) => p.id === partyId);
       setDraftRef((current) => current ? { ...current, incidentVersion: summary.incidentVersion, partyVersion: ownPartyAfter?.version ?? current.partyVersion } : current);
@@ -708,7 +710,7 @@ export default function Index() {
         <div className="rounded-3xl border border-slate-200 bg-white p-8 text-center shadow-sm">
           <span className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-emerald-100"><CheckCircle2 className="h-9 w-9 text-emerald-600" /></span>
           <h1 className="mt-5 text-2xl font-bold tracking-tight text-[#102F52]">{t("signature.confirmTitle")}</h1>
-          <p className="mt-3 text-sm leading-relaxed text-slate-600">{t(hasMultiParty && !counterpart?.signedAt ? "signature.confirmWaiting" : "signature.confirmComplete")}</p>
+          <div className="mt-3"><SignatureStatusLine ownSigned counterpart={counterpart} /></div>
           <Button onClick={() => setView("home")} className="mt-6 h-14 w-full rounded-2xl bg-[#153B66] text-base font-semibold">{t("signature.backHome")}</Button>
         </div>
       </main>
@@ -759,12 +761,9 @@ export default function Index() {
                         </div>
                         <p className="mt-1 truncate text-sm text-slate-500">{formatCaseDate(item) || t("fields.notProvided")} · {item.plate || t("fields.noPlate")}</p>
                       </div>
-                      {item.caseStatus === "action_needed" && <PenLine className="h-5 w-5 shrink-0 text-orange-500" />}
                       <ChevronRight className="h-5 w-5 shrink-0 text-slate-400" />
                     </button>
-                    {item.caseStatus !== "signed" && item.caseStatus !== "submitted" && (
-                      <button onClick={() => setDeleteTarget(item)} className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-slate-400 transition hover:bg-rose-50 hover:text-rose-500" aria-label={t(item.partyLabel === "A" ? "delete.case" : "delete.participation")}><Trash2 className="h-4 w-4" /></button>
-                    )}
+                    <button onClick={() => setDeleteTarget(item)} className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-slate-400 transition hover:bg-rose-50 hover:text-rose-500" aria-label={t(item.partyLabel === "A" ? "delete.case" : "delete.participation")}><Trash2 className="h-4 w-4" /></button>
                   </div>
                 );
               })}
@@ -822,10 +821,6 @@ export default function Index() {
               <button onClick={() => { if (sketchMode !== "freehand" && data.hasSketch) { if (!confirm(t("sketch.switchWarning"))) return; } setSketchMode("freehand"); }} className={`flex-1 rounded-lg py-2 text-sm font-semibold transition ${sketchMode === "freehand" ? "bg-[#153B66] text-white" : "text-slate-600"}`}>{t("sketch.modeFreehand")}</button>
             </div>
 
-            {draftRef && !draftRef.incidentId.startsWith("local:") && ownParty?.sketchConfirmedAt && counterpart && !counterpart.sketchConfirmedAt && (
-              <div className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900"><AlertTriangle className="mr-1 inline h-4 w-4" />{t("sketch.counterpartMustConfirm")}</div>
-            )}
-
             {sketchMode === "builder"
               ? <ScenarioBuilder checkedCircumstances={data.situations} onSave={(s) => { update("hasSketch", true); update("sketchDataUrl", ""); if (draftRef && !draftRef.incidentId.startsWith("local:") && user) void saveSketch(JSON.stringify(s)); }} />
               : <DrawingCanvas label={t("fields.sketch")} height={320} initialDataUrl={data.sketchDataUrl} onChange={(value, dataUrl) => { if (value && dataUrl) void saveSketch(dataUrl); else { update("hasSketch", value); update("sketchDataUrl", dataUrl ?? ""); } }} />}
@@ -842,30 +837,24 @@ export default function Index() {
             )}
           </div>}
           {step === 5 && <div className="space-y-6">
-            {draftRef?.partyLabel === "A" && !alreadySigned && (draftRef.incidentId.startsWith("local:")
-              ? <div className="rounded-2xl border border-amber-200 bg-amber-50 p-5 text-center"><WifiOff className="mx-auto mb-2 h-8 w-8 text-amber-500" /><p className="text-sm font-semibold text-amber-900">{t("invite.offlineHint")}</p><p className="mt-1 text-xs text-amber-700">{t("invite.offlineDetail")}</p>{serverOnline && <Button variant="outline" onClick={() => void retrySync()} className="mt-3 rounded-xl border-amber-300 bg-white text-amber-900"><RefreshCw className="mr-2 h-4 w-4" />{t("home.retry")}</Button>}</div>
-              : <InviteParty shareCode={draftRef.shareCode} loading={false} />)}
+            {draftRef?.partyLabel === "A" && (
+              <InviteParty shareCode={draftRef.shareCode} loading={draftRef.incidentId.startsWith("local:")} />
+            )}
             <div className="grid gap-3 sm:grid-cols-2"><Summary number="1" icon={<Clock3 />} label={t("fields.dateTime")} value={formatCaseDate(data)} /><Summary number="2" icon={<MapPin />} label={t("fields.place")} value={data.location || t("fields.notProvided")} /><Summary number="9" icon={<UserRound />} label={t("fields.driver")} value={data.driverName || t("fields.notProvided")} /><Summary number="7" icon={<Car />} label={t("fields.vehicle")} value={`${data.plate || t("fields.noPlate")}${data.vehicle ? ` · ${data.vehicle}` : ""}`} /><Summary number="8" icon={<ShieldCheck />} label={t("fields.insurer")} value={data.insurer || t("fields.notProvided")} /><Summary number="11–13" icon={<Camera />} label={t("fields.documentation")} value={`${t("fields.photosCount", { formattedCount: formatNumber(data.photos.length) })} · ${t(data.hasSketch ? "fields.sketchAvailable" : "fields.withoutSketch")}`} /></div>
             <div className="rounded-2xl border border-slate-200 p-4"><FieldBadge number="12" /><p className="mb-2 mt-2 text-xs font-bold uppercase tracking-wider text-slate-500">{t("summary.circumstances")}</p>{selectedSummary.length ? <ul className="space-y-1.5">{selectedSummary.map((item) => <li key={item} className="flex gap-2 text-sm text-slate-700"><Check className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />{item}</li>)}</ul> : <p className="text-sm text-slate-500">{t("summary.noneSelected")}</p>}</div>
             {counterpart && <CounterpartSummary party={counterpart} loading={summaryLoading} />}
             <FieldBadge number="15" />
+            <SignatureStatusLine ownSigned={alreadySigned} counterpart={counterpart} />
             {alreadySigned
               ? <div className="rounded-2xl border-2 border-emerald-300 bg-emerald-50 p-5 text-center">
                   <CheckCircle2 className="mx-auto h-10 w-10 text-emerald-600" />
                   <p className="mt-2 font-bold text-emerald-900">{t("signature.alreadySigned")}</p>
-                  {!counterpart?.signedAt && <Button variant="outline" onClick={() => setWithdrawOpen(true)} className="mt-3 rounded-xl border-emerald-300 text-emerald-800"><RotateCcw className="mr-2 h-4 w-4" />{t("signature.withdraw")}</Button>}
+                  <Button variant="outline" onClick={() => setWithdrawOpen(true)} className="mt-3 rounded-xl border-emerald-300 text-emerald-800"><RotateCcw className="mr-2 h-4 w-4" />{t("signature.withdraw")}</Button>
                 </div>
               : !ownRequiredFieldsComplete
                 ? <div className="rounded-2xl border-2 border-dashed border-amber-300 bg-amber-50 p-5"><p className="text-sm font-semibold text-amber-900">{t("signature.missingFieldsTitle")}</p><div className="mt-3 flex flex-wrap gap-2">{missingRequiredFields.map((field) => <button key={field.key} onClick={() => setStep(field.step)} className="rounded-lg bg-amber-100 px-3 py-1.5 text-xs font-semibold text-amber-900 transition hover:bg-amber-200">{t(field.key)}</button>)}</div></div>
-                : !serverOnline || draftRef?.incidentId.startsWith("local:")
-                  ? <div className="rounded-2xl border-2 border-dashed border-slate-300 bg-slate-50 p-5 text-center"><WifiOff className="mx-auto h-8 w-8 text-slate-400" /><p className="mt-2 text-sm font-semibold text-slate-600">{t("signature.onlineRequired")}</p></div>
-                  : <DrawingCanvas label={t("fields.signature")} height={170} confirmable onChange={(value, dataUrl) => { update("hasSignature", value); update("signatureDataUrl", dataUrl ?? ""); }} />}
-            {alreadySigned && draftRef && !draftRef.incidentId.startsWith("local:") && counterpart && !counterpart.signedAt && (
-              <div className="rounded-xl border border-blue-200 bg-blue-50 p-4">
-                <p className="text-sm leading-relaxed text-blue-900">{t("submission.unilateralNotice", { party: counterpart.partyLabel })}</p>
-              </div>
-            )}
-            {alreadySigned && draftRef && !draftRef.incidentId.startsWith("local:") && <SubmissionPanel incidentId={draftRef.incidentId} unilateral={Boolean(counterpart && !counterpart.signedAt)} counterpartLabel={counterpart?.partyLabel ?? ""} email={user?.email ?? null} />}
+                : <DrawingCanvas label={t("fields.signature")} height={170} confirmable onChange={(value, dataUrl) => { update("hasSignature", value); update("signatureDataUrl", dataUrl ?? ""); }} />}
+            {draftRef && !draftRef.incidentId.startsWith("local:") && <SubmissionPanel incidentId={draftRef.incidentId} ownSigned={alreadySigned} unilateral={Boolean(counterpart && !counterpart.signedAt)} counterpartLabel={counterpart?.partyLabel ?? ""} email={user?.email ?? null} />}
             <p className="text-xs leading-relaxed text-slate-500">{t("summary.disclaimer")}</p>
           </div>}
 
@@ -893,7 +882,7 @@ export default function Index() {
   );
 }
 
-function SubmissionPanel({ incidentId, unilateral, counterpartLabel, email }: { incidentId: string; unilateral?: boolean; counterpartLabel?: string; email?: string | null }) {
+function SubmissionPanel({ incidentId, ownSigned, unilateral, counterpartLabel, email }: { incidentId: string; ownSigned: boolean; unilateral?: boolean; counterpartLabel?: string; email?: string | null }) {
   const { t } = useTranslation();
   const [targetEmail, setTargetEmail] = useState(email ?? "");
   const [generating, setGenerating] = useState(false);
@@ -952,17 +941,21 @@ function SubmissionPanel({ incidentId, unilateral, counterpartLabel, email }: { 
         </div>
       </div>
       <div className="mt-4 space-y-3">
-        <Input type="email" value={targetEmail} onChange={(event) => setTargetEmail(event.target.value)} placeholder={t("submission.emailPlaceholder")} className={fieldClass} disabled={submitted || !email} readOnly={Boolean(email)} />
-        <p className="text-xs leading-relaxed text-slate-500">{t("submission.ownEmailNote")}</p>
-        <div className="grid gap-2 sm:grid-cols-2">
-          <Button type="button" variant="outline" onClick={() => void download()} disabled={busy} className="h-12 rounded-xl border-[#9FBACD] text-[#153B66]">
-            {generating ? <><RefreshCw className="mr-2 h-4 w-4 animate-spin" />{t("submission.generating")}</> : <><Download className="mr-2 h-4 w-4" />{t(submitted ? "submission.downloadAgain" : "submission.download")}</>}
-          </Button>
-          <Button type="button" onClick={() => submitted ? void download() : setConfirmOpen(true)} disabled={busy || submitted || !email} className="h-12 rounded-xl bg-[#153B66]">
-            {submitting ? <><RefreshCw className="mr-2 h-4 w-4 animate-spin" />{t("submission.submitting")}</> : submitted ? <><Check className="mr-2 h-4 w-4" />{t("submission.submitted")}</> : <><Send className="mr-2 h-4 w-4" />{t("submission.submit")}</>}
-          </Button>
-        </div>
-        {submitted && <p className="flex items-center gap-1.5 text-xs text-emerald-700"><CheckCircle2 className="h-3.5 w-3.5" />{t("submission.submittedHint")}</p>}
+        {!ownSigned
+          ? <p className="rounded-lg bg-white p-3 text-sm leading-relaxed text-slate-600">{t("signature.ownRequired")}</p>
+          : <>
+            <Input type="email" value={targetEmail} onChange={(event) => setTargetEmail(event.target.value)} placeholder={t("submission.emailPlaceholder")} className={fieldClass} disabled={submitted || !email} readOnly={Boolean(email)} />
+            <p className="text-xs leading-relaxed text-slate-500">{t("submission.ownEmailNote")}</p>
+            <div className="grid gap-2 sm:grid-cols-2">
+              <Button type="button" variant="outline" onClick={() => void download()} disabled={busy} className="h-12 rounded-xl border-[#9FBACD] text-[#153B66]">
+                {generating ? <><RefreshCw className="mr-2 h-4 w-4 animate-spin" />{t("submission.generating")}</> : <><Download className="mr-2 h-4 w-4" />{t(submitted ? "submission.downloadAgain" : "submission.download")}</>}
+              </Button>
+              <Button type="button" onClick={() => submitted ? void download() : setConfirmOpen(true)} disabled={busy || submitted || !email} className="h-12 rounded-xl bg-[#153B66]">
+                {submitting ? <><RefreshCw className="mr-2 h-4 w-4 animate-spin" />{t("submission.submitting")}</> : submitted ? <><Check className="mr-2 h-4 w-4" />{t("submission.submitted")}</> : <><Send className="mr-2 h-4 w-4" />{t("submission.submit")}</>}
+              </Button>
+            </div>
+            {submitted && <p className="flex items-center gap-1.5 text-xs text-emerald-700"><CheckCircle2 className="h-3.5 w-3.5" />{t("submission.submittedHint")}</p>}
+          </>}
       </div>
       <Dialog open={confirmOpen} onOpenChange={setConfirmOpen}>
         <DialogContent className="max-w-md">
@@ -996,6 +989,24 @@ function SectionTitle({ number, icon, title }: { number: string; icon: React.Rea
 
 function Choice({ active, warning, onClick, children }: { active: boolean; warning?: boolean; onClick: () => void; children: React.ReactNode }) { return <button type="button" onClick={onClick} className={`h-14 rounded-xl border-2 text-base font-semibold ${active ? warning ? "border-amber-500 bg-amber-50 text-amber-900" : "border-[#153B66] bg-[#EDF3F7] text-[#153B66]" : "border-slate-200 text-slate-600"}`}>{children}</button>; }
 function Summary({ number, icon, label, value }: { number: string; icon: React.ReactNode; label: string; value: string }) { return <div className="flex gap-3 rounded-2xl bg-[#F6F8FA] p-4"><span className="mt-0.5 text-[#39719D] [&>svg]:h-5 [&>svg]:w-5">{icon}</span><div className="min-w-0"><FieldBadge number={number} /><p className="text-xs font-semibold uppercase tracking-wide text-slate-500">{label}</p><p className="mt-1 break-words text-sm font-semibold text-slate-800">{value}</p></div></div>; }
+
+// Quiet status line reflecting the server-side signature state. It informs,
+// it never blocks.
+function SignatureStatusLine({ ownSigned, counterpart }: { ownSigned: boolean; counterpart?: IncidentPartySummary }) {
+  const { t } = useTranslation();
+  const counterpartSigned = counterpart ? Boolean(counterpart.signedAt) : null;
+  const key = ownSigned
+    ? counterpartSigned === true ? "signature.status.both"
+      : counterpartSigned === false ? "signature.status.ownSigned"
+      : "signature.status.ownSignedAlone"
+    : counterpartSigned === true ? "signature.status.counterpartSigned"
+    : "signature.status.none";
+  return (
+    <p className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm leading-relaxed text-slate-600">
+      {t(key, { party: counterpart?.partyLabel ?? "B" })}
+    </p>
+  );
+}
 
 function CounterpartSummary({ party, loading }: { party?: IncidentPartySummary; loading: boolean }) {
   const { t } = useTranslation();
@@ -1043,7 +1054,7 @@ function CaseDiagnostics({ incidentId }: { incidentId: string }) {
           {!loading && data && (
             <div className="space-y-1 text-xs">
               <p className="font-mono text-slate-600">incident_id: <span className="text-slate-900">{incidentId}</span></p>
-              <p className="font-mono text-slate-600">status: <span className={`font-bold ${data.status === "signed" ? "text-emerald-600" : data.status === "submitted" ? "text-blue-600" : "text-amber-600"}`}>{data.status}</span></p>
+              <p className="font-mono text-slate-600">status: <span className={`font-bold ${data.status === "signed" ? "text-emerald-600" : data.status === "submitted" ? "text-blue-600" : "text-slate-600"}`}>{data.status}</span></p>
               <div className="mt-2">
                 <p className="font-semibold text-slate-500 uppercase">Parties</p>
                 {data.parties.map((p, i) => (

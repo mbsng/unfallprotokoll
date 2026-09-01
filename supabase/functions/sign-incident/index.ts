@@ -81,9 +81,8 @@ serve(async (req) => {
       .select("version, signed_at, signature_storage_path")
       .single();
     if (updateError || !updated) {
-      // Incidents that already reached a terminal state are immutable.
       console.error("[sign-incident] party update failed", { error: updateError?.message, code: updateError?.code });
-      return json(req, { error: updateError?.code === "55000" ? "incident_finalized" : "sign_failed" }, updateError?.code === "55000" ? 409 : 500);
+      return json(req, { error: "sign_failed" }, 500);
     }
 
     console.log("[sign-incident] party signed", { partyId, incidentId: party.incident_id, userId: authData.user.id });

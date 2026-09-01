@@ -114,16 +114,12 @@ serve(async (req) => {
       return json(req, { error: "own_signature_required" }, 409);
     }
 
-    // Determine completeness
+    // Determine completeness — the derived incident status is maintained
+    // exclusively by the sync_incident_status_from_parties DB trigger.
     const realParties = parties.filter((p) => p.profile_id);
     const unsignedParties = realParties.filter((p) => !p.signed_at);
     const allSigned = realParties.length > 0 && unsignedParties.length === 0;
     const completeness = allSigned ? "vollstaendig" : "einseitig";
-
-    // If all signed but status not yet "signed", fix it (trigger should do this, but belt-and-braces)
-    if (allSigned && !["signed", "submitted"].includes(incident.status)) {
-      await service.from("incidents").update({ status: "signed", version: incident.version + 1, updated_at: new Date().toISOString() }).eq("id", incidentId).eq("version", incident.version);
-    }
 
     const downloaded = new Map<string, { bytes: Uint8Array; contentType?: string }>();
     for (const item of media ?? []) {

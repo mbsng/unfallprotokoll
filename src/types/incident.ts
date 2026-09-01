@@ -42,7 +42,9 @@ export interface IncidentSummaryData {
   parties: IncidentPartySummary[];
 }
 
-export type CaseStatus = "draft" | "action_needed" | "waiting" | "signed" | "submitted";
+// Mirrors the database-derived incident status maintained by the
+// sync_incident_status_from_parties trigger (plus the terminal "submitted").
+export type CaseStatus = "draft" | "joined" | "partially_signed" | "signed" | "submitted";
 
 export interface UserIncidentItem {
   incidentId: string;

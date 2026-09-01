@@ -16,8 +16,8 @@ import { FleetPortalError, inviteFleetDriver, loadFleetIncident, loadFleetOvervi
 import { generateIncidentPdf } from "@/lib/submissions";
 
 const CLOSED_STATUSES = new Set(["submitted"]);
-const statusLabel = (status: string) => ({ draft: "Entwurf", open: "Offen", signed: "Signiert", submitted: "Eingereicht" }[status] ?? status);
-const statusClass = (status: string) => status === "submitted" ? "bg-emerald-100 text-emerald-800" : status === "signed" ? "bg-blue-100 text-blue-800" : "bg-amber-100 text-amber-800";
+const statusLabel = (status: string) => ({ draft: "Entwurf", joined: "Beigetreten", partially_signed: "Teilweise signiert", open: "Offen", signed: "Signiert", submitted: "Eingereicht" }[status] ?? status);
+const statusClass = (status: string) => status === "submitted" ? "bg-emerald-100 text-emerald-800" : status === "signed" ? "bg-blue-100 text-blue-800" : "bg-slate-100 text-slate-700";
 const formatDate = (value: string | null, withTime = false) => value ? new Intl.DateTimeFormat("de-CH", withTime ? { dateStyle: "medium", timeStyle: "short" } : { dateStyle: "medium" }).format(new Date(value)) : "—";
 
 export default function Fleet() {

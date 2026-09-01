@@ -83,15 +83,6 @@ serve(async (req) => {
       if (!allowed) return json(req, { error: "too_many_submissions" }, 429);
     }
 
-    // Auto-fix status if all parties signed but status not yet updated
-    if (!["signed", "submitted"].includes(incident.status)) {
-      const { data: allParties } = await service.from("incident_parties").select("signed_at").eq("incident_id", incidentId);
-      const allSigned = allParties && allParties.length > 0 && allParties.every((p) => p.signed_at);
-      if (allSigned) {
-        await service.from("incidents").update({ status: "signed", version: incident.version + 1, updated_at: new Date().toISOString() }).eq("id", incidentId).eq("version", incident.version);
-      }
-    }
-
     let { data: submission } = await service.from("submissions").select("id, status, pdf_storage_path").eq("incident_id", incidentId).eq("party_id", ownParty.id).maybeSingle();
     if (!submission?.pdf_storage_path) {
       const generated = await fetch(`${supabaseUrl}/functions/v1/generate-pdf`, {
@@ -145,20 +136,17 @@ serve(async (req) => {
       console.error("[submit-incident] Failed to update submission status", { error: submissionError.message });
       throw submissionError;
     }
-    if (incident.status === "signed") {
-      const { data: updatedIncident, error: incidentUpdateError } = await service.from("incidents")
-        .update({ status: "submitted", version: incident.version + 1, updated_at: submittedAt })
-        .eq("id", incidentId).eq("version", incident.version).select("status").maybeSingle();
-      if (incidentUpdateError) {
-        console.error("[submit-incident] Failed to update incident status", { error: incidentUpdateError.message });
-        throw incidentUpdateError;
-      }
-      if (!updatedIncident) {
-        const { data: current } = await service.from("incidents").select("status").eq("id", incidentId).single();
-        if (current?.status !== "submitted") {
-          console.warn("[submit-incident] Incident status conflict, but email was already sent", { incidentId });
-        }
-      }
+    // 'submitted' marks the delivery receipt. It is reachable from any
+    // signature-derived status — the only gate is the requester's own
+    // signature, checked above. The signature-derived statuses themselves
+    // are maintained exclusively by the DB trigger.
+    const { error: incidentUpdateError } = await service.from("incidents")
+      .update({ status: "submitted", version: incident.version + 1, updated_at: submittedAt })
+      .eq("id", incidentId)
+      .eq("version", incident.version)
+      .neq("status", "submitted");
+    if (incidentUpdateError) {
+      console.error("[submit-incident] Failed to update incident status", { error: incidentUpdateError.message });
     }
     const { data: signed, error: signError } = await service.storage.from("incident-pdfs").createSignedUrl(submission.pdf_storage_path, 3600, { download: `Unfallprotokoll-${incident.share_code}.pdf` });
     if (signError) {

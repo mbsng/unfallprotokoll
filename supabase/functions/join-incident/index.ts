@@ -69,7 +69,7 @@ serve(async (req) => {
       console.error("[join-incident] incident lookup failed", { error: incidentError.message });
       return json(req, { error: "lookup_failed" }, 500);
     }
-    if (!incident || ["closed", "submitted", "signed"].includes(incident.status)) {
+    if (!incident) {
       return json(req, { error: "invitation_unavailable" }, 404);
     }
 
@@ -119,19 +119,18 @@ serve(async (req) => {
       return json(req, { error: insertError.code === "23505" ? "party_b_exists" : "join_failed" }, insertError.code === "23505" ? 409 : 500);
     }
 
-    const nextVersion = incident.version + 1;
-    const { data: updatedIncident, error: updateError } = await serviceClient
+    // The status transition to 'joined' happens automatically via the
+    // sync_incident_status_from_parties trigger on the party insert. The
+    // trigger bumps incidents.version, so read the fresh value back.
+    const { data: refreshed, error: refreshError } = await serviceClient
       .from("incidents")
-      .update({ status: "joined", version: nextVersion, updated_at: new Date().toISOString() })
-      .eq("id", incident.id)
-      .eq("version", incident.version)
       .select("version")
+      .eq("id", incident.id)
       .single();
-    if (updateError) {
-      await serviceClient.from("incident_parties").delete().eq("id", party.id);
-      console.error("[join-incident] incident update failed", { error: updateError.message });
-      return json(req, { error: "join_failed" }, 409);
+    if (refreshError || !refreshed) {
+      console.warn("[join-incident] incident version refresh failed, using fallback", { error: refreshError?.message });
     }
+    const incidentVersion = refreshed?.version ?? incident.version + 1;
 
     console.log("[join-incident] verified party B joined", { incidentId: incident.id, userId: claims.user.id });
     return json(req, {
@@ -141,7 +140,7 @@ serve(async (req) => {
         partyId: party.id,
         partyLabel: party.party_label,
         shareCode: incident.share_code,
-        incidentVersion: updatedIncident.version,
+        incidentVersion,
         partyVersion: party.version,
       },
     });

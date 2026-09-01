@@ -143,11 +143,9 @@ export async function loadUserIncidents(userId: string): Promise<UserIncidentIte
 }
 
 export function computeCaseStatus(item: UserIncidentItem): CaseStatus {
-  if (item.status === "submitted") return "submitted";
-  if (item.status === "signed") return "signed";
-  if (!item.ownFieldsComplete) return "draft";
-  if (!item.ownSignedAt) return "action_needed";
-  return "waiting";
+  const status = item.status as CaseStatus;
+  if (status === "draft" || status === "joined" || status === "partially_signed" || status === "signed" || status === "submitted") return status;
+  return "draft";
 }
 
 export function subscribeToUserIncidents(onChange: () => void) {
