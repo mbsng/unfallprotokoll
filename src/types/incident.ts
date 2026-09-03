@@ -80,11 +80,20 @@ export interface AccidentData {
   witnesses: string;
   driverName: string;
   driverAddress: string;
+  postalCode: string;
+  city: string;
+  country: string;
+  birthDate: string;
   phone: string;
+  licenseNo: string;
+  licenseClass: string;
+  licenseValidUntil: string;
   plate: string;
   vehicle: string;
+  vehicleCountry: string;
   insurer: string;
   policy: string;
+  insuranceOffice: string;
   situations: number[];
   damage: string;
   notes: string;
@@ -98,16 +107,24 @@ export interface AccidentData {
 export interface DriverIncidentData {
   fullName: string;
   address: string;
+  postalCode?: string;
+  city?: string;
+  country?: string;
+  birthDate?: string;
   phone: string;
   licenseNo?: string;
+  licenseClass?: string;
+  licenseValidUntil?: string;
 }
 
 export interface VehicleIncidentData {
   plate: string;
   makeModel: string;
+  registrationCountry?: string;
 }
 
 export interface InsuranceIncidentData {
   company: string;
   policyNumber: string;
+  office?: string;
 }

@@ -13,7 +13,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { FleetPortalError, inviteFleetDriver, loadFleetIncident, loadFleetOverview, type FleetDriver, type FleetIncident, type FleetIncidentDetail, type FleetInvitation } from "@/lib/fleet";
-import { generateIncidentPdf } from "@/lib/submissions";
+import { generateIncidentPdf, SubmissionError } from "@/lib/submissions";
+import i18n from "@/i18n";
 
 const CLOSED_STATUSES = new Set(["submitted"]);
 const statusLabel = (status: string) => ({ draft: "Entwurf", joined: "Beigetreten", partially_signed: "Teilweise signiert", open: "Offen", signed: "Signiert", submitted: "Eingereicht" }[status] ?? status);
@@ -94,8 +95,8 @@ export default function Fleet() {
     try {
       const result = await generateIncidentPdf(incident.id);
       window.location.assign(result.downloadUrl);
-    } catch {
-      toast.error("Das PDF konnte nicht erstellt werden. Der Fall muss vollständig signiert sein.");
+    } catch (error) {
+      toast.error(error instanceof SubmissionError ? error.message : i18n.t("submission.errors.pdf_generation_failed"));
     } finally {
       setDownloadingId(null);
     }

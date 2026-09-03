@@ -22,6 +22,7 @@ export function UserMenu() {
       <DropdownMenuContent align="end" className="w-64 rounded-xl p-2">
         <DropdownMenuLabel><p className="truncate text-sm font-semibold">{profile?.full_name || user.email}</p><p className="truncate text-xs font-normal text-slate-500">{user.email}</p></DropdownMenuLabel>
         <DropdownMenuSeparator />
+        <DropdownMenuItem asChild className="min-h-11 cursor-pointer rounded-lg"><Link to="/profil"><UserRound className="mr-2 h-4 w-4" />{t("profile.menu")}</Link></DropdownMenuItem>
         {profile?.org_id && ["fleet_manager", "admin"].includes(profile.role) && <DropdownMenuItem asChild className="min-h-11 cursor-pointer rounded-lg"><Link to="/fleet"><LayoutDashboard className="mr-2 h-4 w-4" />Flotten-Portal</Link></DropdownMenuItem>}
         <DropdownMenuItem asChild className="min-h-11 cursor-pointer rounded-lg"><Link to="/upgrade"><CreditCard className="mr-2 h-4 w-4" />Pläne & Abrechnung</Link></DropdownMenuItem>
         {profile?.org_id && ["insurer_agent", "admin"].includes(profile.role) && <DropdownMenuItem asChild className="min-h-11 cursor-pointer rounded-lg"><Link to="/integrations"><Cable className="mr-2 h-4 w-4" />{t("integrations.menu")}</Link></DropdownMenuItem>}

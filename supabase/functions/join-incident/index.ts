@@ -109,9 +109,33 @@ serve(async (req) => {
     }
     if (existingParties?.some((party) => party.party_label === "B")) return json(req, { error: "party_b_exists" }, 409);
 
+    const { data: joiningProfile, error: profileError } = await serviceClient
+      .from("profiles")
+      .select("full_name, phone, address, postal_code, city, country, birth_date, license_no, license_class, license_valid_until, default_vehicle_json, insurance_json")
+      .eq("id", claims.user.id)
+      .maybeSingle();
+    if (profileError) {
+      console.error("[join-incident] profile lookup failed", { error: profileError.message });
+      return json(req, { error: "join_failed" }, 500);
+    }
+
+    const vehicle = joiningProfile?.default_vehicle_json ?? {};
+    const insurance = joiningProfile?.insurance_json ?? {};
     const { data: party, error: insertError } = await serviceClient
       .from("incident_parties")
-      .insert({ incident_id: incident.id, party_label: "B", profile_id: claims.user.id })
+      .insert({
+        incident_id: incident.id,
+        party_label: "B",
+        profile_id: claims.user.id,
+        driver_json: {
+          fullName: joiningProfile?.full_name ?? "", phone: joiningProfile?.phone ?? "", address: joiningProfile?.address ?? "",
+          postalCode: joiningProfile?.postal_code ?? "", city: joiningProfile?.city ?? "", country: joiningProfile?.country ?? "",
+          birthDate: joiningProfile?.birth_date ?? "", licenseNo: joiningProfile?.license_no ?? "", licenseClass: joiningProfile?.license_class ?? "",
+          licenseValidUntil: joiningProfile?.license_valid_until ?? "",
+        },
+        vehicle_json: vehicle,
+        insurance_json: insurance,
+      })
       .select("id, party_label, version")
       .single();
     if (insertError) {

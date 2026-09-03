@@ -25,6 +25,7 @@ import { getPlanEntitlement } from "@/lib/billing";
 import { computeCaseStatus, loadIncidentSummary, loadUserIncidents, subscribeToIncident, subscribeToUserIncidents } from "@/lib/incidents";
 import { createLocalDraft, db, deleteLocalDraft, deleteLocalPhoto, getLatestDraft, markDraftComplete, saveDraftField, saveLocalPhoto, type LocalDraft } from "@/lib/local-db";
 import { captureAccidentPhoto, getCurrentCoordinates, isNativeApp } from "@/lib/native-device";
+import { accidentToMasterData, loadLocalProfileMasterData, saveLocalProfileMasterData, saveProfileMasterData } from "@/lib/profile-data";
 import { processOutbox } from "@/lib/sync-worker";
 import { generateIncidentPdf, signIncident, SubmissionError, submitIncident } from "@/lib/submissions";
 
@@ -37,7 +38,16 @@ interface CaseItem { id: string; date: string; time: string; location: string; p
 
 const emptyData = (profile?: Profile | null): AccidentData => {
   const now = new Date();
-  return { date: now.toISOString().slice(0, 10), time: now.toTimeString().slice(0, 5), location: "", locationLat: null, locationLng: null, injured: false, otherDamage: false, witnesses: "", driverName: profile?.full_name ?? "", driverAddress: "", phone: profile?.phone ?? "", plate: profile?.default_vehicle_json?.plate ?? "", vehicle: profile?.default_vehicle_json?.makeModel ?? "", insurer: profile?.insurance_json?.company ?? "", policy: profile?.insurance_json?.policyNumber ?? "", situations: [], damage: "", notes: "", photos: [], hasSketch: false, sketchDataUrl: "", hasSignature: false, signatureDataUrl: "" };
+  const local = profile ? null : loadLocalProfileMasterData();
+  return {
+    date: now.toISOString().slice(0, 10), time: now.toTimeString().slice(0, 5), location: "", locationLat: null, locationLng: null,
+    injured: false, otherDamage: false, witnesses: "",
+    driverName: profile?.full_name ?? local?.fullName ?? "", driverAddress: profile?.address ?? local?.address ?? "", postalCode: profile?.postal_code ?? local?.postalCode ?? "", city: profile?.city ?? local?.city ?? "", country: profile?.country ?? local?.country ?? "",
+    birthDate: profile?.birth_date ?? local?.birthDate ?? "", phone: profile?.phone ?? local?.phone ?? "", licenseNo: profile?.license_no ?? local?.licenseNo ?? "", licenseClass: profile?.license_class ?? local?.licenseClass ?? "", licenseValidUntil: profile?.license_valid_until ?? local?.licenseValidUntil ?? "",
+    plate: profile?.default_vehicle_json?.plate ?? local?.plate ?? "", vehicle: profile?.default_vehicle_json?.makeModel ?? local?.makeModel ?? "", vehicleCountry: profile?.default_vehicle_json?.registrationCountry ?? local?.registrationCountry ?? "",
+    insurer: profile?.insurance_json?.company ?? local?.insuranceCompany ?? "", policy: profile?.insurance_json?.policyNumber ?? local?.policyNumber ?? "", insuranceOffice: profile?.insurance_json?.office ?? local?.insuranceOffice ?? "",
+    situations: [], damage: "", notes: "", photos: [], hasSketch: false, sketchDataUrl: "", hasSignature: false, signatureDataUrl: "",
+  };
 };
 
 const joinedData = (joined: JoinedIncidentState, profile?: Profile | null): AccidentData => {
@@ -61,11 +71,20 @@ const summaryToData = (summary: IncidentSummaryData, ownParty: IncidentPartySumm
   data.location = summary.locationText ?? "";
   data.driverName = ownParty.driver.fullName ?? "";
   data.driverAddress = ownParty.driver.address ?? "";
+  data.postalCode = ownParty.driver.postalCode ?? "";
+  data.city = ownParty.driver.city ?? "";
+  data.country = ownParty.driver.country ?? "";
+  data.birthDate = ownParty.driver.birthDate ?? "";
   data.phone = ownParty.driver.phone ?? "";
+  data.licenseNo = ownParty.driver.licenseNo ?? "";
+  data.licenseClass = ownParty.driver.licenseClass ?? "";
+  data.licenseValidUntil = ownParty.driver.licenseValidUntil ?? "";
   data.plate = ownParty.vehicle.plate ?? "";
   data.vehicle = ownParty.vehicle.makeModel ?? "";
+  data.vehicleCountry = ownParty.vehicle.registrationCountry ?? "";
   data.insurer = ownParty.insurance.company ?? "";
   data.policy = ownParty.insurance.policyNumber ?? "";
+  data.insuranceOffice = ownParty.insurance.office ?? "";
   data.damage = ownParty.damageDescription ?? "";
   data.situations = ownParty.circumstancesChecked ?? [];
   data.hasSignature = Boolean(ownParty.signedAt);
@@ -110,7 +129,7 @@ export default function Index() {
   const navigate = useNavigate();
   const location = useLocation();
   const joinedIncident = (location.state as { joinedIncident?: JoinedIncidentState } | null)?.joinedIncident;
-  const { user, profile, isAnonymous, startAnonymous } = useAuth();
+  const { user, profile, isAnonymous, startAnonymous, refreshProfile } = useAuth();
 
   const locale = localeForLanguage(i18n.resolvedLanguage || i18n.language);
   const steps = t("wizard.steps", { returnObjects: true }) as string[];
@@ -131,6 +150,7 @@ export default function Index() {
   const [signedJustNow, setSignedJustNow] = useState(false);
   const [creating, setCreating] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [saveToProfile, setSaveToProfile] = useState(true);
 
   const [serverCases, setServerCases] = useState<UserIncidentItem[]>([]);
   const [casesLoading, setCasesLoading] = useState(false);
@@ -154,7 +174,7 @@ export default function Index() {
   const applyLocalDraft = (draft: LocalDraft) => {
     setLocalDraftId(draft.id);
     setDraftRef(draft.ref);
-    setData(draft.data);
+    setData({ ...emptyData(profile), ...draft.data });
   };
 
   const update = <K extends keyof AccidentData>(key: K, value: AccidentData[K]) => {
@@ -427,16 +447,19 @@ export default function Index() {
     setWithdrawOpen(false);
     if (!user || !draftRef || !localDraftId) return;
     try {
-      update("hasSignature", false);
-      update("signatureDataUrl", "");
       if (!draftRef.incidentId.startsWith("local:")) {
-        const { error } = await supabase.from("incident_parties")
+        const { data: updatedParty, error } = await supabase.from("incident_parties")
           .update({ signed_at: null, signature_storage_path: null, version: draftRef.partyVersion + 1, updated_at: new Date().toISOString() })
           .eq("id", draftRef.partyId)
-          .eq("version", draftRef.partyVersion);
+          .eq("version", draftRef.partyVersion)
+          .select("id")
+          .maybeSingle();
         if (error) throw error;
+        if (!updatedParty) throw new Error("signature_withdraw_zero_rows");
         await refreshFromServer();
       }
+      update("hasSignature", false);
+      update("signatureDataUrl", "");
       toast.success(t("signature.withdrawn"));
     } catch {
       toast.error(t("incident.saveError"));
@@ -465,9 +488,12 @@ export default function Index() {
         console.log("[startAccident] Creating incident on server via RPC");
         const { data: rpcResult, error: rpcError } = await Promise.race([
           supabase.rpc("create_incident_with_party", {
-            initial_driver: { fullName: initial.driverName, address: initial.driverAddress, phone: initial.phone },
-            initial_vehicle: { plate: initial.plate, makeModel: initial.vehicle },
-            initial_insurance: { company: initial.insurer, policyNumber: initial.policy },
+            initial_driver: {
+              fullName: initial.driverName, address: initial.driverAddress, postalCode: initial.postalCode, city: initial.city, country: initial.country,
+              birthDate: initial.birthDate, phone: initial.phone, licenseNo: initial.licenseNo, licenseClass: initial.licenseClass, licenseValidUntil: initial.licenseValidUntil,
+            },
+            initial_vehicle: { plate: initial.plate, makeModel: initial.vehicle, registrationCountry: initial.vehicleCountry },
+            initial_insurance: { company: initial.insurer, policyNumber: initial.policy, office: initial.insuranceOffice },
           }),
           new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timeout")), 10_000)),
         ]);
@@ -502,6 +528,7 @@ export default function Index() {
       setLiveUpdatesActive(false);
       setDirty(false);
       setSignedJustNow(false);
+      setSaveToProfile(true);
       setStep(0);
       setView("wizard");
       window.scrollTo(0, 0);
@@ -610,7 +637,8 @@ export default function Index() {
   const ownRequiredFieldsComplete = [data.driverName, data.driverAddress, data.phone, data.plate, data.vehicle, data.insurer, data.policy, data.damage].every(hasText);
   const ownParty = parties.find((party) => party.id === draftRef?.partyId);
   const counterpart = parties.find((party) => party.id !== draftRef?.partyId);
-  const alreadySigned = Boolean(ownParty?.signedAt || data.hasSignature);
+  // The database is the sole source of truth for persisted signature state.
+  const alreadySigned = Boolean(ownParty?.signedAt);
 
   const missingRequiredFields = useMemo(() => {
     const fields: { key: string; step: number }[] = [];
@@ -665,6 +693,21 @@ export default function Index() {
       console.log("[complete] Step c: Calling sign-incident", { partyId, storagePath });
       const result = await signIncident(partyId);
       console.log("[complete] Step c: sign-incident succeeded", { partyId, version: result.version, signedAt: result.signedAt, alreadySigned: result.alreadySigned });
+
+      if (saveToProfile) {
+        try {
+          const masterData = accidentToMasterData(data, locale as Profile["locale"]);
+          if (isAnonymous) {
+            saveLocalProfileMasterData(masterData);
+          } else {
+            await saveProfileMasterData(user.id, masterData);
+            await refreshProfile();
+          }
+        } catch (profileError) {
+          console.error("[complete] Profile save failed", { error: profileError instanceof Error ? profileError.message : String(profileError) });
+          toast.error(t("profile.saveError"));
+        }
+      }
 
       // Step f: Update local Dexie copy
       if (localDraftId) {
@@ -806,7 +849,30 @@ export default function Index() {
 
           {step === 0 && <div className="space-y-6"><div className="grid grid-cols-2 gap-4"><Field number="1" label={t("fields.date")}><Input type="date" value={data.date} onChange={(event) => update("date", event.target.value)} className={fieldClass} /></Field><Field number="1" label={t("fields.time")}><Input type="time" value={data.time} onChange={(event) => update("time", event.target.value)} className={fieldClass} /></Field></div><Field number="2" label={t("fields.place")}><div className="space-y-2"><Input value={data.location} onChange={(event) => { update("location", event.target.value); update("locationLat", null); update("locationLng", null); }} placeholder={t("fields.placePlaceholder")} className={fieldClass} /><Button type="button" variant="outline" onClick={locate} disabled={locating} className="h-12 w-full rounded-xl border-[#B8CDDC] text-[#153B66]"><LocateFixed className={`mr-2 h-5 w-5 ${locating ? "animate-spin" : ""}`} />{t(locating ? "location.locating" : "location.useCurrent")}</Button></div></Field><Field number="3" label={t("fields.injured")}><div className="grid grid-cols-2 gap-3"><Choice active={!data.injured} onClick={() => update("injured", false)}>{t("fields.no")}</Choice><Choice active={data.injured} warning onClick={() => update("injured", true)}>{t("fields.yesInjured")}</Choice></div>{data.injured && <p className="mt-3 rounded-xl bg-amber-50 p-3 text-sm font-medium text-amber-900">{t("fields.emergency")}</p>}</Field><Field number="4" label={t("fields.otherDamage")}><div className="grid grid-cols-2 gap-3"><Choice active={!data.otherDamage} onClick={() => update("otherDamage", false)}>{t("fields.no")}</Choice><Choice active={data.otherDamage} warning onClick={() => update("otherDamage", true)}>{t("fields.yesOtherDamage")}</Choice></div></Field><Field number="5" label={t("fields.witnesses")}><Textarea value={data.witnesses} onChange={(event) => update("witnesses", event.target.value)} placeholder={t("fields.witnessesPlaceholder")} className="min-h-24 rounded-xl text-base" /></Field></div>}
 
-          {step === 1 && <div className="space-y-7"><SectionTitle number="6 & 9" icon={<UserRound />} title={t("fields.driver")} /><div className="space-y-5"><Field label={t("fields.fullName")}><Input value={data.driverName} onChange={(event) => update("driverName", event.target.value)} placeholder={t("fields.namePlaceholder")} className={fieldClass} /></Field><Field label={t("fields.address")}><Input value={data.driverAddress} onChange={(event) => update("driverAddress", event.target.value)} placeholder={t("fields.addressPlaceholder")} className={fieldClass} /></Field><Field label={t("fields.phone")}><Input type="tel" value={data.phone} onChange={(event) => update("phone", event.target.value)} placeholder={t("fields.phonePlaceholder")} className={fieldClass} /></Field></div><div className="border-t border-slate-100 pt-6"><SectionTitle number="7–8" icon={<Car />} title={t("fields.vehicleInsurance")} /></div><div className="grid gap-5 sm:grid-cols-2"><Field number="7" label={t("fields.plate")}><Input value={data.plate} onChange={(event) => update("plate", event.target.value.toUpperCase())} placeholder={t("fields.platePlaceholder")} className={`${fieldClass} font-semibold uppercase`} /></Field><Field number="7" label={t("fields.vehicle")}><Input value={data.vehicle} onChange={(event) => update("vehicle", event.target.value)} placeholder={t("fields.vehiclePlaceholder")} className={fieldClass} /></Field><Field number="8" label={t("fields.insurer")}><Input value={data.insurer} onChange={(event) => update("insurer", event.target.value)} placeholder={t("fields.insurerPlaceholder")} className={fieldClass} /></Field><Field number="8" label={t("fields.policy")}><Input value={data.policy} onChange={(event) => update("policy", event.target.value)} placeholder={t("fields.policyPlaceholder")} className={fieldClass} /></Field></div></div>}
+          {step === 1 && <div className="space-y-7">
+            <SectionTitle number="6 & 9" icon={<UserRound />} title={t("fields.driver")} />
+            <div className="grid gap-5 sm:grid-cols-2">
+              <Field label={t("fields.fullName")}><Input value={data.driverName} onChange={(event) => update("driverName", event.target.value)} placeholder={t("fields.namePlaceholder")} className={fieldClass} /></Field>
+              <Field label={t("fields.phone")}><Input type="tel" value={data.phone} onChange={(event) => update("phone", event.target.value)} placeholder={t("fields.phonePlaceholder")} className={fieldClass} /></Field>
+              <Field label={t("fields.address")}><Input value={data.driverAddress} onChange={(event) => update("driverAddress", event.target.value)} placeholder={t("fields.addressPlaceholder")} className={fieldClass} /></Field>
+              <Field label={t("profile.postalCode")}><Input value={data.postalCode} onChange={(event) => update("postalCode", event.target.value)} className={fieldClass} /></Field>
+              <Field label={t("profile.city")}><Input value={data.city} onChange={(event) => update("city", event.target.value)} className={fieldClass} /></Field>
+              <Field label={t("profile.country")}><Input value={data.country} onChange={(event) => update("country", event.target.value)} className={fieldClass} /></Field>
+              <Field label={t("profile.birthDate")}><Input type="date" value={data.birthDate} onChange={(event) => update("birthDate", event.target.value)} className={fieldClass} /></Field>
+              <Field label={t("profile.licenseNo")}><Input value={data.licenseNo} onChange={(event) => update("licenseNo", event.target.value)} className={fieldClass} /></Field>
+              <Field label={t("profile.licenseClass")}><Input value={data.licenseClass} onChange={(event) => update("licenseClass", event.target.value)} className={fieldClass} /></Field>
+              <Field label={t("profile.licenseValidUntil")}><Input type="date" value={data.licenseValidUntil} onChange={(event) => update("licenseValidUntil", event.target.value)} className={fieldClass} /></Field>
+            </div>
+            <div className="border-t border-slate-100 pt-6"><SectionTitle number="7–8" icon={<Car />} title={t("fields.vehicleInsurance")} /></div>
+            <div className="grid gap-5 sm:grid-cols-2">
+              <Field number="7" label={t("fields.plate")}><Input value={data.plate} onChange={(event) => update("plate", event.target.value.toUpperCase())} placeholder={t("fields.platePlaceholder")} className={`${fieldClass} font-semibold uppercase`} /></Field>
+              <Field number="7" label={t("fields.vehicle")}><Input value={data.vehicle} onChange={(event) => update("vehicle", event.target.value)} placeholder={t("fields.vehiclePlaceholder")} className={fieldClass} /></Field>
+              <Field label={t("profile.registrationCountry")}><Input value={data.vehicleCountry} onChange={(event) => update("vehicleCountry", event.target.value)} className={fieldClass} /></Field>
+              <Field number="8" label={t("fields.insurer")}><Input value={data.insurer} onChange={(event) => update("insurer", event.target.value)} placeholder={t("fields.insurerPlaceholder")} className={fieldClass} /></Field>
+              <Field number="8" label={t("fields.policy")}><Input value={data.policy} onChange={(event) => update("policy", event.target.value)} placeholder={t("fields.policyPlaceholder")} className={fieldClass} /></Field>
+              <Field label={t("profile.insuranceOffice")}><Input value={data.insuranceOffice} onChange={(event) => update("insuranceOffice", event.target.value)} className={fieldClass} /></Field>
+            </div>
+          </div>}
           {step === 2 && <div className="space-y-3"><FieldBadge number="12" />{circumstances.map((circumstance, index) => { const selected = data.situations.includes(index); return <label key={index} className={`flex min-h-16 cursor-pointer items-center gap-4 rounded-2xl border-2 p-4 ${selected ? "border-[#39719D] bg-[#EDF4F8]" : "border-slate-200"}`}><Checkbox checked={selected} onCheckedChange={() => update("situations", selected ? data.situations.filter((value) => value !== index) : [...data.situations, index])} className="h-6 w-6 rounded-md data-[state=checked]:border-[#153B66] data-[state=checked]:bg-[#153B66]" /><span className="flex-1 text-sm font-medium leading-snug text-slate-700"><span className="mr-2 text-xs font-bold text-[#39719D]">{formatNumber(index + 1)}.</span>{circumstance}</span></label>; })}<p className="pt-3 text-center text-sm font-medium text-slate-500">{t("circumstances.selected", { count: data.situations.length, formattedCount: formatNumber(data.situations.length) })}</p></div>}
           {step === 3 && <div className="space-y-6"><Field number="11" label={t("fields.visibleDamage")}><Textarea value={data.damage} onChange={(event) => update("damage", event.target.value)} placeholder={t("fields.damagePlaceholder")} className="min-h-28 rounded-xl text-base" /></Field><Field number="14" label={t("fields.remarks")}><Textarea value={data.notes} onChange={(event) => update("notes", event.target.value)} placeholder={t("fields.remarksPlaceholder")} className="min-h-24 rounded-xl text-base" /></Field><Field number="11" label={t("fields.photos")}><button type="button" onClick={() => void takePhoto()} className="flex min-h-32 w-full cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed border-[#9FBACD] bg-[#F7FAFC] p-5 text-center"><Camera className="mb-2 h-8 w-8 text-[#39719D]" /><span className="font-semibold text-[#153B66]">{t("fields.photoAction")}</span><span className="mt-1 text-xs text-slate-500">{t("fields.photoHint")}</span></button><input ref={photoInputRef} type="file" accept="image/*" capture="environment" multiple className="sr-only" onChange={(event) => { addPhotos(event.target.files); event.target.value = ""; }} /></Field>{data.photos.length > 0 && <div className="grid grid-cols-3 gap-3">{data.photos.map((photo, index) => <div key={photo.id} className="relative aspect-square overflow-hidden rounded-xl bg-slate-100"><img src={photo.url} alt={t("fields.photoAlt", { number: formatNumber(index + 1) })} className="h-full w-full object-cover" /><button type="button" onClick={() => void removePhoto(photo)} className="absolute right-1 top-1 flex h-8 w-8 items-center justify-center rounded-full bg-slate-900/75 text-white" aria-label={t("fields.deletePhoto")}><Trash2 className="h-4 w-4" /></button></div>)}</div>}</div>}
 
@@ -843,6 +909,12 @@ export default function Index() {
             <div className="grid gap-3 sm:grid-cols-2"><Summary number="1" icon={<Clock3 />} label={t("fields.dateTime")} value={formatCaseDate(data)} /><Summary number="2" icon={<MapPin />} label={t("fields.place")} value={data.location || t("fields.notProvided")} /><Summary number="9" icon={<UserRound />} label={t("fields.driver")} value={data.driverName || t("fields.notProvided")} /><Summary number="7" icon={<Car />} label={t("fields.vehicle")} value={`${data.plate || t("fields.noPlate")}${data.vehicle ? ` · ${data.vehicle}` : ""}`} /><Summary number="8" icon={<ShieldCheck />} label={t("fields.insurer")} value={data.insurer || t("fields.notProvided")} /><Summary number="11–13" icon={<Camera />} label={t("fields.documentation")} value={`${t("fields.photosCount", { formattedCount: formatNumber(data.photos.length) })} · ${t(data.hasSketch ? "fields.sketchAvailable" : "fields.withoutSketch")}`} /></div>
             <div className="rounded-2xl border border-slate-200 p-4"><FieldBadge number="12" /><p className="mb-2 mt-2 text-xs font-bold uppercase tracking-wider text-slate-500">{t("summary.circumstances")}</p>{selectedSummary.length ? <ul className="space-y-1.5">{selectedSummary.map((item) => <li key={item} className="flex gap-2 text-sm text-slate-700"><Check className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />{item}</li>)}</ul> : <p className="text-sm text-slate-500">{t("summary.noneSelected")}</p>}</div>
             {counterpart && <CounterpartSummary party={counterpart} loading={summaryLoading} />}
+            {!alreadySigned && (
+              <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-slate-200 bg-slate-50 p-4">
+                <Checkbox checked={saveToProfile} onCheckedChange={(checked) => setSaveToProfile(checked === true)} className="mt-0.5" />
+                <span className="text-sm leading-relaxed text-slate-700">{t("profile.saveForFuture")}</span>
+              </label>
+            )}
             <FieldBadge number="15" />
             <SignatureStatusLine ownSigned={alreadySigned} counterpart={counterpart} />
             {alreadySigned
@@ -904,7 +976,7 @@ function SubmissionPanel({ incidentId, ownSigned, unilateral, counterpartLabel, 
     } catch (error) {
       const code = error instanceof SubmissionError ? error.code : "pdf_generation_failed";
       console.error("[SubmissionPanel] PDF download failed", { code, error });
-      toast.error(t(`submission.errors.${code}`, { defaultValue: t("submission.errors.pdf_generation_failed") }));
+      toast.error(error instanceof SubmissionError ? error.message : t("submission.errors.pdf_generation_failed"));
     } finally {
       setGenerating(false);
       setBusy(false);
@@ -924,7 +996,7 @@ function SubmissionPanel({ incidentId, ownSigned, unilateral, counterpartLabel, 
     } catch (error) {
       const code = error instanceof SubmissionError ? error.code : "submission_failed";
       console.error("[SubmissionPanel] Submission failed", { code, error });
-      toast.error(t(`submission.errors.${code}`, { defaultValue: t("submission.errors.submission_failed") }));
+      toast.error(error instanceof SubmissionError ? error.message : t("submission.errors.submission_failed"));
     } finally {
       setSubmitting(false);
       setBusy(false);

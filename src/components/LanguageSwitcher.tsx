@@ -1,4 +1,5 @@
 import { useTranslation } from "react-i18next";
+import { toast } from "sonner";
 import { localeForLanguage, supportedLanguages } from "@/i18n";
 import { useAuth } from "@/contexts/AuthContext";
 import { supabase } from "@/integrations/supabase/client";
@@ -11,7 +12,8 @@ export function LanguageSwitcher() {
   const selectLanguage = async (locale: string) => {
     await i18n.changeLanguage(locale);
     if (user && !isAnonymous) {
-      await supabase.from("profiles").update({ locale, updated_at: new Date().toISOString() }).eq("id", user.id);
+      const { data, error } = await supabase.from("profiles").update({ locale, updated_at: new Date().toISOString() }).eq("id", user.id).select("id").maybeSingle();
+      if (error || !data) toast.error(t("profile.saveError"));
     }
   };
 

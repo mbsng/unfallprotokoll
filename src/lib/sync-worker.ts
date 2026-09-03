@@ -36,9 +36,14 @@ const incidentPatch = (data: AccidentData, field: keyof AccidentData) => {
 };
 
 const partyPatch = (data: AccidentData, field: keyof AccidentData) => {
-  if (["driverName", "driverAddress", "phone"].includes(field)) return { driver_json: { fullName: data.driverName, address: data.driverAddress, phone: data.phone } };
-  if (["plate", "vehicle"].includes(field)) return { vehicle_json: { plate: data.plate, makeModel: data.vehicle } };
-  if (["insurer", "policy"].includes(field)) return { insurance_json: { company: data.insurer, policyNumber: data.policy } };
+  if (["driverName", "driverAddress", "postalCode", "city", "country", "birthDate", "phone", "licenseNo", "licenseClass", "licenseValidUntil"].includes(field)) return {
+    driver_json: {
+      fullName: data.driverName, address: data.driverAddress, postalCode: data.postalCode, city: data.city, country: data.country,
+      birthDate: data.birthDate, phone: data.phone, licenseNo: data.licenseNo, licenseClass: data.licenseClass, licenseValidUntil: data.licenseValidUntil,
+    },
+  };
+  if (["plate", "vehicle", "vehicleCountry"].includes(field)) return { vehicle_json: { plate: data.plate, makeModel: data.vehicle, registrationCountry: data.vehicleCountry } };
+  if (["insurer", "policy", "insuranceOffice"].includes(field)) return { insurance_json: { company: data.insurer, policyNumber: data.policy, office: data.insuranceOffice } };
   if (field === "situations") return { circumstances_checked: data.situations };
   if (field === "damage" || field === "notes") return { damage_description: [data.damage, data.notes].filter(Boolean).join("\n\n") };
   return {};
@@ -63,11 +68,20 @@ function serverFields(table: "incidents" | "incident_parties", row: Record<strin
     const insurance = row.insurance_json as Record<string, unknown>;
     if (field === "driverName") return driver?.fullName ?? "";
     if (field === "driverAddress") return driver?.address ?? "";
+    if (field === "postalCode") return driver?.postalCode ?? "";
+    if (field === "city") return driver?.city ?? "";
+    if (field === "country") return driver?.country ?? "";
+    if (field === "birthDate") return driver?.birthDate ?? "";
     if (field === "phone") return driver?.phone ?? "";
+    if (field === "licenseNo") return driver?.licenseNo ?? "";
+    if (field === "licenseClass") return driver?.licenseClass ?? "";
+    if (field === "licenseValidUntil") return driver?.licenseValidUntil ?? "";
     if (field === "plate") return vehicle?.plate ?? "";
     if (field === "vehicle") return vehicle?.makeModel ?? "";
+    if (field === "vehicleCountry") return vehicle?.registrationCountry ?? "";
     if (field === "insurer") return insurance?.company ?? "";
     if (field === "policy") return insurance?.policyNumber ?? "";
+    if (field === "insuranceOffice") return insurance?.office ?? "";
     if (field === "situations") return row.circumstances_checked ?? [];
     if (field === "damage" || field === "notes") {
       const [damage = "", ...notes] = String(row.damage_description ?? "").split("\n\n");
@@ -86,9 +100,12 @@ async function createRemoteDraft(draft: LocalDraft, entry: OutboxEntry) {
   await assertOwner(draft.ownerId);
   console.log("[sync-worker] createRemoteDraft: calling RPC create_incident_with_party");
   const { data, error } = await withTimeout(supabase.rpc("create_incident_with_party", {
-    initial_driver: { fullName: draft.data.driverName, address: draft.data.driverAddress, phone: draft.data.phone },
-    initial_vehicle: { plate: draft.data.plate, makeModel: draft.data.vehicle },
-    initial_insurance: { company: draft.data.insurer, policyNumber: draft.data.policy },
+    initial_driver: {
+      fullName: draft.data.driverName, address: draft.data.driverAddress, postalCode: draft.data.postalCode, city: draft.data.city, country: draft.data.country,
+      birthDate: draft.data.birthDate, phone: draft.data.phone, licenseNo: draft.data.licenseNo, licenseClass: draft.data.licenseClass, licenseValidUntil: draft.data.licenseValidUntil,
+    },
+    initial_vehicle: { plate: draft.data.plate, makeModel: draft.data.vehicle, registrationCountry: draft.data.vehicleCountry },
+    initial_insurance: { company: draft.data.insurer, policyNumber: draft.data.policy, office: draft.data.insuranceOffice },
   }));
   const row = data?.[0];
   if (error) {
@@ -111,7 +128,8 @@ async function createRemoteDraft(draft: LocalDraft, entry: OutboxEntry) {
   const now = new Date().toISOString();
   const snapshotFields: (keyof AccidentData)[] = [
     "date", "time", "location", "locationLat", "locationLng", "injured", "otherDamage", "witnesses",
-    "driverName", "driverAddress", "phone", "plate", "vehicle", "insurer", "policy", "situations", "damage", "notes",
+    "driverName", "driverAddress", "postalCode", "city", "country", "birthDate", "phone", "licenseNo", "licenseClass", "licenseValidUntil",
+    "plate", "vehicle", "vehicleCountry", "insurer", "policy", "insuranceOffice", "situations", "damage", "notes",
   ];
   const snapshotEntries: OutboxEntry[] = snapshotFields.map((field, index) => {
     const table = field === "witnesses" ? "incident_witnesses" : ["date", "time", "location", "locationLat", "locationLng", "injured", "otherDamage"].includes(field) ? "incidents" : "incident_parties";

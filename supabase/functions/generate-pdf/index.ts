@@ -3,9 +3,11 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
 import { PDFDocument, StandardFonts, rgb, type PDFImage, type PDFPage, type PDFFont } from "https://esm.sh/pdf-lib@1.17.1";
 import { incidentBelongsToOrg } from "../_shared/incident-export.ts";
 import { corsHeaders } from "../_shared/cors.ts";
+import { errorBody, normalizeLocale, type AppLocale } from "../_shared/error-response.ts";
 
 const ALLOW_HEADERS = "authorization, x-client-info, apikey, content-type";
 const json = (req: Request, body: Record<string, unknown>, status = 200) => new Response(JSON.stringify(body), { status, headers: { ...corsHeaders(req, ALLOW_HEADERS), "Content-Type": "application/json" } });
+const fail = (req: Request, code: string, status: number, locale: AppLocale) => json(req, errorBody(code, locale), status);
 
 const PW = 595.28;
 const PH = 841.89;
@@ -73,20 +75,22 @@ const CIRCUMSTANCES = [
 
 serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders(req, ALLOW_HEADERS) });
-  if (req.method !== "POST") return json(req, { error: "method_not_allowed" }, 405);
+  let locale = normalizeLocale(req.headers.get("accept-language"));
+  if (req.method !== "POST") return fail(req, "method_not_allowed", 405, locale);
   try {
-    const authHeader = req.headers.get("Authorization");
-    if (!authHeader?.startsWith("Bearer ")) return json(req, { error: "unauthorized" }, 401);
-    const token = authHeader.slice(7);
     const body = await req.json();
+    locale = normalizeLocale(body.locale ?? locale);
+    const authHeader = req.headers.get("Authorization");
+    if (!authHeader?.startsWith("Bearer ")) return fail(req, "unauthorized", 401, locale);
+    const token = authHeader.slice(7);
     const incidentId = body.incidentId as string;
-    if (!incidentId || !/^[0-9a-f-]{36}$/i.test(incidentId)) return json(req, { error: "invalid_incident" }, 400);
+    if (!incidentId || !/^[0-9a-f-]{36}$/i.test(incidentId)) return fail(req, "invalid_incident", 400, locale);
 
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
     const authClient = createClient(supabaseUrl, Deno.env.get("SUPABASE_ANON_KEY")!, { global: { headers: { Authorization: authHeader } }, auth: { persistSession: false } });
     const service = createClient(supabaseUrl, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!, { auth: { persistSession: false } });
     const { data: authData, error: authError } = await authClient.auth.getUser(token);
-    if (authError || !authData.user) return json(req, { error: "unauthorized" }, 401);
+    if (authError || !authData.user) return fail(req, "unauthorized", 401, locale);
 
     const [{ data: incident, error: incidentError }, { data: parties, error: partiesError }, { data: witnesses }, { data: media }] = await Promise.all([
       service.from("incidents").select("*").eq("id", incidentId).single(),
@@ -94,7 +98,7 @@ serve(async (req) => {
       service.from("incident_witnesses").select("name, contact").eq("incident_id", incidentId),
       service.from("incident_media").select("storage_path, kind, taken_at, party_id").eq("incident_id", incidentId).order("uploaded_at"),
     ]);
-    if (incidentError || partiesError || !incident || !parties) return json(req, { error: "not_found" }, 404);
+    if (incidentError || partiesError || !incident || !parties) return fail(req, "not_found", 404, locale);
 
     let submissionParty = parties.find((p) => p.profile_id === authData.user.id);
     if (!submissionParty) {
@@ -105,21 +109,20 @@ serve(async (req) => {
         submissionParty = parties.find((p) => p.profile_id === orgProfile?.id);
       }
     }
-    if (!submissionParty) return json(req, { error: "forbidden" }, 403);
+    if (!submissionParty) return fail(req, "forbidden", 403, locale);
 
-    // NEW RULE: PDF is allowed as soon as MY OWN party has signed.
-    // No dependency on counterpart signature. Document carries its own status.
-    const requesterSigned = Boolean(submissionParty.signed_at);
-    if (!requesterSigned) {
-      return json(req, { error: "own_signature_required" }, 409);
+    // The only document gate: the requesting party's own signed_at.
+    // Counterpart signatures, incident status, Realtime and Outbox state are
+    // deliberately irrelevant to PDF generation.
+    if (!submissionParty.signed_at) {
+      return fail(req, "own_signature_required", 409, locale);
     }
 
     // Determine completeness — the derived incident status is maintained
     // exclusively by the sync_incident_status_from_parties DB trigger.
     const realParties = parties.filter((p) => p.profile_id);
     const unsignedParties = realParties.filter((p) => !p.signed_at);
-    const allSigned = realParties.length > 0 && unsignedParties.length === 0;
-    const completeness = allSigned ? "vollstaendig" : "einseitig";
+    const completeness = unsignedParties.length === 0 ? "vollstaendig" : "einseitig";
 
     const downloaded = new Map<string, { bytes: Uint8Array; contentType?: string }>();
     for (const item of media ?? []) {
@@ -349,6 +352,6 @@ serve(async (req) => {
     return json(req, { submissionId, storagePath, downloadUrl: signed.signedUrl, completeness });
   } catch (error) {
     console.error("[generate-pdf] generation failed", { error: error instanceof Error ? error.message : String(error) });
-    return json(req, { error: "pdf_generation_failed" }, 500);
+    return fail(req, "pdf_generation_failed", 500, locale);
   }
 });

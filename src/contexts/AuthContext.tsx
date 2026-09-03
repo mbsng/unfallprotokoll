@@ -4,6 +4,7 @@ import { supabase } from "@/integrations/supabase/client";
 import { localeForLanguage } from "@/i18n";
 import i18n from "@/i18n";
 import { clearLocalAccidentData } from "@/lib/local-db";
+import { clearLocalProfileMasterData, loadLocalProfileMasterData, saveProfileMasterData } from "@/lib/profile-data";
 import { pauseSyncWorker } from "@/lib/sync-worker";
 import type { Organization, Profile } from "@/types/profile";
 
@@ -69,6 +70,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (insertError) setError(insertError.message);
       else nextProfile = inserted as Profile;
     }
+
+    const localMasterData = loadLocalProfileMasterData();
+    if (nextProfile && localMasterData) {
+      try {
+        nextProfile = await saveProfileMasterData(user.id, localMasterData);
+        clearLocalProfileMasterData();
+      } catch (transferError) {
+        setError(transferError instanceof Error ? transferError.message : "profile_transfer_failed");
+      }
+    }
+
     setProfile(nextProfile);
     if (nextProfile?.org_id) {
       const { data: org, error: orgError } = await supabase.from("organizations").select("id, name, branding_json").eq("id", nextProfile.org_id).maybeSingle();
