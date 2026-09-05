@@ -1,10 +1,9 @@
 import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
 import { validateWebhookEndpoint } from "../_shared/safe-webhook.ts";
-import { corsHeaders } from "../_shared/cors.ts";
+import { corsHeaders, corsPreflightResponse } from "../_shared/cors.ts";
 
-const ALLOW_HEADERS = "authorization, x-client-info, apikey, content-type";
-const json = (req: Request, body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { ...corsHeaders(req, ALLOW_HEADERS), "Content-Type": "application/json" } });
+const json = (req: Request, body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { ...corsHeaders(req), "Content-Type": "application/json" } });
 const allowedScopes = new Set(["incidents:read", "pdf:read"]);
 
 function base64Url(bytes: Uint8Array) {
@@ -25,7 +24,7 @@ async function hmacHex(secret: string, payload: string) {
 }
 
 serve(async (req) => {
-  if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders(req, ALLOW_HEADERS) });
+  if (req.method === "OPTIONS") return corsPreflightResponse(req);
   if (req.method !== "POST") return json(req, { error: "method_not_allowed" }, 405);
   try {
     const authHeader = req.headers.get("Authorization");

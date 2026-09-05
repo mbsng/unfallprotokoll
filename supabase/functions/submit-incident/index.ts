@@ -1,11 +1,10 @@
 import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
 import { sendEmail } from "../_shared/email.ts";
-import { corsHeaders } from "../_shared/cors.ts";
+import { corsHeaders, corsPreflightResponse } from "../_shared/cors.ts";
 import { errorBody, normalizeLocale, type AppLocale } from "../_shared/error-response.ts";
 
-const ALLOW_HEADERS = "authorization, x-client-info, apikey, content-type";
-const json = (req: Request, body: Record<string, unknown>, status = 200) => new Response(JSON.stringify(body), { status, headers: { ...corsHeaders(req, ALLOW_HEADERS), "Content-Type": "application/json" } });
+const json = (req: Request, body: Record<string, unknown>, status = 200) => new Response(JSON.stringify(body), { status, headers: { ...corsHeaders(req), "Content-Type": "application/json" } });
 const fail = (req: Request, code: string, status: number, locale: AppLocale) => json(req, errorBody(code, locale), status);
 const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -24,7 +23,7 @@ function toBase64(bytes: Uint8Array) {
 }
 
 serve(async (req) => {
-  if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders(req, ALLOW_HEADERS) });
+  if (req.method === "OPTIONS") return corsPreflightResponse(req);
   let locale = normalizeLocale(req.headers.get("accept-language"));
   if (req.method !== "POST") return fail(req, "method_not_allowed", 405, locale);
   try {

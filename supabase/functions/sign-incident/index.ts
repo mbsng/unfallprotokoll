@@ -1,10 +1,9 @@
 import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
-import { corsHeaders } from "../_shared/cors.ts";
+import { corsHeaders, corsPreflightResponse } from "../_shared/cors.ts";
 
-const ALLOW_HEADERS = "authorization, x-client-info, apikey, content-type";
 const json = (req: Request, body: Record<string, unknown>, status = 200) =>
-  new Response(JSON.stringify(body), { status, headers: { ...corsHeaders(req, ALLOW_HEADERS), "Content-Type": "application/json" } });
+  new Response(JSON.stringify(body), { status, headers: { ...corsHeaders(req), "Content-Type": "application/json" } });
 
 async function sha256(bytes: Uint8Array) {
   const digest = await crypto.subtle.digest("SHA-256", bytes as unknown as ArrayBuffer);
@@ -17,7 +16,7 @@ async function sha256(bytes: Uint8Array) {
 // A plain client UPDATE on incident_parties cannot mint a signature
 // (blocked by the guard_incident_party_client_updates trigger).
 serve(async (req) => {
-  if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders(req, ALLOW_HEADERS) });
+  if (req.method === "OPTIONS") return corsPreflightResponse(req);
   if (req.method !== "POST") return json(req, { error: "method_not_allowed" }, 405);
   try {
     const authHeader = req.headers.get("Authorization");

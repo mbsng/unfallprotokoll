@@ -1,10 +1,9 @@
 import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
 import { buildIncidentExport, incidentBelongsToOrg } from "../_shared/incident-export.ts";
-import { corsHeaders } from "../_shared/cors.ts";
+import { corsHeaders, corsPreflightResponse } from "../_shared/cors.ts";
 
-const ALLOW_HEADERS = "authorization, content-type";
-const json = (req: Request, body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { ...corsHeaders(req, ALLOW_HEADERS), "Access-Control-Expose-Headers": "X-RateLimit-Limit", "Content-Type": "application/json", "X-RateLimit-Limit": "60" } });
+const json = (req: Request, body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { ...corsHeaders(req), "Access-Control-Expose-Headers": "X-RateLimit-Limit", "Content-Type": "application/json", "X-RateLimit-Limit": "60" } });
 
 async function sha256(value: string) {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
@@ -12,7 +11,7 @@ async function sha256(value: string) {
 }
 
 serve(async (req) => {
-  if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders(req, ALLOW_HEADERS) });
+  if (req.method === "OPTIONS") return corsPreflightResponse(req);
   if (req.method !== "GET") return json(req, { error: "method_not_allowed" }, 405);
   try {
     const authorization = req.headers.get("Authorization");
@@ -60,7 +59,7 @@ serve(async (req) => {
       if (!submission?.pdf_storage_path) return json(req, { error: "pdf_not_found" }, 404);
       const { data: pdf, error } = await service.storage.from("incident-pdfs").download(submission.pdf_storage_path);
       if (error || !pdf) return json(req, { error: "pdf_not_found" }, 404);
-      return new Response(await pdf.arrayBuffer(), { status: 200, headers: { ...corsHeaders(req, ALLOW_HEADERS), "Access-Control-Expose-Headers": "X-RateLimit-Limit", "Content-Type": "application/pdf", "Content-Disposition": `attachment; filename="incident-${incidentId}.pdf"`, "X-RateLimit-Limit": "60" } });
+      return new Response(await pdf.arrayBuffer(), { status: 200, headers: { ...corsHeaders(req), "Access-Control-Expose-Headers": "X-RateLimit-Limit", "Content-Type": "application/pdf", "Content-Disposition": `attachment; filename="incident-${incidentId}.pdf"`, "X-RateLimit-Limit": "60" } });
     }
     return json(req, await buildIncidentExport(service, incidentId));
   } catch (error) {

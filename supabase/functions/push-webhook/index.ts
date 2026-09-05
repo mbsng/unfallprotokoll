@@ -2,11 +2,10 @@ import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
 import { buildIncidentExport, incidentBelongsToOrg } from "../_shared/incident-export.ts";
 import { validateWebhookEndpoint } from "../_shared/safe-webhook.ts";
-import { corsHeaders } from "../_shared/cors.ts";
+import { corsHeaders, corsPreflightResponse } from "../_shared/cors.ts";
 
 declare const EdgeRuntime: { waitUntil(promise: Promise<unknown>): void };
-const ALLOW_HEADERS = "authorization, x-client-info, apikey, content-type";
-const json = (req: Request, body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { ...corsHeaders(req, ALLOW_HEADERS), "Content-Type": "application/json" } });
+const json = (req: Request, body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { ...corsHeaders(req), "Content-Type": "application/json" } });
 const sleep = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 async function hmacHex(secret: string, payload: string) {
@@ -66,7 +65,7 @@ async function deliver(service: any, integration: any, submissionId: string, doc
 }
 
 serve(async (req) => {
-  if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders(req, ALLOW_HEADERS) });
+  if (req.method === "OPTIONS") return corsPreflightResponse(req);
   if (req.method !== "POST") return json(req, { error: "method_not_allowed" }, 405);
   try {
     const authHeader = req.headers.get("Authorization");
