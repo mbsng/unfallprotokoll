@@ -1,6 +1,7 @@
 import { supabase } from "@/integrations/supabase/client";
 import { normalizeShareCode } from "@/lib/share-code";
-import type { CaseStatus, IncidentDraftRef, IncidentPreview, IncidentSummaryData, JoinedIncidentState, PendingPhoto, UserIncidentItem } from "@/types/incident";
+import type { CaseStatus, IncidentDraftRef, IncidentPreview, IncidentSummaryData, JoinedIncidentState, PendingPhoto, ReportType, UserIncidentItem } from "@/types/incident";
+import { normalizeReportType } from "@/types/incident";
 
 const hasText = (value?: string | null) => Boolean(value?.trim());
 
@@ -37,12 +38,13 @@ async function functionErrorCode(error: unknown, fallback: string) {
   }
 }
 
-export async function createIncidentWithParty(driver: object, vehicle: object, insurance: object): Promise<IncidentDraftRef> {
+export async function createIncidentWithParty(driver: object, vehicle: object, insurance: object, reportType: ReportType = "collision"): Promise<IncidentDraftRef> {
 
   const { data, error } = await supabase.rpc("create_incident_with_party", {
     initial_driver: driver,
     initial_vehicle: vehicle,
     initial_insurance: insurance,
+    initial_report_type: reportType,
   });
   const row = data?.[0];
   if (error || !row || !row.share_code) throw new IncidentSaveError("create");
@@ -74,7 +76,7 @@ export async function joinIncident(code: string): Promise<JoinedIncidentState> {
 
 export async function loadIncidentSummary(ref: IncidentDraftRef): Promise<IncidentSummaryData> {
   const [incidentResult, partiesResult] = await Promise.all([
-    supabase.from("incidents").select("version, status, occurred_at, location_text, sketch_data_url, sketch_updated_by, sketch_updated_at").eq("id", ref.incidentId).single(),
+    supabase.from("incidents").select("version, status, occurred_at, location_text, sketch_data_url, sketch_updated_by, sketch_updated_at, report_type, type_details").eq("id", ref.incidentId).single(),
     supabase.from("incident_parties").select("id, party_label, version, driver_json, vehicle_json, insurance_json, damage_description, circumstances_checked, signed_at, sketch_confirmed_at").eq("incident_id", ref.incidentId).order("party_label"),
   ]);
   if (incidentResult.error || partiesResult.error) throw new IncidentSaveError("save");
@@ -86,6 +88,8 @@ export async function loadIncidentSummary(ref: IncidentDraftRef): Promise<Incide
     sketchDataUrl: incidentResult.data.sketch_data_url,
     sketchUpdatedBy: incidentResult.data.sketch_updated_by,
     sketchUpdatedAt: incidentResult.data.sketch_updated_at,
+    reportType: normalizeReportType(incidentResult.data.report_type),
+    typeDetails: (incidentResult.data.type_details ?? {}) as IncidentSummaryData["typeDetails"],
     parties: partiesResult.data.map((party) => ({
       id: party.id,
       partyLabel: party.party_label as "A" | "B",
@@ -104,7 +108,7 @@ export async function loadIncidentSummary(ref: IncidentDraftRef): Promise<Incide
 export async function loadUserIncidents(userId: string): Promise<UserIncidentItem[]> {
   const { data: incidents, error: incidentsError } = await supabase
     .from("incidents")
-    .select("id, share_code, status, occurred_at, location_text, created_at, updated_at")
+    .select("id, share_code, status, report_type, occurred_at, location_text, created_at, updated_at")
     .order("updated_at", { ascending: false })
     .limit(20);
 
@@ -130,6 +134,7 @@ export async function loadUserIncidents(userId: string): Promise<UserIncidentIte
         partyLabel: own.party_label as "A" | "B",
         shareCode: incident.share_code,
         status: incident.status,
+        reportType: normalizeReportType(incident.report_type),
         ownSignedAt: own.signed_at,
         counterpartSignedAt: others[0]?.signed_at ?? null,
         counterpartExists: others.length > 0,

@@ -87,6 +87,8 @@ export async function buildIncidentExport(service: any, incidentId: string, urlT
       id: incident.id,
       share_code: incident.share_code,
       status: incident.status.toUpperCase(),
+      report_type: incident.report_type ?? "collision",
+      type_details: incident.type_details ?? {},
       occurred_at: incident.occurred_at,
       occurred_date: occurredAt?.toISOString().slice(0, 10) ?? null,
       location: { text: incident.location_text, latitude: incident.location_lat, longitude: incident.location_lng },

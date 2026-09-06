@@ -72,6 +72,21 @@ const CIRCUMSTANCES = [
   "Vorfahrt / rote Ampel",
 ];
 
+const NATURE_EVENT_LABELS: Record<string, string> = {
+  hail: "Hagel", storm: "Sturm", flood: "Hochwasser", snow_pressure: "Schneedruck",
+  rockfall: "Steinschlag", wildlife: "Wildunfall", marten: "Marderschaden", other: "Sonstiges",
+};
+
+const NATURE_PART_LABELS: Record<string, string> = {
+  roof: "Dach", hood: "Motorhaube", trunk_lid: "Kofferraumdeckel", windshield: "Frontscheibe",
+  rear_window: "Heckscheibe", side_windows: "Seitenscheiben", fender_left: "Kotfluegel links",
+  fender_right: "Kotfluegel rechts", doors_left: "Tueren links", doors_right: "Tueren rechts",
+  mirrors: "Spiegel", lights: "Beleuchtung", underbody: "Unterboden", other_part: "Sonstiges",
+};
+
+const NATURE_HAIL_DENSITY_LABELS: Record<string, string> = { few: "wenige", moderate: "mittel", many: "viele" };
+const NATURE_HAIL_SIZE_LABELS: Record<string, string> = { small: "klein", medium: "mittel", large: "gross" };
+
 serve(async (req) => {
   if (req.method === "OPTIONS") return corsPreflightResponse(req);
   let locale = normalizeLocale(req.headers.get("accept-language"));
@@ -127,6 +142,149 @@ serve(async (req) => {
     for (const item of media ?? []) {
       const { data, error } = await service.storage.from("incident-media").download(item.storage_path);
       if (!error && data) downloaded.set(item.storage_path, { bytes: new Uint8Array(await data.arrayBuffer()), contentType: data.type });
+    }
+
+    // Nature reports ("Wetter, Natur und Tier") get their own lean A4 damage
+    // report instead of the European accident protocol. It deliberately shares
+    // the head bar, footer, photo appendix and vehicle/insurance blocks with
+    // the collision format so both documents read as one family.
+    if (incident.report_type === "nature") {
+      const details = (incident.type_details ?? {}) as Record<string, unknown>;
+      const eventType = String(details.eventType ?? "other");
+      const selectedParts = Array.isArray(details.parts) ? (details.parts as string[]) : [];
+      const isWeatherPeriod = ["hail", "storm", "flood", "snow_pressure", "rockfall"].includes(eventType);
+      const periodFrom = String(details.periodFrom ?? "");
+      const periodTo = String(details.periodTo ?? "");
+      const timeValue = isWeatherPeriod
+        ? [periodFrom, periodTo].filter(Boolean).join(" - ")
+        : incident.occurred_at ? new Date(incident.occurred_at).toLocaleString("de-CH") : "";
+
+      const pdf = await PDFDocument.create();
+      pdf.setTitle(`Schadenmeldung ${incident.share_code}`);
+      pdf.setCreationDate(new Date());
+      const regular = await pdf.embedFont(StandardFonts.Helvetica);
+      const bold = await pdf.embedFont(StandardFonts.HelveticaBold);
+      const page = pdf.addPage([PW, PH]);
+      const navy = rgb(0.08, 0.23, 0.4);
+      const blueA = rgb(0.05, 0.27, 0.49);
+
+      page.drawRectangle({ x: 0, y: PH - 30, width: PW, height: 30, color: navy });
+      page.drawText("SCHADENMELDUNG", { x: MARGIN, y: PH - 20, size: 13, font: bold, color: rgb(1, 1, 1) });
+      page.drawText(`Fall ${clean(incident.share_code)}`, { x: PW - 110, y: PH - 14, size: 6, font: regular, color: rgb(0.85, 0.9, 1) });
+
+      let y = PH - 34;
+      const gap = 3;
+      const headH = 30;
+      const wHalf = (CONTENT_W - gap) / 2;
+      const w1 = CONTENT_W * 0.34;
+      const w2 = CONTENT_W * 0.38;
+      const w3 = CONTENT_W - w1 - w2 - 2 * gap;
+      labeledField(page, regular, bold, "1", "Ereignisart", NATURE_EVENT_LABELS[eventType] ?? eventType, MARGIN, y - headH, w1, headH);
+      labeledField(page, regular, bold, "2", isWeatherPeriod ? "Zeitraum (von - bis)" : "Zeitpunkt", timeValue, MARGIN + w1 + gap, y - headH, w2, headH);
+      labeledField(page, regular, bold, "3", "Schaden entdeckt am", details.discoveredOn ?? "", MARGIN + w1 + w2 + 2 * gap, y - headH, w3, headH);
+      y -= headH + gap;
+      labeledField(page, regular, bold, "4", "Ort / GPS", incident.location_text ?? "", MARGIN, y - headH, wHalf, headH);
+      labeledField(page, regular, bold, "5", "Abstellort", details.parking ?? "", MARGIN + wHalf + gap, y - headH, wHalf, headH);
+      y -= headH + gap + 2;
+
+      const partKeys = Object.keys(NATURE_PART_LABELS);
+      const rows = Math.ceil(partKeys.length / 2);
+      const partRowH = 11;
+      const hailExtra = eventType === "hail" ? 26 : 0;
+      const partsH = 16 + rows * partRowH + 6 + hailExtra;
+      box(page, MARGIN, y - partsH, CONTENT_W, partsH);
+      page.drawText("BETROFFENE FAHRZEUGTEILE", { x: MARGIN + 4, y: y - 10, size: 6, font: bold, color: navy });
+      partKeys.forEach((key, index) => {
+        const column = index < rows ? 0 : 1;
+        const rowIndex = index < rows ? index : index - rows;
+        const px = MARGIN + 6 + column * (CONTENT_W / 2 - 4);
+        const py = y - 22 - rowIndex * partRowH;
+        const checked = selectedParts.includes(key);
+        page.drawRectangle({ x: px, y: py - 2, width: 5, height: 5, borderWidth: 0.4, borderColor: navy, color: checked ? blueA : rgb(1, 1, 1) });
+        page.drawText(`${checked ? "X" : "-"} ${NATURE_PART_LABELS[key]}`, { x: px + 8, y: py, size: 5.5, font: checked ? bold : regular, color: rgb(0.12, 0.14, 0.18) });
+      });
+      if (eventType === "hail") {
+        const density = String(details.hailDensity ?? "");
+        const hailSize = String(details.hailSize ?? "");
+        page.drawText(`Hagel: Einschlagstellen: ${NATURE_HAIL_DENSITY_LABELS[density] ?? "-"} | Groesse der Hagelkoerner: ${NATURE_HAIL_SIZE_LABELS[hailSize] ?? "-"}`, { x: MARGIN + 6, y: y - partsH + 6, size: 5.5, font: bold, color: blueA });
+      }
+      y -= partsH + gap;
+
+      const descH = 52;
+      box(page, MARGIN, y - descH, CONTENT_W, descH);
+      page.drawText("SCHADENBESCHREIBUNG", { x: MARGIN + 4, y: y - 10, size: 6, font: bold, color: navy });
+      drawWrapped(page, regular, submissionParty.damage_description ?? "", MARGIN + 4, y - 20, CONTENT_W - 8, 6, 6);
+      y -= descH + gap;
+
+      page.drawRectangle({ x: MARGIN, y: y - 12, width: CONTENT_W, height: 12, color: blueA });
+      page.drawText(`FAHRZEUG ${clean(submissionParty.party_label)}`, { x: MARGIN + 3, y: y - 9, size: 6.5, font: bold, color: rgb(1, 1, 1) });
+      y -= 14;
+      const natureDriver = (submissionParty.driver_json ?? {}) as Record<string, unknown>;
+      const natureVehicle = (submissionParty.vehicle_json ?? {}) as Record<string, unknown>;
+      const natureInsurance = (submissionParty.insurance_json ?? {}) as Record<string, unknown>;
+      labeledField(page, regular, bold, "6", "Versicherungsnehmer", [natureDriver.fullName, natureDriver.address, natureDriver.phone].filter(Boolean).join("\n"), MARGIN, y - 40, wHalf, 40);
+      labeledField(page, regular, bold, "7", "Fahrzeug / Kennzeichen", [natureVehicle.makeModel, natureVehicle.plate].filter(Boolean).join(" - "), MARGIN + wHalf + gap, y - 40, wHalf, 40);
+      y -= 42;
+      labeledField(page, regular, bold, "8", "Versicherung", [natureInsurance.company, natureInsurance.policyNumber].filter(Boolean).join(" - "), MARGIN, y - 26, wHalf, 26);
+      labeledField(page, regular, bold, "9", "Fahrer", [natureDriver.fullName, natureDriver.address, natureDriver.phone].filter(Boolean).join("\n"), MARGIN + wHalf + gap, y - 26, wHalf, 26);
+      y -= 28;
+
+      const sigH = 78;
+      box(page, MARGIN, y - sigH, CONTENT_W, sigH);
+      page.drawText(`15 UNTERSCHRIFT ${clean(submissionParty.party_label)}`, { x: MARGIN + 4, y: y - 6, size: 5, font: bold, color: navy });
+      const natureSigItem = (media ?? []).find((item: { storage_path: string }) => item.storage_path.includes(`/${submissionParty.id}/signature.`));
+      if (natureSigItem && downloaded.has(natureSigItem.storage_path)) {
+        const stored = downloaded.get(natureSigItem.storage_path)!;
+        const img = await embedImage(pdf, stored.bytes, stored.contentType);
+        if (img) drawImageFit(page, img, MARGIN + 8, y - sigH + 10, CONTENT_W - 16, sigH - 26);
+      }
+      page.drawText(`Signiert: ${submissionParty.signed_at ? new Date(submissionParty.signed_at).toLocaleString("de-CH") : ""}`, { x: MARGIN + 4, y: y - sigH + 4, size: 4, font: regular, color: rgb(0.35, 0.4, 0.45) });
+
+      page.drawText(`Fall ${clean(incident.share_code)} - Erstellt ${new Date().toLocaleDateString("de-CH")} - Unterschrift kein Schuldanerkenntnis.`, { x: MARGIN, y: 4, size: 4, font: regular, color: rgb(0.4, 0.45, 0.5) });
+
+      const photos = (media ?? []).filter((item: { kind: string }) => item.kind === "photo");
+      for (let index = 0; index < photos.length; index += 4) {
+        const pPage = pdf.addPage([PW, PH]);
+        pPage.drawText(`FOTOANHANG - FALL ${clean(incident.share_code)}`, { x: MARGIN, y: PH - 28, size: 12, font: bold, color: navy });
+        for (let slot = 0; slot < 4; slot++) {
+          const item = photos[index + slot];
+          if (!item) break;
+          const px = slot % 2 === 0 ? MARGIN : MARGIN + (CONTENT_W / 2) + 2;
+          const py = slot < 2 ? PH - MARGIN - 320 : PH - MARGIN - 640;
+          const photoW = CONTENT_W / 2 - 2;
+          const photoH = 310;
+          box(pPage, px, py, photoW, photoH);
+          const stored = downloaded.get(item.storage_path);
+          if (stored) {
+            const img = await embedImage(pdf, stored.bytes, stored.contentType);
+            if (img) drawImageFit(pPage, img, px + 6, py + 22, photoW - 12, photoH - 36);
+          }
+          pPage.drawText(`Foto ${index + slot + 1}`, { x: px + 6, y: py + 8, size: 5.5, font: regular, color: rgb(0.3, 0.35, 0.4) });
+        }
+      }
+
+      const pdfBytes = await pdf.save();
+      const storagePath = `${incidentId}/schadenmeldung-${incident.share_code}.pdf`;
+      const { error: uploadError } = await service.storage.from("incident-pdfs").upload(storagePath, pdfBytes, { upsert: true, contentType: "application/pdf" });
+      if (uploadError) throw uploadError;
+
+      const { data: existing } = await service.from("submissions").select("id, status").eq("incident_id", incidentId).eq("party_id", submissionParty.id).maybeSingle();
+      let submissionId: string;
+      if (existing) {
+        const { data: updatedSubmission, error: submissionUpdateError } = await service.from("submissions").update({ pdf_storage_path: storagePath }).eq("id", existing.id).select("id").maybeSingle();
+        if (submissionUpdateError) throw submissionUpdateError;
+        if (!updatedSubmission) throw new Error("submission_update_zero_rows");
+        submissionId = updatedSubmission.id;
+      } else {
+        const { data: sub, error: subErr } = await service.from("submissions").insert({ incident_id: incidentId, party_id: submissionParty.id, target: "pending", status: "generated", pdf_storage_path: storagePath }).select("id").single();
+        if (subErr) throw subErr;
+        submissionId = sub.id;
+      }
+
+      const { data: signed, error: signError } = await service.storage.from("incident-pdfs").createSignedUrl(storagePath, 3600, { download: `Schadenmeldung-${incident.share_code}.pdf` });
+      if (signError) throw signError;
+      console.log("[generate-pdf] Nature damage report generated", { incidentId, submissionId, photoCount: photos.length, format: "A4-portrait" });
+      return json(req, { submissionId, storagePath, downloadUrl: signed.signedUrl, completeness: "vollstaendig" });
     }
 
     const pdf = await PDFDocument.create();

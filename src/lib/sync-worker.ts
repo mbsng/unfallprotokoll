@@ -1,6 +1,6 @@
 import Dexie from "dexie";
 import { supabase } from "@/integrations/supabase/client";
-import { db, deviceId, applyDraftFromSync, requestSync, type LocalDraft, type OutboxEntry, type SyncConflict } from "@/lib/local-db";
+import { db, deviceId, applyDraftFromSync, requestSync, tableForField, NATURE_FIELDS, type LocalDraft, type OutboxEntry, type SyncConflict } from "@/lib/local-db";
 import type { AccidentData } from "@/types/incident";
 
 let activeRun: Promise<void> | null = null;
@@ -27,7 +27,31 @@ const extensionForPhoto = (mimeType: string) => {
   return "jpg";
 };
 
-const incidentPatch = (data: AccidentData, field: keyof AccidentData) => {
+const natureTypeDetails = (data: AccidentData) => ({
+  eventType: data.natureEventType,
+  periodFrom: data.naturePeriodFrom,
+  periodTo: data.naturePeriodTo,
+  discoveredOn: data.natureDiscoveredOn,
+  parking: data.natureParking,
+  parts: data.natureParts,
+  hailDensity: data.natureEventType === "hail" ? data.natureHailDensity : "",
+  hailSize: data.natureEventType === "hail" ? data.natureHailSize : "",
+});
+
+const natureDetailsKey = (field: string) => {
+  const stripped = field.replace(/^nature/, "");
+  return stripped.charAt(0).toLowerCase() + stripped.slice(1);
+};
+
+const incidentPatch = (data: AccidentData, field: keyof AccidentData): Record<string, unknown> => {
+  if (field === "reportType") return {};
+  if (typeof field === "string" && NATURE_FIELDS.includes(field as (typeof NATURE_FIELDS)[number])) {
+    const patch: Record<string, unknown> = { type_details: natureTypeDetails(data) };
+    if (field === "naturePeriodFrom" || field === "naturePeriodTo") {
+      patch.occurred_at = data.naturePeriodFrom ? new Date(`${data.naturePeriodFrom}T00:00:00`).toISOString() : null;
+    }
+    return patch;
+  }
   if (field === "date" || field === "time") return { occurred_at: new Date(`${data.date}T${data.time}:00`).toISOString() };
   if (["location", "locationLat", "locationLng"].includes(field)) return { location_text: data.location, location_lat: data.locationLat, location_lng: data.locationLng };
   if (field === "injured" || field === "otherDamage") return { circumstances_json: { injured: data.injured, otherDamage: data.otherDamage } };
@@ -51,6 +75,11 @@ const partyPatch = (data: AccidentData, field: keyof AccidentData) => {
 
 function serverFields(table: "incidents" | "incident_parties", row: Record<string, unknown>, field: keyof AccidentData) {
   if (table === "incidents") {
+    if (typeof field === "string" && NATURE_FIELDS.includes(field as (typeof NATURE_FIELDS)[number])) {
+      const details = (row.type_details ?? {}) as Record<string, unknown>;
+      const key = natureDetailsKey(field);
+      return key === "parts" ? details[key] ?? [] : details[key] ?? "";
+    }
     if (field === "date" || field === "time") {
       const date = row.occurred_at ? new Date(row.occurred_at as string) : null;
       return field === "date" ? date?.toISOString().slice(0, 10) ?? "" : date?.toTimeString().slice(0, 5) ?? "";
@@ -106,6 +135,7 @@ async function createRemoteDraft(draft: LocalDraft, entry: OutboxEntry) {
     },
     initial_vehicle: { plate: draft.data.plate, makeModel: draft.data.vehicle, registrationCountry: draft.data.vehicleCountry },
     initial_insurance: { company: draft.data.insurer, policyNumber: draft.data.policy, office: draft.data.insuranceOffice },
+    initial_report_type: draft.data.reportType ?? "collision",
   }));
   const row = data?.[0];
   if (error) {
@@ -131,8 +161,9 @@ async function createRemoteDraft(draft: LocalDraft, entry: OutboxEntry) {
     "driverName", "driverAddress", "postalCode", "city", "country", "birthDate", "phone", "licenseNo", "licenseClass", "licenseValidUntil",
     "plate", "vehicle", "vehicleCountry", "insurer", "policy", "insuranceOffice", "situations", "damage", "notes",
   ];
+  if ((draft.data.reportType ?? "collision") === "nature") snapshotFields.push(...NATURE_FIELDS);
   const snapshotEntries: OutboxEntry[] = snapshotFields.map((field, index) => {
-    const table = field === "witnesses" ? "incident_witnesses" : ["date", "time", "location", "locationLat", "locationLng", "injured", "otherDamage"].includes(field) ? "incidents" : "incident_parties";
+    const table = tableForField(field);
     return {
       id: crypto.randomUUID(), ownerId: draft.ownerId, draftId: draft.id, table, operation: "update",
       payload: { field, value: draft.data[field], modifiedAt: draft.fieldModifiedAt[field] ?? now },

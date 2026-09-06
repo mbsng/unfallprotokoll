@@ -4,6 +4,15 @@ import type { AccidentData, IncidentDraftRef, PendingPhoto } from "@/types/incid
 export type SyncTable = "incidents" | "incident_parties" | "incident_witnesses" | "incident_media";
 export type SyncOperation = "create" | "update" | "upload" | "delete" | "complete";
 
+// Nature-report fields persisted in incidents.type_details.
+export const NATURE_FIELDS = [
+  "natureEventType", "naturePeriodFrom", "naturePeriodTo", "natureDiscoveredOn",
+  "natureParking", "natureParts", "natureHailDensity", "natureHailSize",
+] as const;
+
+export const isNatureField = (field: keyof AccidentData): field is (typeof NATURE_FIELDS)[number] =>
+  (NATURE_FIELDS as readonly string[]).includes(field);
+
 export interface LocalDraft {
   id: string;
   ownerId: string;
@@ -94,8 +103,9 @@ export const deviceId = (() => {
   return created;
 })();
 
-const tableForField = (field: keyof AccidentData): SyncTable => {
+export const tableForField = (field: keyof AccidentData): SyncTable => {
   if (field === "witnesses") return "incident_witnesses";
+  if (field === "reportType" || isNatureField(field)) return "incidents";
   if (["date", "time", "location", "locationLat", "locationLng", "injured", "otherDamage", "sketchDataUrl", "hasSketch"].includes(field)) return "incidents";
   return "incident_parties";
 };

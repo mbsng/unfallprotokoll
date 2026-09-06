@@ -3,7 +3,7 @@ import { useLiveQuery } from "dexie-react-hooks";
 import { useTranslation } from "react-i18next";
 
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import { AlertTriangle, ArrowLeft, ArrowRight, Camera, Car, Check, CheckCircle2, ChevronRight, Clock3, Download, FileText, LocateFixed, Mail, MapPin, Plus, QrCode, Radio, RefreshCw, RotateCcw, Send, ShieldCheck, Trash2, UserRound } from "lucide-react";
+import { AlertTriangle, ArrowLeft, ArrowRight, Camera, Car, Check, CheckCircle2, ChevronRight, Clock3, CloudHail, Download, FileText, LocateFixed, Mail, MapPin, Plus, QrCode, Radio, RefreshCw, RotateCcw, Send, ShieldCheck, TrafficCone, TreePine, Trash2, UserRound } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -29,17 +29,19 @@ import { accidentToMasterData, loadLocalProfileMasterData, saveLocalProfileMaste
 import { processOutbox } from "@/lib/sync-worker";
 import { generateIncidentPdf, signIncident, SubmissionError, submitIncident } from "@/lib/submissions";
 
-import type { AccidentData, IncidentDraftRef, IncidentPartySummary, IncidentSummaryData, JoinedIncidentState, PendingPhoto } from "@/types/incident";
+import type { AccidentData, IncidentDraftRef, IncidentPartySummary, IncidentSummaryData, JoinedIncidentState, PendingPhoto, ReportType } from "@/types/incident";
 import type { CaseStatus, UserIncidentItem } from "@/types/incident";
+import { NATURE_EVENT_TYPES, NATURE_HAIL_DENSITIES, NATURE_HAIL_SIZES, NATURE_PART_KEYS, NATURE_PERIOD_EVENT_TYPES, normalizeReportType } from "@/types/incident";
 
 import type { Profile } from "@/types/profile";
 
-interface CaseItem { id: string; date: string; time: string; location: string; plate: string; incidentId: string; partyId: string; partyLabel: "A" | "B"; shareCode: string; caseStatus: CaseStatus }
+interface CaseItem { id: string; date: string; time: string; location: string; plate: string; incidentId: string; partyId: string; partyLabel: "A" | "B"; shareCode: string; caseStatus: CaseStatus; reportType: ReportType }
 
 const emptyData = (profile?: Profile | null): AccidentData => {
   const now = new Date();
   const local = profile ? null : loadLocalProfileMasterData();
   return {
+    reportType: "collision",
     date: now.toISOString().slice(0, 10), time: now.toTimeString().slice(0, 5), location: "", locationLat: null, locationLng: null,
     injured: false, otherDamage: false, witnesses: "",
     driverName: profile?.full_name ?? local?.fullName ?? "", driverAddress: profile?.address ?? local?.address ?? "", postalCode: profile?.postal_code ?? local?.postalCode ?? "", city: profile?.city ?? local?.city ?? "", country: profile?.country ?? local?.country ?? "",
@@ -47,6 +49,7 @@ const emptyData = (profile?: Profile | null): AccidentData => {
     plate: profile?.default_vehicle_json?.plate ?? local?.plate ?? "", vehicle: profile?.default_vehicle_json?.makeModel ?? local?.makeModel ?? "", vehicleCountry: profile?.default_vehicle_json?.registrationCountry ?? local?.registrationCountry ?? "",
     insurer: profile?.insurance_json?.company ?? local?.insuranceCompany ?? "", policy: profile?.insurance_json?.policyNumber ?? local?.policyNumber ?? "", insuranceOffice: profile?.insurance_json?.office ?? local?.insuranceOffice ?? "",
     situations: [], damage: "", notes: "", photos: [], hasSketch: false, sketchDataUrl: "", hasSignature: false, signatureDataUrl: "",
+    natureEventType: "", naturePeriodFrom: "", naturePeriodTo: "", natureDiscoveredOn: "", natureParking: "", natureParts: [], natureHailDensity: "", natureHailSize: "",
   };
 };
 
@@ -63,6 +66,16 @@ const joinedData = (joined: JoinedIncidentState, profile?: Profile | null): Acci
 
 const summaryToData = (summary: IncidentSummaryData, ownParty: IncidentPartySummary, profile?: Profile | null): AccidentData => {
   const data = emptyData(profile);
+  data.reportType = normalizeReportType(summary.reportType);
+  const details = summary.typeDetails ?? {};
+  data.natureEventType = details.eventType ?? "";
+  data.naturePeriodFrom = details.periodFrom ?? "";
+  data.naturePeriodTo = details.periodTo ?? "";
+  data.natureDiscoveredOn = details.discoveredOn ?? "";
+  data.natureParking = details.parking ?? "";
+  data.natureParts = Array.isArray(details.parts) ? details.parts : [];
+  data.natureHailDensity = details.hailDensity ?? "";
+  data.natureHailSize = details.hailSize ?? "";
   if (summary.occurredAt) {
     const occurredAt = new Date(summary.occurredAt);
     data.date = `${occurredAt.getFullYear()}-${String(occurredAt.getMonth() + 1).padStart(2, "0")}-${String(occurredAt.getDate()).padStart(2, "0")}`;
@@ -108,6 +121,12 @@ const statusColors: Record<CaseStatus, string> = {
   submitted: "bg-blue-100 text-blue-700",
 };
 
+const reportTypeColors: Record<ReportType, string> = {
+  collision: "bg-[#E7F0F6] text-[#285B82]",
+  single_vehicle: "bg-violet-100 text-violet-700",
+  nature: "bg-emerald-100 text-emerald-700",
+};
+
 const toCaseItem = (item: UserIncidentItem): CaseItem => {
   const occurredAt = item.occurredAt ? new Date(item.occurredAt) : new Date();
   return {
@@ -116,6 +135,7 @@ const toCaseItem = (item: UserIncidentItem): CaseItem => {
     partyId: item.partyId,
     partyLabel: item.partyLabel,
     shareCode: item.shareCode,
+    reportType: normalizeReportType(item.reportType),
     date: occurredAt.toISOString().slice(0, 10),
     time: occurredAt.toTimeString().slice(0, 5),
     location: item.locationText ?? "",
@@ -132,15 +152,19 @@ export default function Index() {
   const { user, profile, isAnonymous, startAnonymous, refreshProfile } = useAuth();
 
   const locale = localeForLanguage(i18n.resolvedLanguage || i18n.language);
-  const steps = t("wizard.steps", { returnObjects: true }) as string[];
-  const titles = t("wizard.titles", { returnObjects: true }) as string[];
-  const descriptions = t("wizard.descriptions", { returnObjects: true }) as string[];
-  const circumstances = t("circumstances.items", { returnObjects: true }) as string[];
-  const [view, setView] = useState<"home" | "wizard" | "signed">(joinedIncident ? "wizard" : "home");
+  const [view, setView] = useState<"home" | "triage" | "wizard" | "signed">(joinedIncident ? "wizard" : "home");
   const [step, setStep] = useState(joinedIncident ? 1 : 0);
   const [data, setData] = useState<AccidentData>(() => joinedIncident ? joinedData(joinedIncident, profile) : emptyData(profile));
   const [draftRef, setDraftRef] = useState<IncidentDraftRef | null>(joinedIncident?.draftRef ?? null);
   const [localDraftId, setLocalDraftId] = useState<string | null>(null);
+
+  // The step list is derived from the report type instead of being hardcoded:
+  // collision/single_vehicle keep the established flow, nature gets its own.
+  const isNature = normalizeReportType(data.reportType) === "nature";
+  const steps = t(isNature ? "natureWizard.steps" : "wizard.steps", { returnObjects: true }) as string[];
+  const titles = t(isNature ? "natureWizard.titles" : "wizard.titles", { returnObjects: true }) as string[];
+  const descriptions = t(isNature ? "natureWizard.descriptions" : "wizard.descriptions", { returnObjects: true }) as string[];
+  const circumstances = t("circumstances.items", { returnObjects: true }) as string[];
 
   const [parties, setParties] = useState<IncidentPartySummary[]>([]);
   const [summaryLoading, setSummaryLoading] = useState(false);
@@ -164,6 +188,10 @@ export default function Index() {
   const [withdrawOpen, setWithdrawOpen] = useState(false);
   const [sketchMode, setSketchMode] = useState<"builder" | "freehand">("builder");
   const photoInputRef = useRef<HTMLInputElement>(null);
+
+  // The final (signature/submit) step index depends on the report type's
+  // step list: collision/single_vehicle keep their six steps, nature uses seven.
+  const signatureStep = isNature ? 6 : 5;
 
   const localDrafts = useLiveQuery(
     () => user ? db.drafts.where("ownerId").equals(user.id).reverse().sortBy("updatedAt") : [],
@@ -313,6 +341,7 @@ export default function Index() {
           id: draft.id, incidentId: draft.ref.incidentId, partyId: draft.ref.partyId, partyLabel: draft.ref.partyLabel,
           shareCode: draft.ref.shareCode, date: draft.data.date, time: draft.data.time,
           location: draft.data.location, plate: draft.data.plate, caseStatus: "draft",
+          reportType: normalizeReportType(draft.data.reportType),
         });
       }
     }
@@ -320,7 +349,7 @@ export default function Index() {
   }, [serverCases, localDrafts]);
 
   useEffect(() => {
-    if (step !== 5 || !draftRef || !draftRef.incidentId.startsWith("local:") || !user || !localDraftId || ensuringServerCase) return;
+    if (step !== signatureStep || !draftRef || !draftRef.incidentId.startsWith("local:") || !user || !localDraftId || ensuringServerCase) return;
     if (!serverOnline) return;
     let active = true;
     setEnsuringServerCase(true);
@@ -354,7 +383,7 @@ export default function Index() {
       }
     });
     return () => { active = false; window.clearTimeout(timeout); };
-  }, [step, draftRef?.incidentId, user?.id, localDraftId, ensuringServerCase, serverOnline]);
+  }, [step, signatureStep, draftRef?.incidentId, user?.id, localDraftId, ensuringServerCase, serverOnline]);
 
   const retrySync = async () => {
     if (!navigator.onLine || !user) return;
@@ -466,10 +495,10 @@ export default function Index() {
     }
   };
 
-  const startAccident = async () => {
+  const startAccident = async (reportType: ReportType) => {
     if (creating) return;
     setCreating(true);
-    const initial = emptyData(profile);
+    const initial = { ...emptyData(profile), reportType };
     try {
       let ownerId = user?.id;
       if (!ownerId) {
@@ -494,6 +523,7 @@ export default function Index() {
             },
             initial_vehicle: { plate: initial.plate, makeModel: initial.vehicle, registrationCountry: initial.vehicleCountry },
             initial_insurance: { company: initial.insurer, policyNumber: initial.policy, office: initial.insuranceOffice },
+            initial_report_type: reportType,
           }),
           new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timeout")), 10_000)),
         ]);
@@ -574,7 +604,7 @@ export default function Index() {
       applyLocalDraft(draft);
       setParties(summary.parties);
       // Determine entry step: use requested step, or find first incomplete step
-      const entryStep = requestedStep ?? (ownParty.signedAt ? 5 : 0);
+      const entryStep = requestedStep ?? (ownParty.signedAt ? (normalizeReportType(serverData.reportType) === "nature" ? 6 : 5) : 0);
       setStep(entryStep);
       setSignedJustNow(false);
       setView("wizard");
@@ -589,6 +619,22 @@ export default function Index() {
   const back = () => { if (step === 0) setView("home"); else { setStep((value) => value - 1); window.scrollTo(0, 0); } };
 
   const next = async () => {
+    if (isNature) {
+      if (step === 0 && !data.natureEventType) return toast.error(t("nature.validation.eventTypeRequired"));
+      if (step === 1) {
+        const periodEvent = NATURE_PERIOD_EVENT_TYPES.includes(data.natureEventType);
+        if (periodEvent ? !data.naturePeriodFrom : !data.date) return toast.error(periodEvent ? t("nature.validation.periodFromRequired") : t("validation.dateRequired"));
+      }
+      if (step === 2 && !data.location.trim() && !data.natureParking.trim()) return toast.error(t("nature.validation.locationRequired"));
+      if (step === 3 && ![data.driverName, data.driverAddress, data.phone, data.plate, data.vehicle, data.insurer, data.policy].every(hasText)) return toast.error(t("validation.requiredFields"));
+      if (step === 4 && data.natureParts.length === 0) return toast.error(t("nature.validation.partsRequired"));
+      if (step === 4 && !hasText(data.damage)) return toast.error(t("validation.damageRequired"));
+      setDirty(false);
+      toast.success(t("incident.saved"));
+      setStep((value) => Math.min(value + 1, signatureStep));
+      window.scrollTo(0, 0);
+      return;
+    }
     if (step === 0 && !data.date) return toast.error(t("validation.dateRequired"));
     if (step === 0 && !data.location.trim()) return toast.error(t("validation.locationRequired"));
     if (step === 1 && ![data.driverName, data.driverAddress, data.phone, data.plate, data.vehicle, data.insurer, data.policy].every(hasText)) return toast.error(t("validation.requiredFields"));
@@ -642,16 +688,18 @@ export default function Index() {
 
   const missingRequiredFields = useMemo(() => {
     const fields: { key: string; step: number }[] = [];
-    if (!hasText(data.driverName)) fields.push({ key: "fields.fullName", step: 1 });
-    if (!hasText(data.driverAddress)) fields.push({ key: "fields.address", step: 1 });
-    if (!hasText(data.phone)) fields.push({ key: "fields.phone", step: 1 });
-    if (!hasText(data.plate)) fields.push({ key: "fields.plate", step: 1 });
-    if (!hasText(data.vehicle)) fields.push({ key: "fields.vehicle", step: 1 });
-    if (!hasText(data.insurer)) fields.push({ key: "fields.insurer", step: 1 });
-    if (!hasText(data.policy)) fields.push({ key: "fields.policy", step: 1 });
-    if (!hasText(data.damage)) fields.push({ key: "fields.visibleDamage", step: 3 });
+    const vehicleStep = isNature ? 3 : 1;
+    const damageStep = isNature ? 4 : 3;
+    if (!hasText(data.driverName)) fields.push({ key: "fields.fullName", step: vehicleStep });
+    if (!hasText(data.driverAddress)) fields.push({ key: "fields.address", step: vehicleStep });
+    if (!hasText(data.phone)) fields.push({ key: "fields.phone", step: vehicleStep });
+    if (!hasText(data.plate)) fields.push({ key: "fields.plate", step: vehicleStep });
+    if (!hasText(data.vehicle)) fields.push({ key: "fields.vehicle", step: vehicleStep });
+    if (!hasText(data.insurer)) fields.push({ key: "fields.insurer", step: vehicleStep });
+    if (!hasText(data.policy)) fields.push({ key: "fields.policy", step: vehicleStep });
+    if (!hasText(data.damage)) fields.push({ key: "fields.visibleDamage", step: damageStep });
     return fields;
-  }, [data]);
+  }, [data, isNature]);
 
   const complete = async () => {
     if (!ownRequiredFieldsComplete) return;
@@ -745,6 +793,9 @@ export default function Index() {
   };
 
   const selectedSummary = useMemo(() => data.situations.map((index) => circumstances[index]), [data.situations, circumstances]);
+  const naturePeriodSummary = NATURE_PERIOD_EVENT_TYPES.includes(data.natureEventType)
+    ? [data.naturePeriodFrom, data.naturePeriodTo].filter(Boolean).join(" – ")
+    : formatCaseDate(data);
 
   if (view === "signed") return (
     <div className="min-h-screen bg-[#F5F7FA] text-slate-900">
@@ -760,6 +811,44 @@ export default function Index() {
     </div>
   );
 
+  if (view === "triage") return (
+    <div className="min-h-screen bg-[#F5F7FA] text-slate-900">
+      <AppHeader />
+      <main className="mx-auto max-w-5xl px-5 pb-12 pt-6">
+        <Button variant="ghost" onClick={() => setView("home")} className="mb-4 h-11 rounded-xl text-[#153B66]" aria-label={t("app.back")}><ArrowLeft className="mr-2 h-5 w-5" />{t("app.back")}</Button>
+        <h1 className="text-3xl font-bold tracking-tight text-[#102F52] md:text-4xl">{t("triage.title")}</h1>
+        <p className="mt-2 max-w-lg text-base leading-relaxed text-slate-600">{t("triage.subtitle")}</p>
+        <div className="mt-8 grid gap-4 md:grid-cols-3">
+          <button onClick={() => void startAccident("collision")} disabled={creating} className="group flex min-h-56 flex-col items-start justify-between rounded-3xl border-2 border-[#D8E3EC] bg-white p-6 text-left shadow-sm active:scale-[0.98] disabled:cursor-wait disabled:opacity-75">
+            <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-[#EAF1F6] text-[#153B66]"><Car className="h-7 w-7" /></span>
+            <span className="mt-4 flex w-full flex-1 flex-col">
+              <span className="text-lg font-bold leading-snug text-[#102F52]">{t("triage.collisionTitle")}</span>
+              <span className="mt-2 text-sm leading-relaxed text-slate-500">{t("triage.collisionHint")}</span>
+            </span>
+            <ChevronRight className="mt-3 h-6 w-6 self-end text-slate-400 group-hover:translate-x-1" />
+          </button>
+          <button onClick={() => void startAccident("single_vehicle")} disabled={creating} className="group flex min-h-56 flex-col items-start justify-between rounded-3xl border-2 border-[#D8E3EC] bg-white p-6 text-left shadow-sm active:scale-[0.98] disabled:cursor-wait disabled:opacity-75">
+            <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-[#EAF1F6] text-[#153B66]"><TrafficCone className="h-7 w-7" /></span>
+            <span className="mt-4 flex w-full flex-1 flex-col">
+              <span className="text-lg font-bold leading-snug text-[#102F52]">{t("triage.singleVehicleTitle")}</span>
+              <span className="mt-2 text-sm leading-relaxed text-slate-500">{t("triage.singleVehicleHint")}</span>
+            </span>
+            <ChevronRight className="mt-3 h-6 w-6 self-end text-slate-400 group-hover:translate-x-1" />
+          </button>
+          <button onClick={() => void startAccident("nature")} disabled={creating} className="group flex min-h-56 flex-col items-start justify-between rounded-3xl border-2 border-[#D8E3EC] bg-white p-6 text-left shadow-sm active:scale-[0.98] disabled:cursor-wait disabled:opacity-75">
+            <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-[#EAF1F6] text-[#153B66]"><CloudHail className="h-7 w-7" /></span>
+            <span className="mt-4 flex w-full flex-1 flex-col">
+              <span className="text-lg font-bold leading-snug text-[#102F52]">{t("triage.natureTitle")}</span>
+              <span className="mt-2 text-sm leading-relaxed text-slate-500">{t("triage.natureHint")}</span>
+            </span>
+            <ChevronRight className="mt-3 h-6 w-6 self-end text-slate-400 group-hover:translate-x-1" />
+          </button>
+        </div>
+        {creating && <p className="mt-6 text-center text-sm font-medium text-[#39719D]">{t("incident.creating")}</p>}
+      </main>
+    </div>
+  );
+
   if (view === "home") return (
     <div className="min-h-screen bg-[#F5F7FA] text-slate-900">
       <AppHeader />
@@ -769,7 +858,7 @@ export default function Index() {
           <div className="mt-5 flex items-center gap-2 rounded-full bg-emerald-50 px-3 py-2 text-sm font-medium text-emerald-700 md:mt-0"><ShieldCheck className="h-4 w-4" />{t("incident.secureStorage")}</div>
         </section>
         <section className="grid gap-4 md:grid-cols-2">
-          <button onClick={() => void startAccident()} disabled={creating} className="group flex min-h-44 flex-col items-start justify-between rounded-3xl bg-[#153B66] p-6 text-left text-white shadow-lg shadow-[#153B66]/15 active:scale-[0.98] disabled:cursor-wait disabled:opacity-75"><span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-white/15"><Plus className="h-7 w-7" /></span><span className="flex w-full items-end justify-between gap-4"><span><span className="block text-xl font-bold">{t(creating ? "incident.creating" : "home.new")}</span><span className="mt-1 block text-sm text-blue-100">{t("home.newHint")}</span></span><ArrowRight className="mb-1 h-6 w-6 group-hover:translate-x-1" /></span></button>
+          <button onClick={() => setView("triage")} className="group flex min-h-44 flex-col items-start justify-between rounded-3xl bg-[#153B66] p-6 text-left text-white shadow-lg shadow-[#153B66]/15 active:scale-[0.98]"><span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-white/15"><Plus className="h-7 w-7" /></span><span className="flex w-full items-end justify-between gap-4"><span><span className="block text-xl font-bold">{t("home.new")}</span><span className="mt-1 block text-sm text-blue-100">{t("home.newHint")}</span></span><ArrowRight className="mb-1 h-6 w-6 group-hover:translate-x-1" /></span></button>
           <button onClick={() => navigate("/join")} className="group flex min-h-44 flex-col items-start justify-between rounded-3xl border-2 border-[#D8E3EC] bg-white p-6 text-left text-[#153B66] shadow-sm active:scale-[0.98]"><span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-[#EAF1F6]"><QrCode className="h-7 w-7" /></span><span className="flex w-full items-end justify-between gap-4"><span><span className="block text-xl font-bold">{t("home.join")}</span><span className="mt-1 block text-sm text-slate-500">{t("home.joinHint")}</span></span><ChevronRight className="mb-1 h-6 w-6 group-hover:translate-x-1" /></span></button>
         </section>
 
@@ -800,6 +889,7 @@ export default function Index() {
                       <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-[#EDF3F7] text-[#153B66]"><FileText className="h-6 w-6" /></div>
                       <div className="min-w-0 flex-1">
                         <div className="flex items-center gap-2"><h3 className="truncate font-bold text-[#153B66]">{item.location || t("fields.notProvided")}</h3>
+                          <span className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] font-semibold ${reportTypeColors[item.reportType]}`}>{t(`reportType.${item.reportType}`)}</span>
                           <span className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] font-semibold ${statusColors[item.caseStatus]}`}>{t(`caseStatus.${item.caseStatus}`)}</span>
                         </div>
                         <p className="mt-1 truncate text-sm text-slate-500">{formatCaseDate(item) || t("fields.notProvided")} · {item.plate || t("fields.noPlate")}</p>
@@ -819,7 +909,7 @@ export default function Index() {
             <FileText className="mb-3 h-10 w-10 text-slate-300" />
             <p className="font-semibold text-slate-600">{t("home.noCases")}</p>
             <p className="mt-1 text-sm text-slate-400">{t("home.noCasesHint")}</p>
-            <Button onClick={() => void startAccident()} className="mt-4 rounded-xl bg-[#153B66]"><Plus className="mr-2 h-4 w-4" />{t("home.new")}</Button>
+            <Button onClick={() => setView("triage")} className="mt-4 rounded-xl bg-[#153B66]"><Plus className="mr-2 h-4 w-4" />{t("home.new")}</Button>
           </section>
         )}
       </main>
@@ -840,12 +930,15 @@ export default function Index() {
 
   return (
     <div className="min-h-screen bg-[#F5F7FA] pb-28 text-slate-900">
-      <header className="sticky top-0 z-20 border-b border-slate-200 bg-white/95 backdrop-blur"><div className="mx-auto max-w-3xl px-4 py-3"><div className="flex items-center justify-between gap-2"><Button variant="ghost" size="icon" onClick={back} className="h-11 w-11 shrink-0 rounded-xl" aria-label={t("app.back")}><ArrowLeft className="h-6 w-6 text-[#153B66]" /></Button><div className="min-w-0 text-center"><p className="text-xs font-semibold uppercase tracking-wider text-slate-500">{t("wizard.stepOf", { current: formatNumber(step + 1), total: formatNumber(6) })}</p><p className="truncate font-bold text-[#153B66]">{steps[step]}</p></div><div className="flex items-center gap-1"><Button variant="ghost" size="icon" onClick={() => void refreshFromServer()} disabled={summaryLoading} className="h-9 w-9 rounded-lg" aria-label={t("home.refresh")}><RefreshCw className={`h-4 w-4 text-[#153B66] ${summaryLoading ? "animate-spin" : ""}`} /></Button><LanguageSwitcher /></div></div><div className="mt-3 flex items-center gap-3"><Progress value={((step + 1) / 6) * 100} className="h-1.5 flex-1 bg-slate-200 [&>div]:bg-[#39719D]" /><div className="flex items-center gap-2"><span className={`flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold ${serverOnline ? "bg-emerald-100 text-emerald-700" : "bg-slate-200 text-slate-600"}`}><span className={`h-1.5 w-1.5 rounded-full ${serverOnline ? "bg-emerald-500" : "bg-slate-400"}`} />{t(serverOnline ? "connection.online" : "connection.offline")}</span>{saveStatus === "saving" && <span className="flex items-center gap-1 rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-semibold text-blue-700"><RefreshCw className="h-2.5 w-2.5 animate-spin" />{t("save.saving")}</span>}{saveStatus === "saved" && <span className="flex items-center gap-1 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-semibold text-emerald-700"><Check className="h-2.5 w-2.5" />{t("save.saved")}</span>}{saveStatus === "error" && <button onClick={() => void retrySync()} className="flex items-center gap-1 rounded-full bg-rose-100 px-2 py-0.5 text-[10px] font-semibold text-rose-700"><AlertTriangle className="h-2.5 w-2.5" />{t("save.error")}</button>}{liveUpdatesActive && <span className="hidden items-center gap-0.5 rounded-full bg-blue-100 px-1.5 py-0.5 text-[10px] font-semibold text-blue-700 sm:flex"><Radio className="h-2.5 w-2.5 animate-pulse" />{t("connection.live")}</span>}</div></div><div className="mt-2 flex gap-1 overflow-x-auto pb-1">{steps.map((label, index) => <button key={index} onClick={() => setStep(index)} className={`shrink-0 rounded-full px-2.5 py-1 text-[10px] font-semibold transition ${index === step ? "bg-[#153B66] text-white" : index < step ? "bg-[#E7F0F6] text-[#153B66]" : "bg-slate-100 text-slate-400"}`}>{index + 1}</button>)}</div></div></header>
+      <header className="sticky top-0 z-20 border-b border-slate-200 bg-white/95 backdrop-blur"><div className="mx-auto max-w-3xl px-4 py-3"><div className="flex items-center justify-between gap-2"><Button variant="ghost" size="icon" onClick={back} className="h-11 w-11 shrink-0 rounded-xl" aria-label={t("app.back")}><ArrowLeft className="h-6 w-6 text-[#153B66]" /></Button><div className="min-w-0 text-center"><p className="text-xs font-semibold uppercase tracking-wider text-slate-500">{t("wizard.stepOf", { current: formatNumber(step + 1), total: formatNumber(steps.length) })}</p><p className="truncate font-bold text-[#153B66]">{steps[step]}</p></div><div className="flex items-center gap-1"><Button variant="ghost" size="icon" onClick={() => void refreshFromServer()} disabled={summaryLoading} className="h-9 w-9 rounded-lg" aria-label={t("home.refresh")}><RefreshCw className={`h-4 w-4 text-[#153B66] ${summaryLoading ? "animate-spin" : ""}`} /></Button><LanguageSwitcher /></div></div><div className="mt-3 flex items-center gap-3"><Progress value={((step + 1) / steps.length) * 100} className="h-1.5 flex-1 bg-slate-200 [&>div]:bg-[#39719D]" /><div className="flex items-center gap-2"><span className={`flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold ${serverOnline ? "bg-emerald-100 text-emerald-700" : "bg-slate-200 text-slate-600"}`}><span className={`h-1.5 w-1.5 rounded-full ${serverOnline ? "bg-emerald-500" : "bg-slate-400"}`} />{t(serverOnline ? "connection.online" : "connection.offline")}</span>{saveStatus === "saving" && <span className="flex items-center gap-1 rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-semibold text-blue-700"><RefreshCw className="h-2.5 w-2.5 animate-spin" />{t("save.saving")}</span>}{saveStatus === "saved" && <span className="flex items-center gap-1 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-semibold text-emerald-700"><Check className="h-2.5 w-2.5" />{t("save.saved")}</span>}{saveStatus === "error" && <button onClick={() => void retrySync()} className="flex items-center gap-1 rounded-full bg-rose-100 px-2 py-0.5 text-[10px] font-semibold text-rose-700"><AlertTriangle className="h-2.5 w-2.5" />{t("save.error")}</button>}{liveUpdatesActive && <span className="hidden items-center gap-0.5 rounded-full bg-blue-100 px-1.5 py-0.5 text-[10px] font-semibold text-blue-700 sm:flex"><Radio className="h-2.5 w-2.5 animate-pulse" />{t("connection.live")}</span>}</div></div><div className="mt-2 flex gap-1 overflow-x-auto pb-1">{steps.map((label, index) => <button key={index} onClick={() => setStep(index)} className={`shrink-0 rounded-full px-2.5 py-1 text-[10px] font-semibold transition ${index === step ? "bg-[#153B66] text-white" : index < step ? "bg-[#E7F0F6] text-[#153B66]" : "bg-slate-100 text-slate-400"}`}>{index + 1}</button>)}</div></div></header>
       <main className="mx-auto max-w-3xl px-5 py-7">{caseLoading ? <div className="flex min-h-64 items-center justify-center"><RefreshCw className="h-7 w-7 animate-spin text-[#39719D]" /></div> : <>
       <div className="mb-7"><div className="mb-2 flex flex-wrap items-center gap-2"><p className="text-sm font-semibold text-[#39719D]">{formatNumber(step + 1).padStart(2, "0")} — {steps[step]}</p>{draftRef && <span className="rounded-full bg-[#E7F0F6] px-2.5 py-1 font-mono text-xs font-bold tracking-wider text-[#153B66]">{t("incident.shareCode")}: {draftRef.shareCode}</span>}</div><h1 className="text-2xl font-bold tracking-tight text-[#102F52]">{titles[step]}</h1><p className="mt-2 text-sm leading-relaxed text-slate-500">{descriptions[step]}</p></div>
 
         {(!user || isAnonymous) && <div className="mb-5 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-amber-950"><div className="flex gap-3"><AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-700" /><div><p className="font-semibold">{t("guest.notice")}</p><p className="mt-1 text-sm leading-relaxed text-amber-800">{t("guest.detail")}</p><Button asChild variant="link" className="mt-1 h-auto p-0 font-semibold text-amber-900"><Link to="/auth">{t("guest.createAccount")}</Link></Button></div></div></div>}
         <div className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm md:p-7">
+
+          {/* Collision & single-vehicle: the established six-step European accident report flow, unchanged */}
+          {!isNature && (<>
 
           {step === 0 && <div className="space-y-6"><div className="grid grid-cols-2 gap-4"><Field number="1" label={t("fields.date")}><Input type="date" value={data.date} onChange={(event) => update("date", event.target.value)} className={fieldClass} /></Field><Field number="1" label={t("fields.time")}><Input type="time" value={data.time} onChange={(event) => update("time", event.target.value)} className={fieldClass} /></Field></div><Field number="2" label={t("fields.place")}><div className="space-y-2"><Input value={data.location} onChange={(event) => { update("location", event.target.value); update("locationLat", null); update("locationLng", null); }} placeholder={t("fields.placePlaceholder")} className={fieldClass} /><Button type="button" variant="outline" onClick={locate} disabled={locating} className="h-12 w-full rounded-xl border-[#B8CDDC] text-[#153B66]"><LocateFixed className={`mr-2 h-5 w-5 ${locating ? "animate-spin" : ""}`} />{t(locating ? "location.locating" : "location.useCurrent")}</Button></div></Field><Field number="3" label={t("fields.injured")}><div className="grid grid-cols-2 gap-3"><Choice active={!data.injured} onClick={() => update("injured", false)}>{t("fields.no")}</Choice><Choice active={data.injured} warning onClick={() => update("injured", true)}>{t("fields.yesInjured")}</Choice></div>{data.injured && <p className="mt-3 rounded-xl bg-amber-50 p-3 text-sm font-medium text-amber-900">{t("fields.emergency")}</p>}</Field><Field number="4" label={t("fields.otherDamage")}><div className="grid grid-cols-2 gap-3"><Choice active={!data.otherDamage} onClick={() => update("otherDamage", false)}>{t("fields.no")}</Choice><Choice active={data.otherDamage} warning onClick={() => update("otherDamage", true)}>{t("fields.yesOtherDamage")}</Choice></div></Field><Field number="5" label={t("fields.witnesses")}><Textarea value={data.witnesses} onChange={(event) => update("witnesses", event.target.value)} placeholder={t("fields.witnessesPlaceholder")} className="min-h-24 rounded-xl text-base" /></Field></div>}
 
@@ -931,11 +1024,134 @@ export default function Index() {
           </div>}
 
           {step === 5 && draftRef && !draftRef.incidentId.startsWith("local:") && <CaseDiagnostics incidentId={draftRef.incidentId} />}
+          </>)}
+
+          {/* Nature reports ("Wetter, Natur und Tier"): no counterpart, no 17 circumstances, no sketch */}
+          {isNature && (<>
+
+          {step === 0 && <div className="space-y-4">
+            <p className="text-sm font-semibold text-slate-700">{t("nature.eventTypeQuestion")}</p>
+            <div className="grid gap-3 sm:grid-cols-2">
+              {NATURE_EVENT_TYPES.map((eventType) => { const selected = data.natureEventType === eventType; return (
+                <button key={eventType} type="button" onClick={() => update("natureEventType", eventType)} className={`flex min-h-16 items-center gap-3 rounded-2xl border-2 p-4 text-left text-sm font-semibold leading-snug transition ${selected ? "border-[#153B66] bg-[#EDF3F7] text-[#153B66]" : "border-slate-200 text-slate-600"}`}>
+                  <span className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full border-2 ${selected ? "border-[#153B66] bg-[#153B66] text-white" : "border-slate-300 text-transparent"}`}><Check className="h-3.5 w-3.5" /></span>
+                  {t(`nature.eventTypes.${eventType}`)}
+                </button>
+              ); })}
+            </div>
+            <p className="pt-1 text-xs leading-relaxed text-slate-500">{t("nature.eventTypeHint")}</p>
+          </div>}
+
+          {step === 1 && <div className="space-y-6">
+            {NATURE_PERIOD_EVENT_TYPES.includes(data.natureEventType) ? (<>
+              <div className="rounded-xl bg-[#EDF4F8] p-4 text-sm leading-relaxed text-[#153B66]"><strong>{t("nature.periodHintTitle")}</strong> {t("nature.periodHint")}</div>
+              <div className="grid grid-cols-2 gap-4">
+                <Field label={t("nature.periodFrom")}><Input type="date" value={data.naturePeriodFrom} onChange={(event) => update("naturePeriodFrom", event.target.value)} className={fieldClass} /></Field>
+                <Field label={t("nature.periodTo")}><Input type="date" value={data.naturePeriodTo} onChange={(event) => update("naturePeriodTo", event.target.value)} className={fieldClass} /></Field>
+              </div>
+            </>) : (
+              <div className="grid grid-cols-2 gap-4">
+                <Field label={t("fields.date")}><Input type="date" value={data.date} onChange={(event) => update("date", event.target.value)} className={fieldClass} /></Field>
+                <Field label={t("fields.time")}><Input type="time" value={data.time} onChange={(event) => update("time", event.target.value)} className={fieldClass} /></Field>
+              </div>
+            )}
+            <Field label={t("nature.discoveredOn")}><Input type="date" value={data.natureDiscoveredOn} onChange={(event) => update("natureDiscoveredOn", event.target.value)} className={fieldClass} /></Field>
+          </div>}
+
+          {step === 2 && <div className="space-y-6">
+            <Field label={t("nature.parkingSpot")}><Input value={data.natureParking} onChange={(event) => update("natureParking", event.target.value)} placeholder={t("nature.parkingPlaceholder")} className={fieldClass} /></Field>
+            <Field label={t("fields.place")}><div className="space-y-2"><Input value={data.location} onChange={(event) => { update("location", event.target.value); update("locationLat", null); update("locationLng", null); }} placeholder={t("fields.placePlaceholder")} className={fieldClass} /><Button type="button" variant="outline" onClick={locate} disabled={locating} className="h-12 w-full rounded-xl border-[#B8CDDC] text-[#153B66]"><LocateFixed className={`mr-2 h-5 w-5 ${locating ? "animate-spin" : ""}`} />{t(locating ? "location.locating" : "location.useCurrent")}</Button></div></Field>
+          </div>}
+
+          {step === 3 && <div className="space-y-7">
+            <SectionTitle number="–" icon={<UserRound />} title={t("fields.driver")} />
+            <div className="grid gap-5 sm:grid-cols-2">
+              <Field label={t("fields.fullName")}><Input value={data.driverName} onChange={(event) => update("driverName", event.target.value)} placeholder={t("fields.namePlaceholder")} className={fieldClass} /></Field>
+              <Field label={t("fields.phone")}><Input type="tel" value={data.phone} onChange={(event) => update("phone", event.target.value)} placeholder={t("fields.phonePlaceholder")} className={fieldClass} /></Field>
+              <Field label={t("fields.address")}><Input value={data.driverAddress} onChange={(event) => update("driverAddress", event.target.value)} placeholder={t("fields.addressPlaceholder")} className={fieldClass} /></Field>
+              <Field label={t("profile.city")}><Input value={data.city} onChange={(event) => update("city", event.target.value)} className={fieldClass} /></Field>
+              <Field label={t("profile.postalCode")}><Input value={data.postalCode} onChange={(event) => update("postalCode", event.target.value)} className={fieldClass} /></Field>
+              <Field label={t("profile.country")}><Input value={data.country} onChange={(event) => update("country", event.target.value)} className={fieldClass} /></Field>
+            </div>
+            <div className="border-t border-slate-100 pt-6"><SectionTitle number="–" icon={<Car />} title={t("fields.vehicleInsurance")} /></div>
+            <div className="grid gap-5 sm:grid-cols-2">
+              <Field label={t("fields.plate")}><Input value={data.plate} onChange={(event) => update("plate", event.target.value.toUpperCase())} placeholder={t("fields.platePlaceholder")} className={`${fieldClass} font-semibold uppercase`} /></Field>
+              <Field label={t("fields.vehicle")}><Input value={data.vehicle} onChange={(event) => update("vehicle", event.target.value)} placeholder={t("fields.vehiclePlaceholder")} className={fieldClass} /></Field>
+              <Field label={t("fields.insurer")}><Input value={data.insurer} onChange={(event) => update("insurer", event.target.value)} placeholder={t("fields.insurerPlaceholder")} className={fieldClass} /></Field>
+              <Field label={t("fields.policy")}><Input value={data.policy} onChange={(event) => update("policy", event.target.value)} placeholder={t("fields.policyPlaceholder")} className={fieldClass} /></Field>
+            </div>
+          </div>}
+
+          {step === 4 && <div className="space-y-6">
+            <div>
+              <Label className="mb-2 block text-sm font-semibold text-slate-700">{t("nature.partsLabel")}</Label>
+              <div className="grid gap-2 sm:grid-cols-2">
+                {NATURE_PART_KEYS.map((part) => { const selected = data.natureParts.includes(part); return (
+                  <label key={part} className={`flex min-h-12 cursor-pointer items-center gap-3 rounded-xl border-2 px-3 py-2.5 text-sm font-medium leading-snug ${selected ? "border-[#39719D] bg-[#EDF4F8] text-[#153B66]" : "border-slate-200 text-slate-600"}`}>
+                    <Checkbox checked={selected} onCheckedChange={() => update("natureParts", selected ? data.natureParts.filter((value) => value !== part) : [...data.natureParts, part])} className="h-5 w-5 rounded-md data-[state=checked]:border-[#153B66] data-[state=checked]:bg-[#153B66]" />
+                    {t(`nature.parts.${part}`)}
+                  </label>
+                ); })}
+              </div>
+            </div>
+            {data.natureEventType === "hail" && <div className="space-y-4 rounded-2xl border border-[#B8CDDC] bg-[#F4F8FB] p-4">
+              <p className="text-sm font-bold text-[#153B66]">{t("nature.hailDetails")}</p>
+              <div><p className="mb-2 text-sm font-semibold text-slate-700">{t("nature.hailDensity")}</p><div className="grid grid-cols-3 gap-2">{NATURE_HAIL_DENSITIES.map((density) => <Choice key={density} active={data.natureHailDensity === density} onClick={() => update("natureHailDensity", density)}>{t(`nature.hailDensities.${density}`)}</Choice>)}</div></div>
+              <div><p className="mb-2 text-sm font-semibold text-slate-700">{t("nature.hailSize")}</p><div className="grid grid-cols-3 gap-2">{NATURE_HAIL_SIZES.map((size) => <Choice key={size} active={data.natureHailSize === size} onClick={() => update("natureHailSize", size)}>{t(`nature.hailSizes.${size}`)}</Choice>)}</div></div>
+            </div>}
+            <Field label={t("fields.visibleDamage")}><Textarea value={data.damage} onChange={(event) => update("damage", event.target.value)} placeholder={t("fields.damagePlaceholder")} className="min-h-28 rounded-xl text-base" /></Field>
+          </div>}
+
+          {step === 5 && <div className="space-y-6">
+            <div className="rounded-xl bg-[#EDF4F8] p-4 text-sm leading-relaxed text-[#153B66]"><strong>{t("nature.photoTipTitle")}</strong> {t("nature.photoTip")}</div>
+            <Field label={t("fields.photos")}><button type="button" onClick={() => void takePhoto()} className="flex min-h-32 w-full cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed border-[#9FBACD] bg-[#F7FAFC] p-5 text-center"><Camera className="mb-2 h-8 w-8 text-[#39719D]" /><span className="font-semibold text-[#153B66]">{t("fields.photoAction")}</span><span className="mt-1 text-xs text-slate-500">{t("nature.photoHint")}</span></button><input ref={photoInputRef} type="file" accept="image/*" capture="environment" multiple className="sr-only" onChange={(event) => { addPhotos(event.target.files); event.target.value = ""; }} /></Field>
+            {data.photos.length > 0 && <div className="grid grid-cols-3 gap-3">{data.photos.map((photo, index) => <div key={photo.id} className="relative aspect-square overflow-hidden rounded-xl bg-slate-100"><img src={photo.url} alt={t("fields.photoAlt", { number: formatNumber(index + 1) })} className="h-full w-full object-cover" /><button type="button" onClick={() => void removePhoto(photo)} className="absolute right-1 top-1 flex h-8 w-8 items-center justify-center rounded-full bg-slate-900/75 text-white" aria-label={t("fields.deletePhoto")}><Trash2 className="h-4 w-4" /></button></div>)}</div>}
+          </div>}
+
+          {step === 6 && <div className="space-y-6">
+            <div className="grid gap-3 sm:grid-cols-2">
+              <Summary number="" icon={<TreePine />} label={t("nature.eventType")} value={data.natureEventType ? t(`nature.eventTypes.${data.natureEventType}`) : t("fields.notProvided")} />
+              <Summary number="" icon={<Clock3 />} label={t("nature.timePeriod")} value={naturePeriodSummary || t("fields.notProvided")} />
+              {data.natureDiscoveredOn && <Summary number="" icon={<Clock3 />} label={t("nature.discoveredOn")} value={data.natureDiscoveredOn} />}
+              <Summary number="" icon={<MapPin />} label={t("nature.parkingSpot")} value={data.natureParking || t("fields.notProvided")} />
+              <Summary number="" icon={<UserRound />} label={t("fields.driver")} value={data.driverName || t("fields.notProvided")} />
+              <Summary number="" icon={<Car />} label={t("fields.vehicle")} value={`${data.plate || t("fields.noPlate")}${data.vehicle ? ` · ${data.vehicle}` : ""}`} />
+              <Summary number="" icon={<ShieldCheck />} label={t("fields.insurer")} value={data.insurer || t("fields.notProvided")} />
+              <Summary number="" icon={<Camera />} label={t("fields.photos")} value={t("fields.photosCount", { formattedCount: formatNumber(data.photos.length) })} />
+            </div>
+            <div className="rounded-2xl border border-slate-200 p-4">
+              <p className="mb-2 text-xs font-bold uppercase tracking-wider text-slate-500">{t("nature.affectedParts")}</p>
+              {data.natureParts.length ? <div className="flex flex-wrap gap-2">{data.natureParts.map((part) => <span key={part} className="rounded-full bg-[#EDF4F8] px-3 py-1 text-xs font-semibold text-[#153B66]">{t(`nature.parts.${part}`)}</span>)}</div> : <p className="text-sm text-slate-500">{t("summary.noneSelected")}</p>}
+              {data.natureEventType === "hail" && (data.natureHailDensity || data.natureHailSize) && (
+                <p className="mt-3 text-sm text-slate-700">{[data.natureHailDensity ? t(`nature.hailDensities.${data.natureHailDensity}`) : "", data.natureHailSize ? t(`nature.hailSizes.${data.natureHailSize}`) : ""].filter(Boolean).join(" · ")}</p>
+              )}
+            </div>
+            {!alreadySigned && (
+              <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-slate-200 bg-slate-50 p-4">
+                <Checkbox checked={saveToProfile} onCheckedChange={(checked) => setSaveToProfile(checked === true)} className="mt-0.5" />
+                <span className="text-sm leading-relaxed text-slate-700">{t("profile.saveForFuture")}</span>
+              </label>
+            )}
+            <SignatureStatusLine ownSigned={alreadySigned} />
+            {alreadySigned
+              ? <div className="rounded-2xl border-2 border-emerald-300 bg-emerald-50 p-5 text-center">
+                  <CheckCircle2 className="mx-auto h-10 w-10 text-emerald-600" />
+                  <p className="mt-2 font-bold text-emerald-900">{t("signature.alreadySigned")}</p>
+                  <Button variant="outline" onClick={() => setWithdrawOpen(true)} className="mt-3 rounded-xl border-emerald-300 text-emerald-800"><RotateCcw className="mr-2 h-4 w-4" />{t("signature.withdraw")}</Button>
+                </div>
+              : !ownRequiredFieldsComplete
+                ? <div className="rounded-2xl border-2 border-dashed border-amber-300 bg-amber-50 p-5"><p className="text-sm font-semibold text-amber-900">{t("signature.missingFieldsTitle")}</p><div className="mt-3 flex flex-wrap gap-2">{missingRequiredFields.map((field) => <button key={field.key} onClick={() => setStep(field.step)} className="rounded-lg bg-amber-100 px-3 py-1.5 text-xs font-semibold text-amber-900 transition hover:bg-amber-200">{t(field.key)}</button>)}</div></div>
+                : <DrawingCanvas label={t("fields.signature")} height={170} confirmable onChange={(value, dataUrl) => { update("hasSignature", value); update("signatureDataUrl", dataUrl ?? ""); }} />}
+            {draftRef && !draftRef.incidentId.startsWith("local:") && <SubmissionPanel incidentId={draftRef.incidentId} ownSigned={alreadySigned} unilateral={false} counterpartLabel="" email={user?.email ?? null} />}
+            <p className="text-xs leading-relaxed text-slate-500">{t("summary.disclaimer")}</p>
+          </div>}
+
+          </>)}
 
         </div>
       </>}</main>
       <div className="fixed inset-x-0 bottom-0 z-20 border-t border-slate-200 bg-white/95 px-5 py-4 backdrop-blur"><div className="mx-auto flex max-w-3xl gap-3">
-        {step < 5
+        {step < signatureStep
           ? <><Button variant="outline" onClick={back} disabled={saving} className="h-14 w-14 shrink-0 rounded-2xl border-slate-300" aria-label={t("app.back")}><ArrowLeft className="h-5 w-5" /></Button><Button onClick={() => void next()} disabled={saving} className="h-14 flex-1 rounded-2xl bg-[#153B66] text-base font-semibold hover:bg-[#102F52]">{saving ? t("incident.saving") : t("wizard.next", { step: steps[step + 1] })}<ArrowRight className="ml-2 h-5 w-5" /></Button></>
           : alreadySigned
             ? <Button onClick={() => setView("home")} className="h-14 flex-1 rounded-2xl bg-[#153B66] text-base font-semibold"><ArrowLeft className="mr-2 h-5 w-5" />{t("summary.toOverview")}</Button>

@@ -54,7 +54,7 @@ serve(async (req) => {
     }
 
     const [{ data: incident, error: incidentError }, { data: ownParty, error: partyError }] = await Promise.all([
-      service.from("incidents").select("id, share_code, status, version").eq("id", incidentId).single(),
+      service.from("incidents").select("id, share_code, status, version, report_type").eq("id", incidentId).single(),
       service.from("incident_parties").select("id, signed_at").eq("incident_id", incidentId).eq("profile_id", authData.user.id).maybeSingle(),
     ]);
     if (incidentError || partyError || !incident) {
@@ -62,6 +62,11 @@ serve(async (req) => {
       return fail(req, "not_found", 404, locale);
     }
     if (!ownParty) return fail(req, "forbidden", 403, locale);
+
+    const isNature = incident.report_type === "nature";
+    const subjectLabel = isNature ? "Schadenmeldung" : "Europäisches Unfallprotokoll";
+    const fileBase = isNature ? `Schadenmeldung-${incident.share_code}` : `Unfallprotokoll-${incident.share_code}`;
+    const htmlDoc = isNature ? "die abgeschlossene Schadenmeldung" : "das abgeschlossene Europäische Unfallprotokoll";
 
     // NEW RULE: Only my own signature is required. No counterpart check.
     if (!ownParty.signed_at) {
@@ -105,7 +110,7 @@ serve(async (req) => {
 
     // Already submitted — return the existing result
     if (submission.status === "submitted") {
-      const { data: signed } = await service.storage.from("incident-pdfs").createSignedUrl(submission.pdf_storage_path, 3600, { download: `Unfallprotokoll-${incident.share_code}.pdf` });
+      const { data: signed } = await service.storage.from("incident-pdfs").createSignedUrl(submission.pdf_storage_path, 3600, { download: `${fileBase}.pdf` });
       return json(req, { submissionId: submission.id, status: "submitted", downloadUrl: signed?.signedUrl });
     }
 
@@ -120,9 +125,9 @@ serve(async (req) => {
     try {
       email = await sendEmail({
         to: targetEmail,
-        subject: `Europäisches Unfallprotokoll ${incident.share_code}`,
-        html: `<p>Guten Tag</p><p>Im Anhang erhalten Sie das abgeschlossene Europäische Unfallprotokoll zum Fall <strong>${incident.share_code}</strong>.</p><p>Freundliche Grüsse<br>Unfallprotokoll</p>`,
-        attachments: [{ filename: `Unfallprotokoll-${incident.share_code}.pdf`, content: toBase64(pdfBytes) }],
+        subject: `${subjectLabel} ${incident.share_code}`,
+        html: `<p>Guten Tag</p><p>Im Anhang erhalten Sie ${htmlDoc} zum Fall <strong>${incident.share_code}</strong>.</p><p>Freundliche Grüsse<br>Unfallprotokoll</p>`,
+        attachments: [{ filename: `${fileBase}.pdf`, content: toBase64(pdfBytes) }],
       });
     } catch (emailError) {
       const message = emailError instanceof Error ? emailError.message : String(emailError);
@@ -151,7 +156,7 @@ serve(async (req) => {
     if (incidentUpdateError) {
       console.error("[submit-incident] Failed to update incident status", { error: incidentUpdateError.message });
     }
-    const { data: signed, error: signError } = await service.storage.from("incident-pdfs").createSignedUrl(submission.pdf_storage_path, 3600, { download: `Unfallprotokoll-${incident.share_code}.pdf` });
+    const { data: signed, error: signError } = await service.storage.from("incident-pdfs").createSignedUrl(submission.pdf_storage_path, 3600, { download: `${fileBase}.pdf` });
     if (signError) {
       console.error("[submit-incident] Failed to create signed URL", { error: signError.message });
       throw signError;
