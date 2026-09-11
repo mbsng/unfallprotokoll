@@ -87,6 +87,100 @@ const NATURE_PART_LABELS: Record<string, string> = {
 const NATURE_HAIL_DENSITY_LABELS: Record<string, string> = { few: "wenige", moderate: "mittel", many: "viele" };
 const NATURE_HAIL_SIZE_LABELS: Record<string, string> = { small: "klein", medium: "mittel", large: "gross" };
 
+// --- Document furniture (logo + provenance footer) -------------------------
+// There is no upsala.ch image asset available to the edge function, so the
+// mark is a cleanly set wordmark in the app's primary colour. A PNG/SVG can
+// be supplied later and embedded here as base64 bytes.
+const UPSALA_WORDMARK = "upsala.ch";
+const UPSALA_PRIMARY = rgb(0.08, 0.23, 0.4); // app primary #153B66
+const UPSALA_ON_DARK = rgb(0.78, 0.86, 0.95);
+
+const LEGAL_NOTE_REPORT = "Dieses Protokoll wurde digital erstellt. Die Unterschrift stellt kein Schuldanerkenntnis dar.";
+const LEGAL_NOTE_NATURE = "Diese Schadenmeldung wurde digital erstellt. Die Unterschrift stellt kein Schuldanerkenntnis dar.";
+
+const MAX_LOGO_BYTES = 2_000_000;
+
+// Organization logos are admin-controlled URLs; they are fetched server-side
+// once and embedded as bytes into the PDF (the PDF never references a URL).
+async function fetchLogoBytes(url: string): Promise<{ bytes: Uint8Array; contentType?: string } | null> {
+  try {
+    if (!/^https:\/\//i.test(url)) return null;
+    const response = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    if (!response.ok) return null;
+    const contentType = response.headers.get("content-type") ?? "";
+    if (contentType && !contentType.startsWith("image/")) return null;
+    const buffer = await response.arrayBuffer();
+    if (buffer.byteLength === 0 || buffer.byteLength > MAX_LOGO_BYTES) return null;
+    return { bytes: new Uint8Array(buffer), contentType: contentType || undefined };
+  } catch (error) {
+    console.warn("[generate-pdf] Organization logo could not be loaded", { error: error instanceof Error ? error.message : String(error) });
+    return null;
+  }
+}
+
+interface DocumentBranding {
+  orgLogo: PDFImage | null;
+  orgName: string | null;
+}
+
+// Small mark next to the document title. It must never replace the title or
+// overlay form fields — it is brand provenance, not a form element.
+function drawHeaderMark(page: PDFPage, bold: PDFFont, title: string, branding: DocumentBranding) {
+  const titleWidth = bold.widthOfTextAtSize(clean(title), 13);
+  const x = MARGIN + titleWidth + 10;
+  if (branding.orgLogo) {
+    const height = 14;
+    const width = Math.min(branding.orgLogo.width * (height / branding.orgLogo.height), 60);
+    page.drawImage(branding.orgLogo, { x, y: PH - 22, width, height });
+    return;
+  }
+  page.drawText(UPSALA_WORDMARK, { x, y: PH - 19, size: 8, font: bold, color: UPSALA_ON_DARK });
+}
+
+// Slim provenance footer on EVERY page, clearly separated from the form body:
+// left logo/wordmark, centered provenance, right case meta + page numbers,
+// plus a small legal line. Muted colour, ~7pt, so it never competes with the
+// standardised form.
+function drawProvenanceFooters(
+  pdf: PDFDocument,
+  style: { regular: PDFFont; bold: PDFFont; shareCode: string; createdLabel: string; descriptor: string; legalNote: string },
+  branding: DocumentBranding,
+) {
+  const pages = pdf.getPages();
+  const muted = rgb(0.42, 0.47, 0.52);
+  const hairline = rgb(0.83, 0.87, 0.91);
+  pages.forEach((page, index) => {
+    page.drawLine({ start: { x: MARGIN, y: 27 }, end: { x: PW - MARGIN, y: 27 }, thickness: 0.5, color: hairline });
+
+    const baseLine = 15;
+    let left = MARGIN;
+    if (branding.orgLogo) {
+      const height = 15;
+      const width = Math.min(branding.orgLogo.width * (height / branding.orgLogo.height), 90);
+      page.drawImage(branding.orgLogo, { x: left, y: baseLine - 4.5, width, height });
+      left += width + 5;
+      if (branding.orgName) {
+        const name = clean(branding.orgName);
+        page.drawText(name, { x: left, y: baseLine, size: 6.5, font: style.regular, color: muted });
+        left += style.regular.widthOfTextAtSize(name, 6.5) + 5;
+      }
+    } else {
+      page.drawText(UPSALA_WORDMARK, { x: left, y: baseLine, size: 9, font: style.bold, color: UPSALA_PRIMARY });
+      left += style.bold.widthOfTextAtSize(UPSALA_WORDMARK, 9) + 5;
+    }
+
+    // White-labelled documents keep upsala.ch as a smaller tool reference only.
+    const centerSize = branding.orgLogo ? 6 : 7;
+    const centerText = branding.orgLogo ? "Erstellt mit upsala.ch" : `Erstellt mit upsala.ch · ${style.descriptor}`;
+    page.drawText(centerText, { x: PW / 2 - style.regular.widthOfTextAtSize(centerText, centerSize) / 2, y: baseLine, size: centerSize, font: style.regular, color: muted });
+
+    const rightText = `Fall ${clean(style.shareCode)} · ${style.createdLabel} · Seite ${index + 1} von ${pages.length}`;
+    page.drawText(rightText, { x: PW - MARGIN - style.regular.widthOfTextAtSize(rightText, 6.5), y: baseLine, size: 6.5, font: style.regular, color: muted });
+
+    page.drawText(style.legalNote, { x: PW / 2 - style.regular.widthOfTextAtSize(style.legalNote, 5.5) / 2, y: 5, size: 5.5, font: style.regular, color: muted });
+  });
+}
+
 serve(async (req) => {
   if (req.method === "OPTIONS") return corsPreflightResponse(req);
   let locale = normalizeLocale(req.headers.get("accept-language"));
@@ -138,6 +232,20 @@ serve(async (req) => {
     const unsignedParties = realParties.filter((p) => !p.signed_at);
     const completeness = unsignedParties.length === 0 ? "vollstaendig" : "einseitig";
 
+    // White-label branding: if the requesting user belongs to an organization
+    // with its own logo, that logo leads and upsala.ch appears only as the
+    // creating tool — never as a party of the accident or an insurer.
+    const { data: requesterProfile } = await service.from("profiles").select("org_id").eq("id", authData.user.id).maybeSingle();
+    let orgLogoBytes: { bytes: Uint8Array; contentType?: string } | null = null;
+    let orgName: string | null = null;
+    if (requesterProfile?.org_id) {
+      const { data: organization } = await service.from("organizations").select("name, branding_json").eq("id", requesterProfile.org_id).maybeSingle();
+      const logoUrl = typeof organization?.branding_json?.logo_url === "string" ? organization.branding_json.logo_url.trim() : "";
+      orgName = organization?.name ?? null;
+      orgLogoBytes = logoUrl ? await fetchLogoBytes(logoUrl) : null;
+    }
+    const createdLabel = new Date().toLocaleDateString("de-CH");
+
     const downloaded = new Map<string, { bytes: Uint8Array; contentType?: string }>();
     for (const item of media ?? []) {
       const { data, error } = await service.storage.from("incident-media").download(item.storage_path);
@@ -164,12 +272,17 @@ serve(async (req) => {
       pdf.setCreationDate(new Date());
       const regular = await pdf.embedFont(StandardFonts.Helvetica);
       const bold = await pdf.embedFont(StandardFonts.HelveticaBold);
+      const branding: DocumentBranding = {
+        orgLogo: orgLogoBytes ? await embedImage(pdf, orgLogoBytes.bytes, orgLogoBytes.contentType) : null,
+        orgName,
+      };
       const page = pdf.addPage([PW, PH]);
       const navy = rgb(0.08, 0.23, 0.4);
       const blueA = rgb(0.05, 0.27, 0.49);
 
       page.drawRectangle({ x: 0, y: PH - 30, width: PW, height: 30, color: navy });
       page.drawText("SCHADENMELDUNG", { x: MARGIN, y: PH - 20, size: 13, font: bold, color: rgb(1, 1, 1) });
+      drawHeaderMark(page, bold, "SCHADENMELDUNG", branding);
       page.drawText(`Fall ${clean(incident.share_code)}`, { x: PW - 110, y: PH - 14, size: 6, font: regular, color: rgb(0.85, 0.9, 1) });
 
       let y = PH - 34;
@@ -240,8 +353,6 @@ serve(async (req) => {
       }
       page.drawText(`Signiert: ${submissionParty.signed_at ? new Date(submissionParty.signed_at).toLocaleString("de-CH") : ""}`, { x: MARGIN + 4, y: y - sigH + 4, size: 4, font: regular, color: rgb(0.35, 0.4, 0.45) });
 
-      page.drawText(`Fall ${clean(incident.share_code)} - Erstellt ${new Date().toLocaleDateString("de-CH")} - Unterschrift kein Schuldanerkenntnis.`, { x: MARGIN, y: 4, size: 4, font: regular, color: rgb(0.4, 0.45, 0.5) });
-
       const photos = (media ?? []).filter((item: { kind: string }) => item.kind === "photo");
       for (let index = 0; index < photos.length; index += 4) {
         const pPage = pdf.addPage([PW, PH]);
@@ -262,6 +373,8 @@ serve(async (req) => {
           pPage.drawText(`Foto ${index + slot + 1}`, { x: px + 6, y: py + 8, size: 5.5, font: regular, color: rgb(0.3, 0.35, 0.4) });
         }
       }
+
+      drawProvenanceFooters(pdf, { regular, bold, shareCode: incident.share_code, createdLabel, descriptor: "Digitale Schadenmeldung", legalNote: LEGAL_NOTE_NATURE }, branding);
 
       const pdfBytes = await pdf.save();
       const storagePath = `${incidentId}/schadenmeldung-${incident.share_code}.pdf`;
@@ -292,6 +405,10 @@ serve(async (req) => {
     pdf.setCreationDate(new Date());
     const regular = await pdf.embedFont(StandardFonts.Helvetica);
     const bold = await pdf.embedFont(StandardFonts.HelveticaBold);
+    const branding: DocumentBranding = {
+      orgLogo: orgLogoBytes ? await embedImage(pdf, orgLogoBytes.bytes, orgLogoBytes.contentType) : null,
+      orgName,
+    };
     const page = pdf.addPage([PW, PH]);
     const navy = rgb(0.08, 0.23, 0.4);
     const blueA = rgb(0.05, 0.27, 0.49);
@@ -301,6 +418,7 @@ serve(async (req) => {
 
     page.drawRectangle({ x: 0, y: PH - 30, width: PW, height: 30, color: navy });
     page.drawText("VERKEHRSUNFALL-BERICHT", { x: MARGIN, y: PH - 20, size: 13, font: bold, color: rgb(1, 1, 1) });
+    drawHeaderMark(page, bold, "VERKEHRSUNFALL-BERICHT", branding);
     // Unilateral notice banner
     if (completeness === "einseitig") {
       const unsignedLabels = unsignedParties.map((p) => p.party_label).join(", ");
@@ -463,8 +581,6 @@ serve(async (req) => {
     await drawSig(partyA, MARGIN);
     await drawSig(partyB, MARGIN + sigW + 4);
 
-    page.drawText(`Fall ${clean(incident.share_code)} - Erstellt ${new Date().toLocaleDateString("de-CH")} - Unterschrift kein Schuldanerkenntnis.`, { x: MARGIN, y: 4, size: 4, font: regular, color: rgb(0.4, 0.45, 0.5) });
-
     const photos = (media ?? []).filter((item) => item.kind === "photo");
     for (let index = 0; index < photos.length; index += 4) {
       const pPage = pdf.addPage([PW, PH]);
@@ -486,6 +602,8 @@ serve(async (req) => {
         pPage.drawText(`Foto ${index + slot + 1} - Partei ${clean(ownerParty?.party_label)}`, { x: px + 6, y: py + 8, size: 5.5, font: regular, color: rgb(0.3, 0.35, 0.4) });
       }
     }
+
+    drawProvenanceFooters(pdf, { regular, bold, shareCode: incident.share_code, createdLabel, descriptor: "Digitales Unfallprotokoll", legalNote: LEGAL_NOTE_REPORT }, branding);
 
     const pdfBytes = await pdf.save();
     const storagePath = `${incidentId}/unfallprotokoll-${incident.share_code}-${completeness}.pdf`;
