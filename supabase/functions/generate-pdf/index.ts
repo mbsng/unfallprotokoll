@@ -2,6 +2,7 @@ import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
 import { PDFDocument, StandardFonts, rgb, type PDFImage, type PDFPage, type PDFFont } from "https://esm.sh/pdf-lib@1.17.1";
 import { incidentBelongsToOrg } from "../_shared/incident-export.ts";
+import { UPSALA_LOGO_PNG_BASE64 } from "../_shared/upsala-logo.ts";
 import { corsHeaders, corsPreflightResponse } from "../_shared/cors.ts";
 import { errorBody, normalizeLocale, type AppLocale } from "../_shared/error-response.ts";
 
@@ -88,12 +89,19 @@ const NATURE_HAIL_DENSITY_LABELS: Record<string, string> = { few: "wenige", mode
 const NATURE_HAIL_SIZE_LABELS: Record<string, string> = { small: "klein", medium: "mittel", large: "gross" };
 
 // --- Document furniture (logo + provenance footer) -------------------------
-// There is no upsala.ch image asset available to the edge function, so the
-// mark is a cleanly set wordmark in the app's primary colour. A PNG/SVG can
-// be supplied later and embedded here as base64 bytes.
+// The upsala.ch logo is embedded as a base64 constant (shared module) so the
+// PDF contains the image bytes directly and never references a URL.
 const UPSALA_WORDMARK = "upsala.ch";
 const UPSALA_PRIMARY = rgb(0.08, 0.23, 0.4); // app primary #153B66
 const UPSALA_ON_DARK = rgb(0.78, 0.86, 0.95);
+
+let upsalaLogoCache: Uint8Array | null = null;
+function upsalaLogoBytes(): Uint8Array {
+  if (!upsalaLogoCache) {
+    upsalaLogoCache = Uint8Array.from(atob(UPSALA_LOGO_PNG_BASE64.replace(/\s+/g, "")), (char) => char.charCodeAt(0));
+  }
+  return upsalaLogoCache;
+}
 
 const LEGAL_NOTE_REPORT = "Dieses Protokoll wurde digital erstellt. Die Unterschrift stellt kein Schuldanerkenntnis dar.";
 const LEGAL_NOTE_NATURE = "Diese Schadenmeldung wurde digital erstellt. Die Unterschrift stellt kein Schuldanerkenntnis dar.";
@@ -121,6 +129,7 @@ async function fetchLogoBytes(url: string): Promise<{ bytes: Uint8Array; content
 interface DocumentBranding {
   orgLogo: PDFImage | null;
   orgName: string | null;
+  upsalaLogo: PDFImage | null;
 }
 
 // Small mark next to the document title. It must never replace the title or
@@ -128,10 +137,11 @@ interface DocumentBranding {
 function drawHeaderMark(page: PDFPage, bold: PDFFont, title: string, branding: DocumentBranding) {
   const titleWidth = bold.widthOfTextAtSize(clean(title), 13);
   const x = MARGIN + titleWidth + 10;
-  if (branding.orgLogo) {
+  const logo = branding.orgLogo ?? branding.upsalaLogo;
+  if (logo) {
     const height = 14;
-    const width = Math.min(branding.orgLogo.width * (height / branding.orgLogo.height), 60);
-    page.drawImage(branding.orgLogo, { x, y: PH - 22, width, height });
+    const width = Math.min(logo.width * (height / logo.height), 60);
+    page.drawImage(logo, { x, y: PH - 22, width, height });
     return;
   }
   page.drawText(UPSALA_WORDMARK, { x, y: PH - 19, size: 8, font: bold, color: UPSALA_ON_DARK });
@@ -165,6 +175,12 @@ function drawProvenanceFooters(
         left += style.regular.widthOfTextAtSize(name, 6.5) + 5;
       }
     } else {
+      if (branding.upsalaLogo) {
+        const height = 16; // ~6 mm
+        const width = Math.min(branding.upsalaLogo.width * (height / branding.upsalaLogo.height), 70);
+        page.drawImage(branding.upsalaLogo, { x: left, y: baseLine - 5, width, height });
+        left += width + 4;
+      }
       page.drawText(UPSALA_WORDMARK, { x: left, y: baseLine, size: 9, font: style.bold, color: UPSALA_PRIMARY });
       left += style.bold.widthOfTextAtSize(UPSALA_WORDMARK, 9) + 5;
     }
@@ -274,6 +290,7 @@ serve(async (req) => {
       const bold = await pdf.embedFont(StandardFonts.HelveticaBold);
       const branding: DocumentBranding = {
         orgLogo: orgLogoBytes ? await embedImage(pdf, orgLogoBytes.bytes, orgLogoBytes.contentType) : null,
+        upsalaLogo: await embedImage(pdf, upsalaLogoBytes(), "image/png"),
         orgName,
       };
       const page = pdf.addPage([PW, PH]);
@@ -407,6 +424,7 @@ serve(async (req) => {
     const bold = await pdf.embedFont(StandardFonts.HelveticaBold);
     const branding: DocumentBranding = {
       orgLogo: orgLogoBytes ? await embedImage(pdf, orgLogoBytes.bytes, orgLogoBytes.contentType) : null,
+      upsalaLogo: await embedImage(pdf, upsalaLogoBytes(), "image/png"),
       orgName,
     };
     const page = pdf.addPage([PW, PH]);
