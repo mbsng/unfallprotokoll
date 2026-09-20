@@ -3,7 +3,7 @@ import { useLiveQuery } from "dexie-react-hooks";
 import { useTranslation } from "react-i18next";
 
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import { AlertTriangle, ArrowLeft, ArrowRight, Camera, Car, Check, CheckCircle2, ChevronRight, Clock3, CloudHail, Download, FileText, LocateFixed, Mail, MapPin, Plus, QrCode, Radio, RefreshCw, RotateCcw, Send, ShieldCheck, TrafficCone, TreePine, Trash2, UserRound } from "lucide-react";
+import { AlertTriangle, ArrowLeft, ArrowRight, Camera, Car, Check, CheckCircle2, ChevronRight, Clock3, CloudHail, Download, FileText, Image as ImageIcon, LocateFixed, Mail, MapPin, Plus, QrCode, Radio, RefreshCw, RotateCcw, Send, ShieldCheck, TrafficCone, TreePine, Trash2, Upload, UserRound } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -25,6 +25,7 @@ import { getPlanEntitlement } from "@/lib/billing";
 import { computeCaseStatus, loadIncidentSummary, loadUserIncidents, subscribeToIncident, subscribeToUserIncidents } from "@/lib/incidents";
 import { createLocalDraft, db, deleteLocalDraft, deleteLocalPhoto, getLatestDraft, markDraftComplete, saveDraftField, saveLocalPhoto, type LocalDraft } from "@/lib/local-db";
 import { captureAccidentPhoto, getCurrentCoordinates, isNativeApp } from "@/lib/native-device";
+import { resizeImageFile } from "@/lib/image-resize";
 import { accidentToMasterData, loadLocalProfileMasterData, saveLocalProfileMasterData, saveProfileMasterData } from "@/lib/profile-data";
 import { processOutbox } from "@/lib/sync-worker";
 import { generateIncidentPdf, signIncident, SubmissionError, submitIncident } from "@/lib/submissions";
@@ -188,6 +189,7 @@ export default function Index() {
   const [withdrawOpen, setWithdrawOpen] = useState(false);
   const [sketchMode, setSketchMode] = useState<"builder" | "freehand">("builder");
   const photoInputRef = useRef<HTMLInputElement>(null);
+  const galleryInputRef = useRef<HTMLInputElement>(null);
 
   // The final (signature/submit) step index depends on the report type's
   // step list: collision/single_vehicle keep their six steps, nature uses seven.
@@ -397,6 +399,26 @@ export default function Index() {
       setEnsuringServerCase(false);
     }
   };
+
+  useEffect(() => {
+    // Failed photo uploads surface with their real error text and a retry
+    // action — no silent background failure. Throttled against toast spam
+    // while the outbox retries with backoff.
+    let lastToastAt = 0;
+    const onPhotoSyncFailed = (event: Event) => {
+      const message = (event as CustomEvent<{ message: string }>).detail?.message ?? "unknown";
+      const now = Date.now();
+      if (now - lastToastAt < 10_000) return;
+      lastToastAt = now;
+      toast.error(`${t("photos.uploadError")}: ${message}`, {
+        duration: 10_000,
+        action: { label: t("sync.retryNow"), onClick: () => void retrySync() },
+      });
+    };
+    window.addEventListener("photo-sync-failed", onPhotoSyncFailed);
+    return () => window.removeEventListener("photo-sync-failed", onPhotoSyncFailed);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const saveSketch = async (dataUrl: string) => {
     if (!draftRef || draftRef.incidentId.startsWith("local:") || !user) {
@@ -661,18 +683,34 @@ export default function Index() {
     }
   };
 
-  const addPhotos = (files: FileList | null) => {
-    if (!files || !user || !localDraftId) return;
-    for (const file of Array.from(files)) void saveLocalPhoto(user.id, localDraftId, file);
-  };
-
-  const takePhoto = async () => {
-    if (!isNativeApp()) { photoInputRef.current?.click(); return; }
+  const persistPhoto = async (file: File) => {
     if (!user || !localDraftId) return;
     try {
+      // Shrink before saving/uploading: max 1600px edge, JPEG ~0.8 — HEIC
+      // originals could never be embedded into the PDF anyway.
+      const optimized = await resizeImageFile(file);
+      await saveLocalPhoto(user.id, localDraftId, optimized);
+    } catch (error) {
+      toast.error(`${t("photos.saveError")}${error instanceof Error ? `: ${error.message}` : ""}`);
+    }
+  };
+
+  const addPhotos = (files: FileList | null) => {
+    if (!files || !user || !localDraftId) return;
+    for (const file of Array.from(files)) void persistPhoto(file);
+  };
+
+  // Camera: on native apps the Capacitor camera plugin runs; on the web the
+  // dedicated capture-input (capture="environment", NO multiple) opens the
+  // rear camera directly — iOS ignores capture on multi-select inputs.
+  const takePhoto = async () => {
+    if (!isNativeApp()) { photoInputRef.current?.click(); return; }
+    try {
       const file = await captureAccidentPhoto();
-      if (file) await saveLocalPhoto(user.id, localDraftId, file);
-    } catch { toast.error(t("incident.saveError")); }
+      if (file) await persistPhoto(file);
+    } catch (error) {
+      toast.error(`${t("photos.saveError")}${error instanceof Error ? `: ${error.message}` : ""}`);
+    }
   };
 
   const removePhoto = async (photo: PendingPhoto) => {
@@ -935,6 +973,10 @@ export default function Index() {
       <div className="mb-7"><div className="mb-2 flex flex-wrap items-center gap-2"><p className="text-sm font-semibold text-[#39719D]">{formatNumber(step + 1).padStart(2, "0")} — {steps[step]}</p>{draftRef && <span className="rounded-full bg-[#E7F0F6] px-2.5 py-1 font-mono text-xs font-bold tracking-wider text-[#153B66]">{t("incident.shareCode")}: {draftRef.shareCode}</span>}</div><h1 className="text-2xl font-bold tracking-tight text-[#102F52]">{titles[step]}</h1><p className="mt-2 text-sm leading-relaxed text-slate-500">{descriptions[step]}</p></div>
 
         {(!user || isAnonymous) && <div className="mb-5 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-amber-950"><div className="flex gap-3"><AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-700" /><div><p className="font-semibold">{t("guest.notice")}</p><p className="mt-1 text-sm leading-relaxed text-amber-800">{t("guest.detail")}</p><Button asChild variant="link" className="mt-1 h-auto p-0 font-semibold text-amber-900"><Link to="/auth">{t("guest.createAccount")}</Link></Button></div></div></div>}
+        {/* Two dedicated hidden inputs: capture WITHOUT multiple opens the iOS
+            camera directly; multiple WITHOUT capture opens the gallery picker. */}
+        <input ref={photoInputRef} type="file" accept="image/*" capture="environment" className="sr-only" onChange={(event) => { addPhotos(event.target.files); event.target.value = ""; }} />
+        <input ref={galleryInputRef} type="file" accept="image/*" multiple className="sr-only" onChange={(event) => { addPhotos(event.target.files); event.target.value = ""; }} />
         <div className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm md:p-7">
 
           {/* Collision & single-vehicle: the established six-step European accident report flow, unchanged */}
@@ -967,7 +1009,7 @@ export default function Index() {
             </div>
           </div>}
           {step === 2 && <div className="space-y-3"><FieldBadge number="12" />{circumstances.map((circumstance, index) => { const selected = data.situations.includes(index); return <label key={index} className={`flex min-h-16 cursor-pointer items-center gap-4 rounded-2xl border-2 p-4 ${selected ? "border-[#39719D] bg-[#EDF4F8]" : "border-slate-200"}`}><Checkbox checked={selected} onCheckedChange={() => update("situations", selected ? data.situations.filter((value) => value !== index) : [...data.situations, index])} className="h-6 w-6 rounded-md data-[state=checked]:border-[#153B66] data-[state=checked]:bg-[#153B66]" /><span className="flex-1 text-sm font-medium leading-snug text-slate-700"><span className="mr-2 text-xs font-bold text-[#39719D]">{formatNumber(index + 1)}.</span>{circumstance}</span></label>; })}<p className="pt-3 text-center text-sm font-medium text-slate-500">{t("circumstances.selected", { count: data.situations.length, formattedCount: formatNumber(data.situations.length) })}</p></div>}
-          {step === 3 && <div className="space-y-6"><Field number="11" label={t("fields.visibleDamage")}><Textarea value={data.damage} onChange={(event) => update("damage", event.target.value)} placeholder={t("fields.damagePlaceholder")} className="min-h-28 rounded-xl text-base" /></Field><Field number="14" label={t("fields.remarks")}><Textarea value={data.notes} onChange={(event) => update("notes", event.target.value)} placeholder={t("fields.remarksPlaceholder")} className="min-h-24 rounded-xl text-base" /></Field><Field number="11" label={t("fields.photos")}><button type="button" onClick={() => void takePhoto()} className="flex min-h-32 w-full cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed border-[#9FBACD] bg-[#F7FAFC] p-5 text-center"><Camera className="mb-2 h-8 w-8 text-[#39719D]" /><span className="font-semibold text-[#153B66]">{t("fields.photoAction")}</span><span className="mt-1 text-xs text-slate-500">{t("fields.photoHint")}</span></button><input ref={photoInputRef} type="file" accept="image/*" capture="environment" multiple className="sr-only" onChange={(event) => { addPhotos(event.target.files); event.target.value = ""; }} /></Field>{data.photos.length > 0 && <div className="grid grid-cols-3 gap-3">{data.photos.map((photo, index) => <div key={photo.id} className="relative aspect-square overflow-hidden rounded-xl bg-slate-100"><img src={photo.url} alt={t("fields.photoAlt", { number: formatNumber(index + 1) })} className="h-full w-full object-cover" /><button type="button" onClick={() => void removePhoto(photo)} className="absolute right-1 top-1 flex h-8 w-8 items-center justify-center rounded-full bg-slate-900/75 text-white" aria-label={t("fields.deletePhoto")}><Trash2 className="h-4 w-4" /></button></div>)}</div>}</div>}
+          {step === 3 && <div className="space-y-6"><Field number="11" label={t("fields.visibleDamage")}><Textarea value={data.damage} onChange={(event) => update("damage", event.target.value)} placeholder={t("fields.damagePlaceholder")} className="min-h-28 rounded-xl text-base" /></Field><Field number="14" label={t("fields.remarks")}><Textarea value={data.notes} onChange={(event) => update("notes", event.target.value)} placeholder={t("fields.remarksPlaceholder")} className="min-h-24 rounded-xl text-base" /></Field><Field number="11" label={t("fields.photos")}><PhotoActions onTakePhoto={() => void takePhoto()} onPickFromGallery={() => galleryInputRef.current?.click()} hint={t("fields.photoHint")} /><PhotoGrid photos={data.photos} onRemove={(photo) => void removePhoto(photo)} /></Field></div>}
 
           {step === 4 && <div className="space-y-5">
             <div><FieldBadge number="10" /><p className="text-sm font-semibold text-slate-700">{t("fields.initialImpact")}</p></div>
@@ -1104,8 +1146,7 @@ export default function Index() {
 
           {step === 5 && <div className="space-y-6">
             <div className="rounded-xl bg-[#EDF4F8] p-4 text-sm leading-relaxed text-[#153B66]"><strong>{t("nature.photoTipTitle")}</strong> {t("nature.photoTip")}</div>
-            <Field label={t("fields.photos")}><button type="button" onClick={() => void takePhoto()} className="flex min-h-32 w-full cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed border-[#9FBACD] bg-[#F7FAFC] p-5 text-center"><Camera className="mb-2 h-8 w-8 text-[#39719D]" /><span className="font-semibold text-[#153B66]">{t("fields.photoAction")}</span><span className="mt-1 text-xs text-slate-500">{t("nature.photoHint")}</span></button><input ref={photoInputRef} type="file" accept="image/*" capture="environment" multiple className="sr-only" onChange={(event) => { addPhotos(event.target.files); event.target.value = ""; }} /></Field>
-            {data.photos.length > 0 && <div className="grid grid-cols-3 gap-3">{data.photos.map((photo, index) => <div key={photo.id} className="relative aspect-square overflow-hidden rounded-xl bg-slate-100"><img src={photo.url} alt={t("fields.photoAlt", { number: formatNumber(index + 1) })} className="h-full w-full object-cover" /><button type="button" onClick={() => void removePhoto(photo)} className="absolute right-1 top-1 flex h-8 w-8 items-center justify-center rounded-full bg-slate-900/75 text-white" aria-label={t("fields.deletePhoto")}><Trash2 className="h-4 w-4" /></button></div>)}</div>}
+            <Field label={t("fields.photos")}><PhotoActions onTakePhoto={() => void takePhoto()} onPickFromGallery={() => galleryInputRef.current?.click()} hint={t("nature.photoHint")} /><PhotoGrid photos={data.photos} onRemove={(photo) => void removePhoto(photo)} /></Field>
           </div>}
 
           {step === 6 && <div className="space-y-6">
@@ -1276,6 +1317,45 @@ function FieldBadge({ number }: { number: string }) { const { t } = useTranslati
 function SectionTitle({ number, icon, title }: { number: string; icon: React.ReactNode; title: string }) { return <div className="mb-4 flex items-center gap-3 text-[#153B66]"><span className="flex h-10 w-10 items-center justify-center rounded-xl bg-[#EDF3F7] [&>svg]:h-5 [&>svg]:w-5">{icon}</span><div><FieldBadge number={number} /><h2 className="text-lg font-bold">{title}</h2></div></div>; }
 
 function Choice({ active, warning, onClick, children }: { active: boolean; warning?: boolean; onClick: () => void; children: React.ReactNode }) { return <button type="button" onClick={onClick} className={`h-14 rounded-xl border-2 text-base font-semibold ${active ? warning ? "border-amber-500 bg-amber-50 text-amber-900" : "border-[#153B66] bg-[#EDF3F7] text-[#153B66]" : "border-slate-200 text-slate-600"}`}>{children}</button>; }
+
+// Two equivalent photo actions: direct camera capture (native plugin or
+// capture-input) and multi-select gallery picker.
+function PhotoActions({ onTakePhoto, onPickFromGallery, hint }: { onTakePhoto: () => void; onPickFromGallery: () => void; hint: string }) {
+  const { t } = useTranslation();
+  return (
+    <div className="space-y-3">
+      <div className="grid grid-cols-2 gap-3">
+        <button type="button" onClick={onTakePhoto} className="flex min-h-14 items-center justify-center gap-2 rounded-2xl bg-[#153B66] px-3 text-sm font-semibold text-white transition active:scale-[0.98]">
+          <Camera className="h-5 w-5 shrink-0" />{t("photos.takePhoto")}
+        </button>
+        <button type="button" onClick={onPickFromGallery} className="flex min-h-14 items-center justify-center gap-2 rounded-2xl border-2 border-[#B8CDDC] bg-white px-3 text-sm font-semibold text-[#153B66] transition active:scale-[0.98]">
+          <ImageIcon className="h-5 w-5 shrink-0" />{t("photos.fromGallery")}
+        </button>
+      </div>
+      <p className="text-xs text-slate-500">{hint}</p>
+    </div>
+  );
+}
+
+// Photo preview grid. Each tile shows its transfer state: uploaded photos
+// carry a green check, pending ones an upload marker.
+function PhotoGrid({ photos, onRemove }: { photos: PendingPhoto[]; onRemove: (photo: PendingPhoto) => void }) {
+  const { t } = useTranslation();
+  if (!photos.length) return null;
+  return (
+    <div className="mt-3 grid grid-cols-3 gap-3">
+      {photos.map((photo, index) => (
+        <div key={photo.id} className="relative aspect-square overflow-hidden rounded-xl bg-slate-100">
+          <img src={photo.url} alt={t("fields.photoAlt", { number: String(index + 1) })} className="h-full w-full object-cover" />
+          <span className={`absolute left-1 top-1 flex h-7 w-7 items-center justify-center rounded-full ${photo.storagePath ? "bg-emerald-600/90 text-white" : "bg-slate-700/80 text-white"}`} aria-label={t(photo.storagePath ? "photos.uploaded" : "photos.pendingUpload")} title={t(photo.storagePath ? "photos.uploaded" : "photos.pendingUpload")}>
+            {photo.storagePath ? <Check className="h-4 w-4" /> : <Upload className="h-3.5 w-3.5" />}
+          </span>
+          <button type="button" onClick={() => onRemove(photo)} className="absolute right-1 top-1 flex h-8 w-8 items-center justify-center rounded-full bg-slate-900/75 text-white" aria-label={t("fields.deletePhoto")}><Trash2 className="h-4 w-4" /></button>
+        </div>
+      ))}
+    </div>
+  );
+}
 function Summary({ number, icon, label, value }: { number: string; icon: React.ReactNode; label: string; value: string }) { return <div className="flex gap-3 rounded-2xl bg-[#F6F8FA] p-4"><span className="mt-0.5 text-[#39719D] [&>svg]:h-5 [&>svg]:w-5">{icon}</span><div className="min-w-0"><FieldBadge number={number} /><p className="text-xs font-semibold uppercase tracking-wide text-slate-500">{label}</p><p className="mt-1 break-words text-sm font-semibold text-slate-800">{value}</p></div></div>; }
 
 // Quiet status line reflecting the server-side signature state. It informs,

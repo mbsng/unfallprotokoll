@@ -343,7 +343,9 @@ serve(async (req) => {
       const descH = 52;
       box(page, MARGIN, y - descH, CONTENT_W, descH);
       page.drawText("SCHADENBESCHREIBUNG", { x: MARGIN + 4, y: y - 10, size: 6, font: bold, color: navy });
-      drawWrapped(page, regular, submissionParty.damage_description ?? "", MARGIN + 4, y - 20, CONTENT_W - 8, 6, 6);
+      drawWrapped(page, regular, submissionParty.damage_description ?? "", MARGIN + 4, y - 19, CONTENT_W - 8, 6, 4);
+      const naturePhotoCount = (media ?? []).filter((item: { kind: string }) => item.kind === "photo").length;
+      page.drawText(clean(`Siehe Fotoanhang, ${naturePhotoCount} Aufnahmen`), { x: MARGIN + 4, y: y - descH + 4, size: 4.5, font: bold, color: navy });
       y -= descH + gap;
 
       page.drawRectangle({ x: MARGIN, y: y - 12, width: CONTENT_W, height: 12, color: blueA });
@@ -383,11 +385,11 @@ serve(async (req) => {
           const photoH = 310;
           box(pPage, px, py, photoW, photoH);
           const stored = downloaded.get(item.storage_path);
-          if (stored) {
-            const img = await embedImage(pdf, stored.bytes, stored.contentType);
-            if (img) drawImageFit(pPage, img, px + 6, py + 22, photoW - 12, photoH - 36);
-          }
-          pPage.drawText(`Foto ${index + slot + 1}`, { x: px + 6, y: py + 8, size: 5.5, font: regular, color: rgb(0.3, 0.35, 0.4) });
+          const photoImage = stored ? await embedImage(pdf, stored.bytes, stored.contentType) : null;
+          if (photoImage) drawImageFit(pPage, photoImage, px + 6, py + 22, photoW - 12, photoH - 36);
+          else pPage.drawText("BILD NICHT VERFUEGBAR", { x: px + photoW / 2 - 32, y: py + photoH / 2, size: 7, font: bold, color: rgb(0.7, 0.3, 0.3) });
+          const takenLabel = item.taken_at ? ` - ${new Date(item.taken_at).toLocaleString("de-CH")}` : "";
+          pPage.drawText(`Foto ${index + slot + 1} - Partei ${clean(submissionParty.party_label)}${takenLabel}`, { x: px + 6, y: py + 8, size: 5.5, font: regular, color: rgb(0.3, 0.35, 0.4) });
         }
       }
 
@@ -486,6 +488,8 @@ serve(async (req) => {
       labeledField(page, regular, bold, "10", "Aufprallpunkt", "(siehe Skizze)", x, cy - 14, colW, 14); cy -= 16;
       labeledField(page, regular, bold, "11", "Sichtbare Schaeden", party.damage_description, x, cy - 42, colW, 42); cy -= 44;
       labeledField(page, regular, bold, "14", "Bemerkungen", "", x, cy - 24, colW, 24);
+      const partyPhotoCount = (media ?? []).filter((item: { kind: string; party_id: string }) => item.kind === "photo" && item.party_id === party.id).length;
+      page.drawText(clean(`Siehe Fotoanhang, ${partyPhotoCount} Aufnahmen`), { x: x + 2, y: cy - 28, size: 4, font: bold, color: navy });
     };
 
     drawPartyColumn(partyA, colLeft, blueA);
@@ -613,11 +617,11 @@ serve(async (req) => {
         const ownerParty = parties.find((p) => p.id === item.party_id);
         box(pPage, px, py, photoW, photoH);
         const stored = downloaded.get(item.storage_path);
-        if (stored) {
-          const img = await embedImage(pdf, stored.bytes, stored.contentType);
-          if (img) drawImageFit(pPage, img, px + 6, py + 22, photoW - 12, photoH - 36);
-        }
-        pPage.drawText(`Foto ${index + slot + 1} - Partei ${clean(ownerParty?.party_label)}`, { x: px + 6, y: py + 8, size: 5.5, font: regular, color: rgb(0.3, 0.35, 0.4) });
+        const photoImage = stored ? await embedImage(pdf, stored.bytes, stored.contentType) : null;
+        if (photoImage) drawImageFit(pPage, photoImage, px + 6, py + 22, photoW - 12, photoH - 36);
+        else pPage.drawText("BILD NICHT VERFUEGBAR", { x: px + photoW / 2 - 32, y: py + photoH / 2, size: 7, font: bold, color: rgb(0.7, 0.3, 0.3) });
+        const takenLabel = item.taken_at ? ` - ${new Date(item.taken_at).toLocaleString("de-CH")}` : "";
+        pPage.drawText(`Foto ${index + slot + 1} - Partei ${clean(ownerParty?.party_label)}${takenLabel}`, { x: px + 6, y: py + 8, size: 5.5, font: regular, color: rgb(0.3, 0.35, 0.4) });
       }
     }
 

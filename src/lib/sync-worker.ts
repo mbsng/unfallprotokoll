@@ -446,6 +446,11 @@ async function runOutbox() {
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         console.error("[sync-worker] Outbox entry failed", { operation: entry.operation, draftId: entry.draftId, error: message });
+        if (entry.table === "incident_media") {
+          // Photo transfers must never fail silently — surface the real error
+          // to the UI so it can be retried.
+          window.dispatchEvent(new CustomEvent("photo-sync-failed", { detail: { message, draftId: entry.draftId } }));
+        }
         if (entry.operation === "create" && message.includes("plan_limit_reached")) {
           window.dispatchEvent(new CustomEvent("plan-limit-reached", { detail: { draftId: entry.draftId } }));
         }
