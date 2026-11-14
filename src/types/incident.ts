@@ -77,6 +77,12 @@ export interface IncidentSummaryData {
   status: string;
   occurredAt: string | null;
   locationText: string | null;
+  locationLat: number | null;
+  locationLng: number | null;
+  injured: boolean;
+  otherDamage: boolean;
+  witnesses: string;
+  photos: PendingPhoto[];
   sketchDataUrl: string | null;
   sketchUpdatedBy: string | null;
   sketchUpdatedAt: string | null;
@@ -168,6 +174,8 @@ export interface DriverIncidentData {
   licenseNo?: string;
   licenseClass?: string;
   licenseValidUntil?: string;
+  reportDamage?: string;
+  reportRemarks?: string;
 }
 
 export interface VehicleIncidentData {

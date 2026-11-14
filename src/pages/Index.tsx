@@ -23,11 +23,11 @@ import { localeForLanguage } from "@/i18n";
 import { supabase } from "@/integrations/supabase/client";
 import { getPlanEntitlement } from "@/lib/billing";
 import { computeCaseStatus, loadIncidentSummary, loadUserIncidents, subscribeToIncident, subscribeToUserIncidents } from "@/lib/incidents";
-import { createLocalDraft, db, deleteLocalDraft, deleteLocalPhoto, getLatestDraft, markDraftComplete, saveDraftField, saveLocalPhoto, type LocalDraft } from "@/lib/local-db";
+import { createLocalDraft, db, deleteLocalDraft, deleteLocalPhoto, getLatestDraft, hydrateDraft, markDraftComplete, saveDraftField, saveLocalPhoto, type LocalDraft } from "@/lib/local-db";
 import { captureAccidentPhoto, getCurrentCoordinates, isNativeApp } from "@/lib/native-device";
 import { resizeImageFile } from "@/lib/image-resize";
 import { accidentToMasterData, loadLocalProfileMasterData, saveLocalProfileMasterData, saveProfileMasterData } from "@/lib/profile-data";
-import { processOutbox } from "@/lib/sync-worker";
+import { processOutbox, retryDraftSync } from "@/lib/sync-worker";
 import { generateIncidentPdf, signIncident, SubmissionError, submitIncident } from "@/lib/submissions";
 
 import type { AccidentData, IncidentDraftRef, IncidentPartySummary, IncidentSummaryData, JoinedIncidentState, PendingPhoto, ReportType } from "@/types/incident";
@@ -43,7 +43,7 @@ const emptyData = (profile?: Profile | null): AccidentData => {
   const local = profile ? null : loadLocalProfileMasterData();
   return {
     reportType: "collision",
-    date: now.toISOString().slice(0, 10), time: now.toTimeString().slice(0, 5), location: "", locationLat: null, locationLng: null,
+    date: `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`, time: now.toTimeString().slice(0, 5), location: "", locationLat: null, locationLng: null,
     injured: false, otherDamage: false, witnesses: "",
     driverName: profile?.full_name ?? local?.fullName ?? "", driverAddress: profile?.address ?? local?.address ?? "", postalCode: profile?.postal_code ?? local?.postalCode ?? "", city: profile?.city ?? local?.city ?? "", country: profile?.country ?? local?.country ?? "",
     birthDate: profile?.birth_date ?? local?.birthDate ?? "", phone: profile?.phone ?? local?.phone ?? "", licenseNo: profile?.license_no ?? local?.licenseNo ?? "", licenseClass: profile?.license_class ?? local?.licenseClass ?? "", licenseValidUntil: profile?.license_valid_until ?? local?.licenseValidUntil ?? "",
@@ -83,6 +83,14 @@ const summaryToData = (summary: IncidentSummaryData, ownParty: IncidentPartySumm
     data.time = `${String(occurredAt.getHours()).padStart(2, "0")}:${String(occurredAt.getMinutes()).padStart(2, "0")}`;
   }
   data.location = summary.locationText ?? "";
+  data.locationLat = summary.locationLat;
+  data.locationLng = summary.locationLng;
+  data.injured = summary.injured;
+  data.otherDamage = summary.otherDamage;
+  data.witnesses = summary.witnesses;
+  data.photos = summary.photos;
+  data.sketchDataUrl = summary.sketchDataUrl ?? "";
+  data.hasSketch = Boolean(data.sketchDataUrl);
   data.driverName = ownParty.driver.fullName ?? "";
   data.driverAddress = ownParty.driver.address ?? "";
   data.postalCode = ownParty.driver.postalCode ?? "";
@@ -99,7 +107,8 @@ const summaryToData = (summary: IncidentSummaryData, ownParty: IncidentPartySumm
   data.insurer = ownParty.insurance.company ?? "";
   data.policy = ownParty.insurance.policyNumber ?? "";
   data.insuranceOffice = ownParty.insurance.office ?? "";
-  data.damage = ownParty.damageDescription ?? "";
+  data.damage = ownParty.driver.reportDamage ?? ownParty.damageDescription ?? "";
+  data.notes = ownParty.driver.reportRemarks ?? "";
   data.situations = ownParty.circumstancesChecked ?? [];
   data.hasSignature = Boolean(ownParty.signedAt);
   return data;
@@ -207,14 +216,28 @@ export default function Index() {
     setData({ ...emptyData(profile), ...draft.data });
   };
 
+  const pendingSaves = useRef(new Set<Promise<void>>());
+  const failedFields = useRef(new Set<keyof AccidentData>());
   const update = <K extends keyof AccidentData>(key: K, value: AccidentData[K]) => {
     setDirty(true);
     setSaveStatus("saving");
     setData((previous) => ({ ...previous, [key]: value }));
     if (user && localDraftId) {
-      void saveDraftField(user.id, localDraftId, key, value)
-        .then(() => setSaveStatus("saved"))
-        .catch(() => setSaveStatus("error"));
+      const task = saveDraftField(user.id, localDraftId, key, value);
+      pendingSaves.current.add(task);
+      void task.then(() => {
+        pendingSaves.current.delete(task);
+        failedFields.current.delete(key);
+        if (!pendingSaves.current.size) setSaveStatus(failedFields.current.size ? "error" : "saved");
+      }).catch(() => {
+        pendingSaves.current.delete(task);
+        failedFields.current.add(key);
+        setSaveStatus("error");
+        toast.error(t("incident.saveError"));
+      });
+    } else {
+      failedFields.current.add(key);
+      setSaveStatus("error");
     }
   };
 
@@ -243,16 +266,17 @@ export default function Index() {
         applyLocalDraft(latest);
       }
     });
+    return () => { active = false; };
+  }, [user?.id, joinedIncident?.draftRef.partyId]);
+
+  useEffect(() => {
     const onDraftChange = (event: Event) => {
       const draft = (event as CustomEvent<LocalDraft>).detail;
-      if (draft.ownerId === user.id && draft.id === localDraftId) applyLocalDraft(draft);
+      if (draft.ownerId === user?.id && draft.id === localDraftId && !pendingSaves.current.size && !failedFields.current.size) applyLocalDraft(draft);
     };
     window.addEventListener("local-draft-change", onDraftChange);
-    return () => {
-      active = false;
-      window.removeEventListener("local-draft-change", onDraftChange);
-    };
-  }, [user?.id, joinedIncident?.draftRef.partyId]);
+    return () => window.removeEventListener("local-draft-change", onDraftChange);
+  }, [user?.id, localDraftId]);
 
   useEffect(() => {
     // Independent connectivity check — NOT tied to Realtime channel status
@@ -294,6 +318,21 @@ export default function Index() {
         const summary = await loadIncidentSummary(draftRef);
         if (!active) return;
         setParties(summary.parties);
+        if (localDraftId && summary.sketchUpdatedAt && !pendingSaves.current.size) {
+          const refreshed = await db.transaction("rw", db.drafts, db.outbox, async () => {
+            const current = await db.drafts.get(localDraftId);
+            if (!current || current.ownerId !== user?.id) return false;
+            const pendingSketch = await db.outbox.where("draftId").equals(localDraftId).filter((entry) => entry.payload.field === "sketchDataUrl" || entry.payload.field === "hasSketch").count();
+            if (pendingSketch) return false;
+            current.data.sketchDataUrl = summary.sketchDataUrl ?? "";
+            current.data.hasSketch = Boolean(summary.sketchDataUrl);
+            current.fieldModifiedAt.sketchDataUrl = summary.sketchUpdatedAt;
+            current.fieldModifiedAt.hasSketch = summary.sketchUpdatedAt;
+            await db.drafts.put(current);
+            return true;
+          });
+          if (active && refreshed && !pendingSaves.current.size) setData((current) => ({ ...current, sketchDataUrl: summary.sketchDataUrl ?? "", hasSketch: Boolean(summary.sketchDataUrl) }));
+        }
         setDraftRef((current) => {
           if (!current) return current;
           const ownParty = summary.parties.find((party) => party.id === current.partyId);
@@ -391,7 +430,8 @@ export default function Index() {
     if (!navigator.onLine || !user) return;
     setEnsuringServerCase(true);
     try {
-      await processOutbox();
+      if (localDraftId) await retryDraftSync(user.id, localDraftId);
+      else await processOutbox();
       await refreshFromServer();
     } catch {
       toast.error(t("incident.saveError"));
@@ -421,23 +461,8 @@ export default function Index() {
   }, []);
 
   const saveSketch = async (dataUrl: string) => {
-    if (!draftRef || draftRef.incidentId.startsWith("local:") || !user) {
-      update("hasSketch", true);
-      update("sketchDataUrl", dataUrl);
-      return;
-    }
-    try {
-      const { error } = await supabase.from("incidents")
-        .update({ sketch_data_url: dataUrl, sketch_updated_by: user.id, sketch_updated_at: new Date().toISOString() })
-        .eq("id", draftRef.incidentId);
-      if (error) throw error;
-      update("hasSketch", true);
-      update("sketchDataUrl", dataUrl);
-      await refreshFromServer();
-    } catch {
-      update("hasSketch", true);
-      update("sketchDataUrl", dataUrl);
-    }
+    update("hasSketch", Boolean(dataUrl));
+    update("sketchDataUrl", dataUrl);
   };
 
   const confirmSketch = async () => {
@@ -617,13 +642,22 @@ export default function Index() {
       const existingDraft = localDrafts?.find((d) => d.ref.incidentId === item.incidentId);
       let draft: LocalDraft;
       if (existingDraft) {
-        draft = existingDraft;
-        draft.ref = { ...ref, incidentVersion: summary.incidentVersion, partyVersion: ownParty.version };
-        draft.data = { ...draft.data, ...serverData };
+        draft = await db.transaction("rw", db.drafts, db.outbox, db.conflicts, async () => {
+          const current = await db.drafts.get(existingDraft.id);
+          if (!current || current.ownerId !== user?.id) throw new Error("draft_not_found");
+          const pending = await db.outbox.where("draftId").equals(current.id).count();
+          const conflicts = await db.conflicts.where("draftId").equals(current.id).count();
+          if (!pending && !conflicts) {
+            current.data = serverData;
+            current.ref = { ...ref, incidentVersion: summary.incidentVersion, partyVersion: ownParty.version };
+          }
+          await db.drafts.put(current);
+          return current;
+        });
       } else {
         draft = await createLocalDraft(user!.id, serverData, { ...ref, incidentVersion: summary.incidentVersion, partyVersion: ownParty.version });
       }
-      applyLocalDraft(draft);
+      applyLocalDraft(await hydrateDraft(draft));
       setParties(summary.parties);
       // Determine entry step: use requested step, or find first incomplete step
       const entryStep = requestedStep ?? (ownParty.signedAt ? (normalizeReportType(serverData.reportType) === "nature" ? 6 : 5) : 0);
@@ -745,16 +779,24 @@ export default function Index() {
     if (!user || !draftRef || !localDraftId || saving) return;
     setSaving(true);
     try {
-      let ref = draftRef;
-      // A purely local case is pushed to the server first; signing itself is
-      // server-attested. Nothing is blocked up front — a failure surfaces as
-      // a regular error.
-      if (ref.incidentId.startsWith("local:")) {
-        await processOutbox();
-        const synced = await db.drafts.get(localDraftId);
-        if (!synced || synced.ref.incidentId.startsWith("local:")) throw new Error("case_not_on_server_yet");
-        ref = synced.ref;
-        setDraftRef(ref);
+      await Promise.all([...pendingSaves.current]);
+      if (failedFields.current.size) throw new Error("unsaved_fields");
+      await retryDraftSync(user.id, localDraftId);
+      const remaining = await db.outbox.where("draftId").equals(localDraftId).count();
+      const conflicts = await db.conflicts.where("draftId").equals(localDraftId).count();
+      if (remaining || conflicts) {
+        toast.error(t("incident.saveError"));
+        return;
+      }
+      const synced = await db.drafts.get(localDraftId);
+      if (!synced || synced.ref.incidentId.startsWith("local:")) throw new Error("case_not_on_server_yet");
+      const ref = synced.ref;
+      setDraftRef(ref);
+      const currentSummary = await loadIncidentSummary(ref);
+      if (currentSummary.parties.find((party) => party.id === ref.partyId)?.signedAt) {
+        setParties(currentSummary.parties);
+        setView("signed");
+        return;
       }
       const partyId = ref.partyId;
       const incidentId = ref.incidentId;

@@ -1,7 +1,8 @@
 import Dexie from "dexie";
 import { supabase } from "@/integrations/supabase/client";
-import { db, deviceId, applyDraftFromSync, requestSync, tableForField, NATURE_FIELDS, type LocalDraft, type OutboxEntry, type SyncConflict } from "@/lib/local-db";
+import { db, deviceId, applyDraftFromSync, persistSyncedDraft, requestSync, tableForField, NATURE_FIELDS, type LocalDraft, type OutboxEntry, type SyncConflict } from "@/lib/local-db";
 import type { AccidentData } from "@/types/incident";
+import { replaceWitness as saveWitness } from "@/lib/incidents";
 
 let activeRun: Promise<void> | null = null;
 let started = false;
@@ -43,34 +44,40 @@ const natureDetailsKey = (field: string) => {
   return stripped.charAt(0).toLowerCase() + stripped.slice(1);
 };
 
+const incidentTimestamp = (data: AccidentData) => {
+  const date = data.reportType === "nature" && ["hail", "storm", "flood", "snow_pressure", "rockfall"].includes(data.natureEventType)
+    ? data.naturePeriodFrom : data.date;
+  if (!date) return null;
+  const timestamp = new Date(`${date}T${data.reportType === "nature" && date === data.naturePeriodFrom ? "00:00" : data.time || "00:00"}:00`);
+  return Number.isNaN(timestamp.getTime()) ? null : timestamp.toISOString();
+};
+
 const incidentPatch = (data: AccidentData, field: keyof AccidentData): Record<string, unknown> => {
-  if (field === "reportType") return {};
+  if (field === "reportType") return { report_type: data.reportType, type_details: natureTypeDetails(data), occurred_at: incidentTimestamp(data) };
   if (typeof field === "string" && NATURE_FIELDS.includes(field as (typeof NATURE_FIELDS)[number])) {
-    const patch: Record<string, unknown> = { type_details: natureTypeDetails(data) };
-    if (field === "naturePeriodFrom" || field === "naturePeriodTo") {
-      patch.occurred_at = data.naturePeriodFrom ? new Date(`${data.naturePeriodFrom}T00:00:00`).toISOString() : null;
-    }
+    const patch: Record<string, unknown> = { type_details: natureTypeDetails(data), occurred_at: incidentTimestamp(data) };
     return patch;
   }
-  if (field === "date" || field === "time") return { occurred_at: new Date(`${data.date}T${data.time}:00`).toISOString() };
+  if (field === "date" || field === "time") return { occurred_at: incidentTimestamp(data) };
   if (["location", "locationLat", "locationLng"].includes(field)) return { location_text: data.location, location_lat: data.locationLat, location_lng: data.locationLng };
   if (field === "injured" || field === "otherDamage") return { circumstances_json: { injured: data.injured, otherDamage: data.otherDamage } };
-  if (field === "sketchDataUrl" || field === "hasSketch") return { sketch_json: data.sketchDataUrl ? { storagePath: "pending" } : {} };
-  return {};
+  if (field === "sketchDataUrl" || field === "hasSketch") return { sketch_data_url: data.sketchDataUrl || null, sketch_updated_by: activeOwnerId, sketch_updated_at: new Date().toISOString() };
+  throw new Error(`unmapped_incident_field:${field}`);
 };
 
 const partyPatch = (data: AccidentData, field: keyof AccidentData) => {
-  if (["driverName", "driverAddress", "postalCode", "city", "country", "birthDate", "phone", "licenseNo", "licenseClass", "licenseValidUntil"].includes(field)) return {
+  if (["driverName", "driverAddress", "postalCode", "city", "country", "birthDate", "phone", "licenseNo", "licenseClass", "licenseValidUntil", "damage", "notes"].includes(field)) return {
     driver_json: {
       fullName: data.driverName, address: data.driverAddress, postalCode: data.postalCode, city: data.city, country: data.country,
       birthDate: data.birthDate, phone: data.phone, licenseNo: data.licenseNo, licenseClass: data.licenseClass, licenseValidUntil: data.licenseValidUntil,
+      reportDamage: data.damage, reportRemarks: data.notes,
     },
+    damage_description: [data.damage, data.notes].filter(Boolean).join("\n\n"),
   };
   if (["plate", "vehicle", "vehicleCountry"].includes(field)) return { vehicle_json: { plate: data.plate, makeModel: data.vehicle, registrationCountry: data.vehicleCountry } };
   if (["insurer", "policy", "insuranceOffice"].includes(field)) return { insurance_json: { company: data.insurer, policyNumber: data.policy, office: data.insuranceOffice } };
   if (field === "situations") return { circumstances_checked: data.situations };
-  if (field === "damage" || field === "notes") return { damage_description: [data.damage, data.notes].filter(Boolean).join("\n\n") };
-  return {};
+  throw new Error(`unmapped_party_field:${field}`);
 };
 
 function serverFields(table: "incidents" | "incident_parties", row: Record<string, unknown>, field: keyof AccidentData) {
@@ -80,17 +87,18 @@ function serverFields(table: "incidents" | "incident_parties", row: Record<strin
       const key = natureDetailsKey(field);
       return key === "parts" ? details[key] ?? [] : details[key] ?? "";
     }
+    if (field === "reportType") return row.report_type ?? "collision";
     if (field === "date" || field === "time") {
       const date = row.occurred_at ? new Date(row.occurred_at as string) : null;
-      return field === "date" ? date?.toISOString().slice(0, 10) ?? "" : date?.toTimeString().slice(0, 5) ?? "";
+      return field === "date" ? date ? `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}` : "" : date?.toTimeString().slice(0, 5) ?? "";
     }
     if (field === "location") return row.location_text ?? "";
     if (field === "locationLat") return row.location_lat ?? null;
     if (field === "locationLng") return row.location_lng ?? null;
     if (field === "injured") return Boolean((row.circumstances_json as Record<string, unknown>)?.injured);
     if (field === "otherDamage") return Boolean((row.circumstances_json as Record<string, unknown>)?.otherDamage);
-    if (field === "hasSketch") return Boolean((row.sketch_json as Record<string, unknown>)?.storagePath);
-    if (field === "sketchDataUrl") return "";
+    if (field === "hasSketch") return Boolean(row.sketch_data_url);
+    if (field === "sketchDataUrl") return row.sketch_data_url ?? "";
   } else {
     const driver = row.driver_json as Record<string, unknown>;
     const vehicle = row.vehicle_json as Record<string, unknown>;
@@ -113,8 +121,7 @@ function serverFields(table: "incidents" | "incident_parties", row: Record<strin
     if (field === "insuranceOffice") return insurance?.office ?? "";
     if (field === "situations") return row.circumstances_checked ?? [];
     if (field === "damage" || field === "notes") {
-      const [damage = "", ...notes] = String(row.damage_description ?? "").split("\n\n");
-      return field === "damage" ? damage : notes.join("\n\n");
+      return field === "damage" ? driver?.reportDamage ?? row.damage_description ?? "" : driver?.reportRemarks ?? "";
     }
   }
   return undefined;
@@ -156,12 +163,13 @@ async function createRemoteDraft(draft: LocalDraft, entry: OutboxEntry) {
     partyVersion: row.party_version,
   };
   const now = new Date().toISOString();
+  // Each patch writes its complete field group, so one entry per group is
+  // sufficient for the initial snapshot rather than dozens of duplicate writes.
   const snapshotFields: (keyof AccidentData)[] = [
-    "date", "time", "location", "locationLat", "locationLng", "injured", "otherDamage", "witnesses",
-    "driverName", "driverAddress", "postalCode", "city", "country", "birthDate", "phone", "licenseNo", "licenseClass", "licenseValidUntil",
-    "plate", "vehicle", "vehicleCountry", "insurer", "policy", "insuranceOffice", "situations", "damage", "notes",
+    "date", "location", "injured", "witnesses", "driverName", "plate", "insurer", "situations",
   ];
-  if ((draft.data.reportType ?? "collision") === "nature") snapshotFields.push(...NATURE_FIELDS);
+  if (draft.data.sketchDataUrl) snapshotFields.push("sketchDataUrl");
+  if ((draft.data.reportType ?? "collision") === "nature") snapshotFields.push("natureEventType");
   const snapshotEntries: OutboxEntry[] = snapshotFields.map((field, index) => {
     const table = tableForField(field);
     return {
@@ -172,7 +180,7 @@ async function createRemoteDraft(draft: LocalDraft, entry: OutboxEntry) {
     };
   });
   await db.transaction("rw", db.drafts, db.outbox, async () => {
-    await db.drafts.put(draft);
+    await persistSyncedDraft(draft);
     await db.outbox.delete(entry.id);
     await db.outbox.bulkAdd(snapshotEntries);
   });
@@ -180,45 +188,12 @@ async function createRemoteDraft(draft: LocalDraft, entry: OutboxEntry) {
   requestSync();
 }
 
-async function uploadCanvas(draft: LocalDraft, kind: "sketch" | "signature", dataUrl: string) {
-  const blob = await (await fetch(dataUrl)).blob();
-  const path = `${draft.ref.incidentId}/${draft.ref.partyId}/${kind}.png`;
-  console.log("[sync-worker] uploadCanvas", { kind, path, size: blob.size });
-  const { error } = await withTimeout(supabase.storage.from("incident-media").upload(path, blob, { upsert: true, contentType: "image/png" }));
-  if (error) {
-    console.error("[sync-worker] uploadCanvas: storage error", { kind, path, error: error.message });
-    throw new Error(`storage_upload_failed:${error.message}`);
-  }
-  const { data: mediaRow, error: mediaError } = await withTimeout(supabase.from("incident_media").upsert({
-    incident_id: draft.ref.incidentId, party_id: draft.ref.partyId, storage_path: path,
-    kind: kind === "sketch" ? "sketch" : "document",
-  }, { onConflict: "storage_path" }).select("id").maybeSingle());
-  if (mediaError) throw new Error(`media_db_failed:${mediaError.message}`);
-  if (!mediaRow) {
-    console.error("[sync-worker] uploadCanvas: media upsert returned no row", { path });
-    throw new Error("media_upsert_zero_rows");
-  }
-  console.log("[sync-worker] uploadCanvas: success", { path, mediaId: mediaRow.id });
-  return path;
-}
-
 async function writeVersioned(draft: LocalDraft, entry: OutboxEntry) {
   const field = entry.payload.field as keyof AccidentData;
   const table = entry.table as "incidents" | "incident_parties";
   const id = table === "incidents" ? draft.ref.incidentId : draft.ref.partyId;
   let version = table === "incidents" ? draft.ref.incidentVersion : draft.ref.partyVersion;
-  let patch = table === "incidents" ? incidentPatch(draft.data, field) : partyPatch(draft.data, field);
-
-  if (table === "incidents" && (field === "sketchDataUrl" || field === "hasSketch") && draft.data.sketchDataUrl) {
-    const cachedPath = entry.payload.storagePath as string | undefined;
-    const storagePath = cachedPath ?? await uploadCanvas(draft, "sketch", draft.data.sketchDataUrl);
-    await db.outbox.update(entry.id, { payload: { ...entry.payload, storagePath } });
-    patch = { sketch_json: { storagePath } };
-  }
-  if (!Object.keys(patch).length) {
-    await db.outbox.delete(entry.id);
-    return;
-  }
+  const patch = table === "incidents" ? incidentPatch(draft.data, field) : partyPatch(draft.data, field);
 
   const attemptUpdate = async (baseVersion: number, values: Record<string, unknown>) => {
     const result = await withTimeout(supabase
@@ -244,7 +219,7 @@ async function writeVersioned(draft: LocalDraft, entry: OutboxEntry) {
     } else {
       const localTime = new Date(draft.fieldModifiedAt[field] ?? entry.createdAt).getTime();
       const serverTime = new Date(server.updated_at).getTime();
-      if (Math.abs(localTime - serverTime) < 1000) {
+      if (serverTime > localTime || Math.abs(localTime - serverTime) < 1000) {
         const conflict: SyncConflict = {
           id: crypto.randomUUID(), ownerId: draft.ownerId, draftId: draft.id, table, field, localValue,
           serverValue, serverVersion: server.version, createdAt: new Date().toISOString(),
@@ -273,20 +248,14 @@ async function writeVersioned(draft: LocalDraft, entry: OutboxEntry) {
   if (table === "incidents") draft.ref = { ...draft.ref, incidentVersion: version };
   else draft.ref = { ...draft.ref, partyVersion: version };
   await db.transaction("rw", db.drafts, db.outbox, async () => {
-    await db.drafts.put(draft);
+    await persistSyncedDraft(draft);
     await db.outbox.delete(entry.id);
   });
   await applyDraftFromSync(draft);
 }
 
 async function replaceWitness(draft: LocalDraft, entry: OutboxEntry) {
-  const { error: deleteError } = await withTimeout(supabase.from("incident_witnesses").delete().eq("incident_id", draft.ref.incidentId));
-  if (deleteError) throw deleteError;
-  if (draft.data.witnesses.trim()) {
-    const { data: witnessRow, error } = await withTimeout(supabase.from("incident_witnesses").insert({ incident_id: draft.ref.incidentId, name: draft.data.witnesses.trim(), contact: null }).select("id").maybeSingle());
-    if (error) throw error;
-    if (!witnessRow) throw new Error("witness_insert_zero_rows");
-  }
+  await withTimeout(saveWitness(draft.ref, draft.data.witnesses, entry.id));
   await db.outbox.delete(entry.id);
 }
 
@@ -298,8 +267,9 @@ async function syncMedia(draft: LocalDraft, entry: OutboxEntry) {
       const { error } = await withTimeout(supabase.storage.from("incident-media").remove([path]));
       if (error) throw error;
     }
-    if (mediaId) {
-      const { error } = await withTimeout(supabase.from("incident_media").delete().eq("id", mediaId));
+    if (mediaId || path) {
+      const query = supabase.from("incident_media").delete();
+      const { error } = await withTimeout(mediaId ? query.eq("id", mediaId) : query.eq("storage_path", path!));
       if (error) throw error;
     }
     await db.outbox.delete(entry.id);
@@ -312,6 +282,7 @@ async function syncMedia(draft: LocalDraft, entry: OutboxEntry) {
     return;
   }
   const path = `${draft.ref.incidentId}/${draft.ref.partyId}/photo-${photo.id}.${extensionForPhoto(photo.mimeType)}`;
+  await db.photos.update(photoId, { storagePath: path });
   const { error } = await withTimeout(supabase.storage.from("incident-media").upload(path, photo.blob, { upsert: true, contentType: photo.mimeType }));
   if (error) throw error;
   const { data: media, error: mediaError } = await withTimeout(supabase.from("incident_media").upsert({
@@ -324,64 +295,7 @@ async function syncMedia(draft: LocalDraft, entry: OutboxEntry) {
     await db.photos.update(photoId, { storagePath: path, mediaId: media.id });
     await db.outbox.delete(entry.id);
   });
-}
-
-async function completeDraft(draft: LocalDraft, entry: OutboxEntry) {
-  if (!draft.data.signatureDataUrl) throw new Error("signature_missing");
-
-  const partyId = draft.ref.partyId;
-  console.log("[sync-worker] completeDraft starting", { partyId, incidentId: draft.ref.incidentId, draftId: draft.id });
-
-  const dataUrl = draft.data.signatureDataUrl;
-  const blob = await (await fetch(dataUrl)).blob();
-  const storagePath = `${draft.ref.incidentId}/${partyId}/signature.png`;
-  console.log("[sync-worker] Uploading signature", { storagePath, blobSize: blob.size, blobType: blob.type });
-
-  const { error: uploadError } = await withTimeout(supabase.storage
-    .from("incident-media")
-    .upload(storagePath, blob, { upsert: true, contentType: "image/png" }));
-  if (uploadError) {
-    console.error("[sync-worker] Signature storage upload FAILED", { storagePath, error: uploadError.message });
-    throw new Error(`signature_upload_failed:${uploadError.message}`);
-  }
-  console.log("[sync-worker] Signature storage upload succeeded", { storagePath });
-
-  const { data: currentParty, error: fetchError } = await withTimeout(supabase
-    .from("incident_parties")
-    .select("version, signed_at, signature_storage_path")
-    .eq("id", partyId)
-    .maybeSingle());
-
-  if (fetchError) throw new Error(`party_fetch_failed:${fetchError.message}`);
-  if (!currentParty) throw new Error("party_not_found");
-  console.log("[sync-worker] Current party state", { partyId, version: currentParty.version, signedAt: currentParty.signed_at });
-
-  if (currentParty.signed_at && currentParty.signature_storage_path === storagePath) {
-    console.log("[sync-worker] Party already signed with same path, treating as success", { partyId });
-    draft.ref = { ...draft.ref, partyVersion: currentParty.version };
-    await db.transaction("rw", db.drafts, db.outbox, async () => {
-      await db.drafts.put(draft);
-      await db.outbox.delete(entry.id);
-    });
-    await applyDraftFromSync(draft);
-    window.dispatchEvent(new CustomEvent("incident-signature-synced", { detail: { draftId: draft.id, incidentId: draft.ref.incidentId } }));
-    return;
-  }
-
-  // Server-attested signing: the edge function verifies the uploaded
-  // signature exists in storage; clients can no longer write signed_at directly.
-  const { data: signedResult, error: signError } = await withTimeout(supabase.functions.invoke("sign-incident", { body: { partyId } }));
-  if (signError || !signedResult?.signedAt) throw new Error(`sign_failed:${signError?.message ?? "no_result"}`);
-
-  console.log("[sync-worker] signature attested by server", { partyId, version: signedResult.version, signedAt: signedResult.signedAt });
-  draft.ref = { ...draft.ref, partyVersion: signedResult.version };
-  await db.transaction("rw", db.drafts, db.outbox, async () => {
-    await db.drafts.put(draft);
-    await db.outbox.delete(entry.id);
-  });
   await applyDraftFromSync(draft);
-  window.dispatchEvent(new CustomEvent("incident-signature-synced", { detail: { draftId: draft.id, incidentId: draft.ref.incidentId } }));
-  console.log("[sync-worker] completeDraft finished successfully", { partyId });
 }
 
 async function processEntry(entry: OutboxEntry) {
@@ -408,6 +322,11 @@ async function processEntry(entry: OutboxEntry) {
       return;
     }
     if (entry.operation === "create") return await createRemoteDraft(draft, entry);
+    const conflict = await db.conflicts.where("draftId").equals(draft.id).filter((item) => item.ownerId === draft.ownerId && item.table === entry.table).first();
+    if (conflict) {
+      await db.outbox.update(entry.id, { nextAttemptAt: Date.now() + 2_000 });
+      return;
+    }
     if (entry.table === "incident_media") return await syncMedia(draft, entry);
     if (entry.table === "incident_witnesses") return await replaceWitness(draft, entry);
     if (entry.operation === "complete") {
@@ -471,6 +390,13 @@ export function processOutbox() {
   return activeRun;
 }
 
+export async function retryDraftSync(ownerId: string, draftId: string) {
+  await assertOwner(ownerId);
+  if (activeRun) await activeRun;
+  await db.outbox.where("draftId").equals(draftId).filter((entry) => entry.ownerId === ownerId).modify({ attempts: 0, nextAttemptAt: Date.now() });
+  await processOutbox();
+}
+
 export function startSyncWorker(ownerId: string) {
   activeOwnerId = ownerId;
   if (started) return () => { if (activeOwnerId === ownerId) activeOwnerId = null; };
@@ -503,19 +429,28 @@ export async function resolveConflict(conflict: SyncConflict, choice: "local" | 
     if (conflict.table === "incidents") draft.ref.incidentVersion = conflict.serverVersion;
     else draft.ref.partyVersion = conflict.serverVersion;
     await db.transaction("rw", db.drafts, db.conflicts, async () => {
-      await db.drafts.put(draft);
+      await persistSyncedDraft(draft);
       await db.conflicts.delete(conflict.id);
     });
     await applyDraftFromSync(draft);
   } else {
-    await db.outbox.add({
-      id: crypto.randomUUID(), ownerId: draft.ownerId, draftId: draft.id,
-      table: conflict.table, operation: "update",
-      payload: { field: conflict.field, value: conflict.localValue, modifiedAt: new Date().toISOString() },
-      version: conflict.serverVersion, device_id: deviceId,
-      attempts: 0, nextAttemptAt: Date.now(), createdAt: new Date().toISOString(),
+    const modifiedAt = new Date().toISOString();
+    draft.data = { ...draft.data, [conflict.field]: conflict.localValue };
+    draft.fieldModifiedAt = { ...draft.fieldModifiedAt, [conflict.field]: modifiedAt };
+    if (conflict.table === "incidents") draft.ref.incidentVersion = conflict.serverVersion;
+    else draft.ref.partyVersion = conflict.serverVersion;
+    await db.transaction("rw", db.drafts, db.outbox, db.conflicts, async () => {
+      await persistSyncedDraft(draft);
+      await db.outbox.add({
+        id: crypto.randomUUID(), ownerId: draft.ownerId, draftId: draft.id,
+        table: conflict.table, operation: "update",
+        payload: { field: conflict.field, value: conflict.localValue, modifiedAt },
+        version: conflict.serverVersion, device_id: deviceId,
+        attempts: 0, nextAttemptAt: Date.now(), createdAt: modifiedAt,
+      });
+      await db.conflicts.delete(conflict.id);
     });
-    await db.conflicts.delete(conflict.id);
+    await applyDraftFromSync(draft);
     requestSync();
   }
 }

@@ -197,6 +197,60 @@ function drawProvenanceFooters(
   });
 }
 
+function appendRecordedFields(pdf: PDFDocument, regular: PDFFont, bold: PDFFont, incident: any, parties: any[], witnesses: any[]) {
+  let page!: PDFPage;
+  let y = 0;
+  const newPage = () => {
+    page = pdf.addPage([PW, PH]);
+    page.drawText(`ERFASSTE ANGABEN - FALL ${clean(incident.share_code)}`, { x: MARGIN, y: PH - 32, size: 11, font: bold });
+    y = PH - 54;
+  };
+  const write = (label: string, value: unknown) => {
+    const text = clean(`${label}: ${value === null || value === undefined || value === "" ? "-" : value}`);
+    for (const paragraph of text.split("\n")) {
+      let line = "";
+      for (const character of paragraph) {
+        if (regular.widthOfTextAtSize(line + character, 8) > CONTENT_W) {
+          if (y < 45) newPage();
+          page.drawText(line, { x: MARGIN, y, size: 8, font: regular });
+          y -= 12;
+          line = "";
+        }
+        line += character;
+      }
+      if (y < 45) newPage();
+      page.drawText(line || " ", { x: MARGIN, y, size: 8, font: regular });
+      y -= 12;
+    }
+    y -= 4;
+  };
+  newPage();
+  write("Meldungsart", incident.report_type);
+  write("Zeitpunkt", incident.occurred_at);
+  write("Ort", incident.location_text);
+  write("Koordinaten", [incident.location_lat, incident.location_lng].filter((value) => value !== null).join(", "));
+  write("Verletzte", incident.circumstances_json?.injured ? "Ja" : "Nein");
+  write("Weitere Sachschaeden", incident.circumstances_json?.otherDamage ? "Ja" : "Nein");
+  write("Zeugen", witnesses.map((item) => [item.name, item.contact].filter(Boolean).join(" ")).join("\n"));
+  if (incident.report_type === "nature") write("Naturereignis-Details", JSON.stringify(incident.type_details ?? {}, null, 2));
+  for (const party of parties) {
+    const driver = party.driver_json ?? {};
+    const vehicle = party.vehicle_json ?? {};
+    const insurance = party.insurance_json ?? {};
+    write(`Partei ${party.party_label}`, driver.fullName);
+    write("Adresse", [driver.address, driver.postalCode, driver.city, driver.country].filter(Boolean).join(", "));
+    write("Geburtsdatum", driver.birthDate);
+    write("Telefon", driver.phone);
+    write("Fuehrerausweis / Klasse / gueltig bis", [driver.licenseNo, driver.licenseClass, driver.licenseValidUntil].filter(Boolean).join(" / "));
+    write("Fahrzeug / Kennzeichen / Zulassungsland", [vehicle.makeModel, vehicle.plate, vehicle.registrationCountry].filter(Boolean).join(" / "));
+    write("Versicherung / Police / Geschaeftsstelle", [insurance.company, insurance.policyNumber, insurance.office].filter(Boolean).join(" / "));
+    write("Sichtbare Schaeden", driver.reportDamage ?? party.damage_description);
+    write("Bemerkungen", driver.reportRemarks);
+    write("Unfallumstaende", (party.circumstances_checked ?? []).map((index: number) => `${index + 1}. ${CIRCUMSTANCES[index] ?? "Unbekannt"}`).join("\n"));
+    write("Unterschrieben am", party.signed_at);
+  }
+}
+
 serve(async (req) => {
   if (req.method === "OPTIONS") return corsPreflightResponse(req);
   let locale = normalizeLocale(req.headers.get("accept-language"));
@@ -216,13 +270,13 @@ serve(async (req) => {
     const { data: authData, error: authError } = await authClient.auth.getUser(token);
     if (authError || !authData.user) return fail(req, "unauthorized", 401, locale);
 
-    const [{ data: incident, error: incidentError }, { data: parties, error: partiesError }, { data: witnesses }, { data: media }] = await Promise.all([
+    const [{ data: incident, error: incidentError }, { data: parties, error: partiesError }, { data: witnesses, error: witnessesError }, { data: media, error: mediaError }] = await Promise.all([
       service.from("incidents").select("*").eq("id", incidentId).single(),
       service.from("incident_parties").select("*").eq("incident_id", incidentId).order("party_label"),
       service.from("incident_witnesses").select("name, contact").eq("incident_id", incidentId),
       service.from("incident_media").select("storage_path, kind, taken_at, party_id").eq("incident_id", incidentId).order("uploaded_at"),
     ]);
-    if (incidentError || partiesError || !incident || !parties) return fail(req, "not_found", 404, locale);
+    if (incidentError || partiesError || witnessesError || mediaError || !incident || !parties) return fail(req, "not_found", 404, locale);
 
     let submissionParty = parties.find((p) => p.profile_id === authData.user.id);
     if (!submissionParty) {
@@ -265,7 +319,8 @@ serve(async (req) => {
     const downloaded = new Map<string, { bytes: Uint8Array; contentType?: string }>();
     for (const item of media ?? []) {
       const { data, error } = await service.storage.from("incident-media").download(item.storage_path);
-      if (!error && data) downloaded.set(item.storage_path, { bytes: new Uint8Array(await data.arrayBuffer()), contentType: data.type });
+      if (error || !data) throw new Error("incident_media_unavailable");
+      downloaded.set(item.storage_path, { bytes: new Uint8Array(await data.arrayBuffer()), contentType: data.type });
     }
 
     // Nature reports ("Wetter, Natur und Tier") get their own lean A4 damage
@@ -393,6 +448,7 @@ serve(async (req) => {
         }
       }
 
+      appendRecordedFields(pdf, regular, bold, incident, parties, witnesses ?? []);
       drawProvenanceFooters(pdf, { regular, bold, shareCode: incident.share_code, createdLabel, descriptor: "Digitale Schadenmeldung", legalNote: LEGAL_NOTE_NATURE }, branding);
 
       const pdfBytes = await pdf.save();
@@ -400,8 +456,9 @@ serve(async (req) => {
       const { error: uploadError } = await service.storage.from("incident-pdfs").upload(storagePath, pdfBytes, { upsert: true, contentType: "application/pdf" });
       if (uploadError) throw uploadError;
 
-      const { data: existing } = await service.from("submissions").select("id, status").eq("incident_id", incidentId).eq("party_id", submissionParty.id).maybeSingle();
-      let submissionId: string;
+      const { data: existing, error: existingError } = await service.from("submissions").select("id, status").eq("incident_id", incidentId).eq("party_id", submissionParty.id).maybeSingle();
+      if (existingError) throw existingError;
+    let submissionId: string;
       if (existing) {
         const { data: updatedSubmission, error: submissionUpdateError } = await service.from("submissions").update({ pdf_storage_path: storagePath }).eq("id", existing.id).select("id").maybeSingle();
         if (submissionUpdateError) throw submissionUpdateError;
@@ -486,8 +543,8 @@ serve(async (req) => {
       labeledField(page, regular, bold, "8", "Versicherung", [ins.company, ins.policyNumber].filter(Boolean).join(" - "), x, cy - 26, colW, 26); cy -= 28;
       labeledField(page, regular, bold, "9", "Fahrer", [d.fullName, d.address, d.phone].filter(Boolean).join("\n"), x, cy - 36, colW, 36); cy -= 38;
       labeledField(page, regular, bold, "10", "Aufprallpunkt", "(siehe Skizze)", x, cy - 14, colW, 14); cy -= 16;
-      labeledField(page, regular, bold, "11", "Sichtbare Schaeden", party.damage_description, x, cy - 42, colW, 42); cy -= 44;
-      labeledField(page, regular, bold, "14", "Bemerkungen", "", x, cy - 24, colW, 24);
+      labeledField(page, regular, bold, "11", "Sichtbare Schaeden", d.reportDamage ?? party.damage_description, x, cy - 42, colW, 42); cy -= 44;
+      labeledField(page, regular, bold, "14", "Bemerkungen", d.reportRemarks ?? "", x, cy - 24, colW, 24);
       const partyPhotoCount = (media ?? []).filter((item: { kind: string; party_id: string }) => item.kind === "photo" && item.party_id === party.id).length;
       page.drawText(clean(`Siehe Fotoanhang, ${partyPhotoCount} Aufnahmen`), { x: x + 2, y: cy - 28, size: 4, font: bold, color: navy });
     };
@@ -625,6 +682,7 @@ serve(async (req) => {
       }
     }
 
+    appendRecordedFields(pdf, regular, bold, incident, parties, witnesses ?? []);
     drawProvenanceFooters(pdf, { regular, bold, shareCode: incident.share_code, createdLabel, descriptor: "Digitales Unfallprotokoll", legalNote: LEGAL_NOTE_REPORT }, branding);
 
     const pdfBytes = await pdf.save();
@@ -632,11 +690,13 @@ serve(async (req) => {
     const { error: uploadError } = await service.storage.from("incident-pdfs").upload(storagePath, pdfBytes, { upsert: true, contentType: "application/pdf" });
     if (uploadError) throw uploadError;
 
-    const { data: existing } = await service.from("submissions").select("id, status").eq("incident_id", incidentId).eq("party_id", submissionParty.id).maybeSingle();
+    const { data: existing, error: existingError } = await service.from("submissions").select("id, status").eq("incident_id", incidentId).eq("party_id", submissionParty.id).maybeSingle();
+    if (existingError) throw existingError;
     let submissionId: string;
     if (existing) {
-      await service.from("submissions").update({ pdf_storage_path: storagePath }).eq("id", existing.id);
-      submissionId = existing.id;
+      const { data: updated, error: updateError } = await service.from("submissions").update({ pdf_storage_path: storagePath }).eq("id", existing.id).select("id").single();
+      if (updateError || !updated) throw updateError ?? new Error("submission_update_zero_rows");
+      submissionId = updated.id;
     } else {
       const { data: sub, error: subErr } = await service.from("submissions").insert({ incident_id: incidentId, party_id: submissionParty.id, target: "pending", status: "generated", pdf_storage_path: storagePath }).select("id").single();
       if (subErr) throw subErr;

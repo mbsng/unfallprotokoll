@@ -75,17 +75,42 @@ export async function joinIncident(code: string): Promise<JoinedIncidentState> {
 }
 
 export async function loadIncidentSummary(ref: IncidentDraftRef): Promise<IncidentSummaryData> {
-  const [incidentResult, partiesResult] = await Promise.all([
-    supabase.from("incidents").select("version, status, occurred_at, location_text, sketch_data_url, sketch_updated_by, sketch_updated_at, report_type, type_details").eq("id", ref.incidentId).single(),
+  const [incidentResult, partiesResult, witnessesResult, mediaResult] = await Promise.all([
+    supabase.from("incidents").select("version, status, occurred_at, location_text, location_lat, location_lng, circumstances_json, sketch_json, sketch_data_url, sketch_updated_by, sketch_updated_at, report_type, type_details").eq("id", ref.incidentId).single(),
     supabase.from("incident_parties").select("id, party_label, version, driver_json, vehicle_json, insurance_json, damage_description, circumstances_checked, signed_at, sketch_confirmed_at").eq("incident_id", ref.incidentId).order("party_label"),
+    supabase.from("incident_witnesses").select("name, contact").eq("incident_id", ref.incidentId),
+    supabase.from("incident_media").select("id, storage_path, kind, party_id").eq("incident_id", ref.incidentId).order("uploaded_at"),
   ]);
-  if (incidentResult.error || partiesResult.error) throw new IncidentSaveError("save");
+  if (incidentResult.error || partiesResult.error || witnessesResult.error || mediaResult.error) throw new IncidentSaveError("save");
+  const photos = await Promise.all((mediaResult.data ?? []).filter((item) => item.kind === "photo" && item.party_id === ref.partyId).map(async (item) => {
+    const { data, error } = await supabase.storage.from("incident-media").createSignedUrl(item.storage_path, 3600);
+    if (error || !data) throw new IncidentSaveError("save");
+    return { id: item.id, mediaId: item.id, storagePath: item.storage_path, url: data.signedUrl };
+  }));
+  let sketchDataUrl = incidentResult.data.sketch_data_url;
+  const sketchPath = (incidentResult.data.sketch_json as { storagePath?: string } | null)?.storagePath;
+  if (!sketchDataUrl && sketchPath && sketchPath !== "pending") {
+    const { data, error } = await supabase.storage.from("incident-media").download(sketchPath);
+    if (error || !data) throw new IncidentSaveError("save");
+    sketchDataUrl = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result as string);
+      reader.onerror = () => reject(new IncidentSaveError("save"));
+      reader.readAsDataURL(data);
+    });
+  }
   return {
     incidentVersion: incidentResult.data.version,
     status: incidentResult.data.status,
     occurredAt: incidentResult.data.occurred_at,
     locationText: incidentResult.data.location_text,
-    sketchDataUrl: incidentResult.data.sketch_data_url,
+    locationLat: incidentResult.data.location_lat,
+    locationLng: incidentResult.data.location_lng,
+    injured: Boolean(incidentResult.data.circumstances_json?.injured),
+    otherDamage: Boolean(incidentResult.data.circumstances_json?.otherDamage),
+    witnesses: (witnessesResult.data ?? []).map((item) => [item.name, item.contact].filter(Boolean).join(" ")).join("\n"),
+    photos,
+    sketchDataUrl,
     sketchUpdatedBy: incidentResult.data.sketch_updated_by,
     sketchUpdatedAt: incidentResult.data.sketch_updated_at,
     reportType: normalizeReportType(incidentResult.data.report_type),
@@ -271,11 +296,19 @@ export async function updateParty(ref: IncidentDraftRef, updates: Record<string,
   return data.version as number;
 }
 
-export async function replaceWitness(ref: IncidentDraftRef, witness: string) {
-  const { error: deleteError } = await supabase.from("incident_witnesses").delete().eq("incident_id", ref.incidentId);
-  if (deleteError) throw new IncidentSaveError("save");
-  if (witness.trim()) {
-    const { error } = await supabase.from("incident_witnesses").insert({ incident_id: ref.incidentId, name: witness.trim(), contact: null });
+export async function replaceWitness(ref: IncidentDraftRef, witness: string, newId: string = crypto.randomUUID()) {
+  const { data: existing, error: loadError } = await supabase.from("incident_witnesses").select("id, name, contact").eq("incident_id", ref.incidentId).order("id");
+  if (loadError) throw new IncidentSaveError("save");
+  const matching = existing?.find((row) => row.name === witness.trim() && !row.contact);
+  const id = matching?.id ?? (existing?.some((row) => row.id === newId) ? crypto.randomUUID() : newId);
+  if (witness.trim() && !matching) {
+    const { data, error } = await supabase.from("incident_witnesses").insert({ id, incident_id: ref.incidentId, name: witness.trim(), contact: null }).select("id").single();
+    if (error || !data) throw new IncidentSaveError("save");
+  }
+  // Only remove the previous rows after the replacement was saved successfully.
+  const obsoleteIds = (existing ?? []).filter((row) => !witness.trim() || row.id !== id).map((row) => row.id);
+  if (obsoleteIds.length) {
+    const { error } = await supabase.from("incident_witnesses").delete().eq("incident_id", ref.incidentId).in("id", obsoleteIds);
     if (error) throw new IncidentSaveError("save");
   }
 }

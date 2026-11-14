@@ -80,15 +80,9 @@ class AccidentDatabase extends Dexie {
       photos: "id, ownerId, draftId, [ownerId+draftId], storagePath",
       outbox: "id, ownerId, draftId, [ownerId+nextAttemptAt], nextAttemptAt, createdAt",
       conflicts: "id, ownerId, draftId, [ownerId+createdAt], createdAt",
-    }).upgrade(async (transaction) => {
-      // Version 1 records had no owner and cannot be assigned safely.
-      await Promise.all([
-        transaction.table("drafts").clear(),
-        transaction.table("photos").clear(),
-        transaction.table("outbox").clear(),
-        transaction.table("conflicts").clear(),
-      ]);
     });
+    // Legacy records without ownerId remain unassigned and inaccessible to
+    // account-scoped queries; upgrading must not delete unsent evidence.
   }
 }
 
@@ -141,11 +135,12 @@ export async function createLocalDraft(ownerId: string, data: AccidentData, join
 }
 
 export async function saveDraftField<K extends keyof AccidentData>(ownerId: string, draftId: string, field: K, value: AccidentData[K]) {
-  const modifiedAt = new Date().toISOString();
   let updatedDraft: LocalDraft | undefined;
   await db.transaction("rw", db.drafts, db.outbox, async () => {
     const draft = await db.drafts.get(draftId);
-    if (!owns(ownerId, draft)) return;
+    if (!owns(ownerId, draft)) throw new Error("draft_not_found");
+    const previousTime = Date.parse(draft.fieldModifiedAt[field] ?? "") || 0;
+    const modifiedAt = new Date(Math.max(Date.now(), previousTime + 1)).toISOString();
     draft.data = { ...draft.data, [field]: value };
     draft.fieldModifiedAt = { ...draft.fieldModifiedAt, [field]: modifiedAt };
     draft.updatedAt = modifiedAt;
@@ -166,55 +161,73 @@ export async function saveDraftField<K extends keyof AccidentData>(ownerId: stri
 }
 
 export async function saveLocalPhoto(ownerId: string, draftId: string, file: File) {
-  const draft = await db.drafts.get(draftId);
-  if (!owns(ownerId, draft)) return;
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
-  const photo: LocalPhoto = { id, ownerId, draftId, blob: file, fileName: file.name, mimeType: file.type || "image/jpeg", lastModified: file.lastModified };
-  draft.data = { ...draft.data, photos: [...draft.data.photos, { id, url: "" }] };
-  draft.updatedAt = now;
+  let updatedDraft: LocalDraft | undefined;
   await db.transaction("rw", db.drafts, db.photos, db.outbox, async () => {
-    await db.photos.add(photo);
+    const draft = await db.drafts.get(draftId);
+    if (!owns(ownerId, draft)) throw new Error("draft_not_found");
+    await db.photos.add({ id, ownerId, draftId, blob: file, fileName: file.name, mimeType: file.type || "image/jpeg", lastModified: file.lastModified });
+    draft.data = { ...draft.data, photos: [...draft.data.photos, { id, url: "" }] };
+    draft.updatedAt = now;
     await db.drafts.put(draft);
     await db.outbox.add({
       id: crypto.randomUUID(), ownerId, draftId, table: "incident_media", operation: "upload",
       payload: { photoId: id }, version: draft.ref.partyVersion, device_id: deviceId,
       attempts: 0, nextAttemptAt: Date.now(), createdAt: now,
     });
+    updatedDraft = draft;
   });
-  notifyDraft(await hydrateDraft(draft));
+  if (updatedDraft) notifyDraft(await hydrateDraft(updatedDraft));
   requestSync();
 }
 
 export async function deleteLocalPhoto(ownerId: string, draftId: string, photoId: string) {
-  const draft = await db.drafts.get(draftId);
-  const photo = await db.photos.get(photoId);
-  if (!owns(ownerId, draft) || (photo && !owns(ownerId, photo))) return;
   const now = new Date().toISOString();
-  draft.data = { ...draft.data, photos: draft.data.photos.filter((item) => item.id !== photoId) };
-  draft.updatedAt = now;
+  let updatedDraft: LocalDraft | undefined;
   await db.transaction("rw", db.drafts, db.photos, db.outbox, async () => {
+    const draft = await db.drafts.get(draftId);
+    const photo = await db.photos.get(photoId);
+    if (!owns(ownerId, draft) || (photo && !owns(ownerId, photo))) throw new Error("draft_not_found");
+    const item = draft.data.photos.find((item) => item.id === photoId || (photo?.storagePath && item.storagePath === photo.storagePath));
+    draft.data = { ...draft.data, photos: draft.data.photos.filter((entry) => entry !== item) };
+    draft.updatedAt = now;
     await db.drafts.put(draft);
     await db.photos.delete(photoId);
     await db.outbox.where("draftId").equals(draftId).filter((entry) => entry.ownerId === ownerId && entry.operation === "upload" && entry.payload.photoId === photoId).delete();
-    if (photo?.storagePath || photo?.mediaId) {
+    const storagePath = photo?.storagePath ?? item?.storagePath;
+    const mediaId = photo?.mediaId ?? item?.mediaId;
+    if (storagePath || mediaId) {
       await db.outbox.add({
         id: crypto.randomUUID(), ownerId, draftId, table: "incident_media", operation: "delete",
-        payload: { storagePath: photo.storagePath, mediaId: photo.mediaId }, version: draft.ref.partyVersion,
+        payload: { storagePath, mediaId }, version: draft.ref.partyVersion,
         device_id: deviceId, attempts: 0, nextAttemptAt: Date.now(), createdAt: now,
       });
     }
+    updatedDraft = draft;
   });
-  notifyDraft(draft);
+  const url = localPhotoUrls.get(photoId);
+  if (url) URL.revokeObjectURL(url);
+  localPhotoUrls.delete(photoId);
+  if (updatedDraft) notifyDraft(await hydrateDraft(updatedDraft));
   requestSync();
 }
+
+const localPhotoUrls = new Map<string, string>();
 
 export async function hydrateDraft(draft: LocalDraft) {
   const photos = await db.photos.where("[ownerId+draftId]").equals([draft.ownerId, draft.id]).toArray();
   const byId = new Map(photos.map((photo) => [photo.id, photo]));
+  const byPath = new Map(photos.filter((photo) => photo.storagePath).map((photo) => [photo.storagePath, photo]));
   const hydrated: PendingPhoto[] = draft.data.photos.map((item) => {
-    const local = byId.get(item.id);
-    return local ? { ...item, url: URL.createObjectURL(local.blob), storagePath: local.storagePath, mediaId: local.mediaId } : item;
+    const local = byId.get(item.id) ?? (item.storagePath ? byPath.get(item.storagePath) : undefined);
+    if (!local) return item;
+    let url = localPhotoUrls.get(local.id);
+    if (!url) {
+      url = URL.createObjectURL(local.blob);
+      localPhotoUrls.set(local.id, url);
+    }
+    return { ...item, id: local.id, url, storagePath: local.storagePath, mediaId: local.mediaId };
   });
   return { ...draft, data: { ...draft.data, photos: hydrated } };
 }
@@ -245,13 +258,29 @@ export async function markDraftComplete(ownerId: string, draftId: string) {
   return id;
 }
 
-export async function applyDraftFromSync(draft: LocalDraft) {
+export async function persistSyncedDraft(draft: LocalDraft) {
+  const current = await db.drafts.get(draft.id);
+  if (!current || current.ownerId !== draft.ownerId) throw new Error("draft_not_found");
+  for (const field of Object.keys(current.fieldModifiedAt) as (keyof AccidentData)[]) {
+    if ((current.fieldModifiedAt[field] ?? "") > (draft.fieldModifiedAt[field] ?? "")) {
+      draft.data = { ...draft.data, [field]: current.data[field] };
+      draft.fieldModifiedAt[field] = current.fieldModifiedAt[field];
+    }
+  }
+  draft.data.photos = current.data.photos;
+  draft.updatedAt = current.updatedAt > draft.updatedAt ? current.updatedAt : draft.updatedAt;
   await db.drafts.put(draft);
-  notifyDraft(await hydrateDraft(draft));
+}
+
+export async function applyDraftFromSync(draft: LocalDraft) {
+  const current = await db.drafts.get(draft.id);
+  if (current?.ownerId === draft.ownerId) notifyDraft(await hydrateDraft(current));
 }
 
 export async function deleteLocalDraft(ownerId: string, draftId: string) {
   await db.transaction("rw", db.drafts, db.photos, db.outbox, db.conflicts, async () => {
+    const draft = await db.drafts.get(draftId);
+    if (!owns(ownerId, draft)) return;
     await db.drafts.delete(draftId);
     await db.photos.where("draftId").equals(draftId).delete();
     await db.outbox.where("draftId").equals(draftId).delete();
